@@ -14,7 +14,7 @@ Provides three complementary uncertainty axes:
 """
 
 from dataclasses import dataclass
-from typing import Dict, Literal, Tuple
+from typing import Literal
 
 import numpy as np
 import torch
@@ -43,7 +43,7 @@ class WelfordAccumulator:
         delta2 = x - self.mean
         self.m2 = self.m2 + delta * delta2
 
-    def finalize(self, unbiased: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def finalize(self, unbiased: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(mean, variance)`` tensors."""
         if self.mean is None or self.m2 is None or self.count == 0:
             raise RuntimeError("WelfordAccumulator received zero samples.")
@@ -75,7 +75,7 @@ def compute_posterior_uncertainty(
     probs: torch.Tensor,
     mode: Literal["multiclass", "multilabel"] = "multiclass",
     eps: float = 1e-7,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute normalized predictive entropy in ``[0, 1]`` and confidence margin.
 
     Args:
@@ -137,7 +137,7 @@ def compute_physical_residual(
     pred_probs_hr: torch.Tensor,
     guide_lr: torch.Tensor,
     psf_sigma: float | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Evaluate forward physical consistency ``|D(P_HR) - G_LR|``.
 
     Args:
@@ -317,7 +317,7 @@ def expected_calibration_error(
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
     ece = 0.0
     n_total = max(len(confidences), 1)
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:], strict=False):
         in_bin = (confidences > lo) & (confidences <= hi)
         if lo == 0.0:
             in_bin = (confidences >= lo) & (confidences <= hi)
@@ -356,7 +356,7 @@ def sparsification_curve(
     targets: np.ndarray | torch.Tensor,
     uncertainty: np.ndarray | torch.Tensor,
     n_fractions: int = 11,
-) -> Dict[str, np.ndarray | float]:
+) -> dict[str, np.ndarray | float]:
     """Evaluate selective prediction (risk-coverage / sparsification curve).
 
     Progressively abstains on the most uncertain fraction ``q`` of pixels

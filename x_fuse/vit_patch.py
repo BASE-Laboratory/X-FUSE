@@ -7,7 +7,8 @@ FeatUp (https://github.com/mhamilton723/FeatUp, MIT License).
 
 import math
 import os
-from typing import Callable, Literal, Tuple, TypeAlias
+from collections.abc import Callable
+from typing import Any, Literal, TypeAlias
 
 import torch
 import torch.nn.functional as F
@@ -35,17 +36,18 @@ def get_qkvo_per_head(
     drop_fn: Callable,
     n_heads: int,
 ) -> torch.Tensor:
-    """Extract per-head ``q``, ``k``, ``v``, or CLS-attention ``o`` summaries."""
+    """Extract per-head ``q``, ``k``, ``v``, or attention-output ``o`` summaries."""
     prims, mapping = [q, k, v], "qkv"
     if which in ("q", "k", "v"):
         prim = prims[mapping.index(which)]
         return prim.sum(dim=-1)
     if which == "o":
+        if x_a.shape == q.shape:
+            return drop_fn(x_a).sum(dim=-1)
         bsz, n_tok, _, _ = q.shape
-        x_a_cls = x_a[:, 0, :, :][:, None, :, :]
-        cls_attn = x_a_cls.permute(0, 2, 1, 3) @ v.permute(0, 2, 3, 1)
-        cls_attn = cls_attn.squeeze(2).permute(0, 2, 1)
-        return cls_attn.reshape([bsz, n_tok, n_heads])
+        if x_a.shape == (bsz, n_tok, n_heads, n_tok):
+            return drop_fn(x_a[:, 0, :, :]).permute(0, 2, 1).contiguous()
+        raise ValueError(f"Unexpected x_a shape {tuple(x_a.shape)} for option 'o'")
     raise ValueError(f"Invalid attention option: {which}")
 
 
@@ -72,7 +74,7 @@ class Patch:
     """Monkey-patch helpers enabling custom ViT stride and attention hooks."""
 
     @staticmethod
-    def _fix_pos_enc(patch_size: int, stride_hw: Tuple[int, int]) -> Callable:
+    def _fix_pos_enc(patch_size: int, stride_hw: tuple[int, int]) -> Callable:
         def interpolate_pos_encoding(
             self, x: torch.Tensor, w: int, h: int
         ) -> torch.Tensor:
@@ -288,7 +290,7 @@ class Patch:
         return forward_feats_attn
 
     @staticmethod
-    def _add_new_forward_features_dv3(model: torch.nn.Module) -> Callable:
+    def _add_new_forward_features_dv3(model: Any) -> Callable:
         def forward_feats_attn(
             self, x, masks=None, attn_choice: AttentionOptions = "none"
         ):

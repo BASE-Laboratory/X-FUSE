@@ -3,9 +3,9 @@ microscopy (SEM/STEM + EDS/EELS), and generic correlative TIFF/HDF5 pairs.
 """
 
 import os
-from pathlib import Path
 import re
-from typing import Dict, List, Sequence, Tuple
+from collections.abc import Sequence
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -40,28 +40,28 @@ def load_xrdct_phase(
     phases: Sequence[str],
     shape: Sequence[int],
     crop: slice = slice(None),
-    entry_names: Dict[str, str] | None = None,
+    entry_names: dict[str, str] | None = None,
     **kwargs,
-) -> List[np.ndarray]:
+) -> list[np.ndarray]:
     """Load stacked NeXus (``.nxs``) XRD-CT slices in deterministic natural order."""
     resolved_entries = entry_names if entry_names is not None else {"default": "data"}
     default_entry = resolved_entries.get("default", "data")
 
     all_entries = sorted(os.listdir(phase_folder), key=_natural_sort_key)
-    xrdct_data: List[np.ndarray] = []
+    xrdct_data: list[np.ndarray] = []
 
     for phase in phases:
         files = [f for f in all_entries if phase.lower() in f.lower()][crop]
 
-        assert (
-            len(files) > 0
-        ), f"No files found for phase {phase} in folder {phase_folder}."
-        assert any(
-            f.endswith(".nxs") for f in files
-        ), f"Expected .nxs files for phase {phase}, but found none."
-        assert (
-            len(files) == shape[0]
-        ), f"Expected {shape[0]} files for phase {phase}, but found {len(files)}."
+        assert len(files) > 0, (
+            f"No files found for phase {phase} in folder {phase_folder}."
+        )
+        assert any(f.endswith(".nxs") for f in files), (
+            f"Expected .nxs files for phase {phase}, but found none."
+        )
+        assert len(files) == shape[0], (
+            f"Expected {shape[0]} files for phase {phase}, but found {len(files)}."
+        )
 
         entry_key = resolved_entries.get(phase, default_entry)
         xrdct_i = np.zeros(shape, dtype=np.float64)
@@ -83,7 +83,7 @@ def load_diad_xrdct(
     phase_folder: str,
     phases: Sequence[str] | None = None,
     **kwargs,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Load DIAD XRD-CT NeXus phase stacks as ``{phase_name: (Z, Y, X)}``."""
     phase_list = list(phases) if phases is not None else ["Na", "Zn"]
     phase_arrays = load_xrdct_phase(
@@ -101,7 +101,7 @@ def load_diad_xrdct(
 
     return {
         phase: np.flip(arr, axis=2).copy()
-        for phase, arr in zip(phase_list, phase_arrays)
+        for phase, arr in zip(phase_list, phase_arrays, strict=False)
     }
 
 
@@ -124,8 +124,8 @@ def load_image_array(path: str | Path) -> np.ndarray:
 
 def load_correlative_tiff_pair(
     hr_path: str | Path,
-    guide_paths: Sequence[str | Path] | Dict[str, str | Path],
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    guide_paths: Sequence[str | Path] | dict[str, str | Path],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Load a high-res structural image (e.g. BSE-SEM, HAADF-STEM, XCT slice)
     and one or more coarse physical guide maps (e.g. multi-element EDS, XRD-CT).
 
@@ -155,7 +155,7 @@ def load_eds_text_hypermap(
     elements: Sequence[str],
     bse_suffix: str = "BSE",
     delimiter: str | None = None,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Load ``edxia``-style SEM-BSE + multi-element EDS ASCII/CSV maps
     (e.g. ``{prefix}_BSE.txt``, ``{prefix}_Ca.txt``, ``{prefix}_Si.txt``)."""
     root = Path(folder)

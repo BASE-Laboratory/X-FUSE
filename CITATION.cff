@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: "X-FUSE: Uncertainty-Aware Foundation-Model Fusion for 2D & 2.5D Correlative Materials Imaging"
+message: "If you use X-FUSE in your research, please cite this software."
+type: software
+version: 0.2.0
+license: MIT
+repository-code: "https://github.com/BASE-Laboratory/X-FUSE"
+url: "https://github.com/BASE-Laboratory/X-FUSE"
+authors:
+  - family-names: Green
+    given-names: Calum
+    affiliation: Imperial College London
+  - name: "BASE Laboratory"
+keywords:
+  - correlative microscopy
+  - multimodal fusion
+  - uncertainty quantification
+  - vision transformers
+  - X-ray tomography
+  - XRD-CT
+  - electron microscopy
+  - neutron Bragg-edge imaging

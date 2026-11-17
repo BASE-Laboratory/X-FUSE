@@ -34,7 +34,7 @@ def test_combined_shift_and_flip_exact_invertibility():
     # Combine shifts with 90-deg rotations (non-commuting on square tensor)
     sq = torch.randn(1, 3, 24, 24)
     fwd, inv = combine_transforms(fwd_s, fwd_r, inv_s, inv_r)
-    for f_fn, i_fn in zip(fwd, inv):
+    for f_fn, i_fn in zip(fwd, inv, strict=False):
         recovered = i_fn(f_fn(sq))
         assert torch.allclose(recovered, sq, atol=1e-6)
 
@@ -42,7 +42,7 @@ def test_combined_shift_and_flip_exact_invertibility():
     fwd_tta, inv_tta = build_default_tta(
         shift_dists=[1, 2], pattern="Neumann", include_flips=True
     )
-    for f_fn, i_fn in zip(fwd_tta, inv_tta):
+    for f_fn, i_fn in zip(fwd_tta, inv_tta, strict=False):
         recovered = i_fn(f_fn(img))
         assert torch.allclose(recovered, img, atol=1e-6)
 

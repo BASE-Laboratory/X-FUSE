@@ -6,15 +6,15 @@ Portions adapted from HR-Dv2 (https://github.com/tldr-group/HR-Dv2, MIT License)
 
 from functools import partial
 from itertools import product
-from typing import List, Literal, Tuple, TypeAlias
+from typing import Literal, TypeAlias
 
 import numpy as np
-from PIL import Image
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+from PIL import Image
 
-PartialTrs: TypeAlias = List[partial]
+PartialTrs: TypeAlias = list[partial]
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -36,17 +36,17 @@ iden_partial = partial(iden)
 true_iden_partial = partial(true_iden)
 
 
-def _roll_spatial(shift: Tuple[int, int], x: torch.Tensor) -> torch.Tensor:
+def _roll_spatial(shift: tuple[int, int], x: torch.Tensor) -> torch.Tensor:
     return torch.roll(x, shift, dims=(-2, -1))
 
 
-def _flip_spatial(dims: Tuple[int, ...], x: torch.Tensor) -> torch.Tensor:
+def _flip_spatial(dims: tuple[int, ...], x: torch.Tensor) -> torch.Tensor:
     if x.ndim == 3:
         x = x.unsqueeze(0)
     return torch.flip(x, dims)
 
 
-def _rot90_spatial(dims: Tuple[int, int], k: int, x: torch.Tensor) -> torch.Tensor:
+def _rot90_spatial(dims: tuple[int, int], k: int, x: torch.Tensor) -> torch.Tensor:
     if x.ndim == 3:
         x = x.unsqueeze(0)
     return torch.rot90(x, k, dims)
@@ -58,7 +58,7 @@ def _compose_two(tr_1: partial, tr_2: partial, x: torch.Tensor) -> torch.Tensor:
 
 def compute_shift_directions(
     pattern: Literal["Neumann", "Moore"] = "Moore",
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     """Return unit-step ``(dy, dx)`` shift directions for a 2D neighbourhood."""
     if pattern not in ("Neumann", "Moore"):
         raise ValueError(f"Unknown shift pattern '{pattern}'. Expected Neumann/Moore.")
@@ -73,7 +73,7 @@ def compute_shift_directions(
         (1, 0),
         (1, 1),
     ]
-    directions: List[Tuple[int, int]] = []
+    directions: list[tuple[int, int]] = []
     for idx, s in enumerate(shifts):
         if pattern == "Neumann" and idx % 2 == 1:
             directions.append(s)
@@ -83,9 +83,9 @@ def compute_shift_directions(
 
 
 def get_shift_transforms(
-    dists: List[int],
+    dists: list[int],
     pattern: Literal["Neumann", "Moore"] = "Moore",
-) -> Tuple[PartialTrs, PartialTrs]:
+) -> tuple[PartialTrs, PartialTrs]:
     """Build forward and exact inverse spatial roll transforms."""
     fwd_transforms: PartialTrs = [true_iden_partial]
     inv_transforms: PartialTrs = [true_iden_partial]
@@ -100,7 +100,7 @@ def get_shift_transforms(
     return fwd_transforms, inv_transforms
 
 
-def get_flip_transforms() -> Tuple[PartialTrs, PartialTrs]:
+def get_flip_transforms() -> tuple[PartialTrs, PartialTrs]:
     """Build forward and inverse horizontal/vertical flip transforms."""
     h_flip = partial(_flip_spatial, (-1,))
     v_flip = partial(_flip_spatial, (-2,))
@@ -109,7 +109,7 @@ def get_flip_transforms() -> Tuple[PartialTrs, PartialTrs]:
     return fwd, inv
 
 
-def get_rotation_transforms() -> Tuple[PartialTrs, PartialTrs]:
+def get_rotation_transforms() -> tuple[PartialTrs, PartialTrs]:
     """Build forward and inverse 90-degree rotation transforms (0, 90, 180, 270)."""
     fwd: PartialTrs = [iden_partial]
     inv: PartialTrs = [iden_partial]
@@ -124,7 +124,7 @@ def combine_transforms(
     fwd_2: PartialTrs,
     inv_1: PartialTrs,
     inv_2: PartialTrs,
-) -> Tuple[PartialTrs, PartialTrs]:
+) -> tuple[PartialTrs, PartialTrs]:
     """Compose invertible transform lists ``f = f2 o f1`` with ``f^-1 = i1 o i2``."""
     if len(fwd_1) != len(inv_1) or len(fwd_2) != len(inv_2):
         raise ValueError("Forward and inverse transform lists must match in length.")
@@ -140,10 +140,10 @@ def combine_transforms(
 
 
 def build_default_tta(
-    shift_dists: List[int] | None = None,
+    shift_dists: list[int] | None = None,
     pattern: Literal["Neumann", "Moore"] = "Neumann",
     include_flips: bool = True,
-) -> Tuple[PartialTrs, PartialTrs]:
+) -> tuple[PartialTrs, PartialTrs]:
     """Convenience builder for standard sub-patch TTA ensembles."""
     if shift_dists is None:
         shift_dists = [1, 2]
@@ -156,7 +156,7 @@ def build_default_tta(
 
 def normalize_structural(
     img: np.ndarray | torch.Tensor,
-    clip_percentiles: Tuple[float, float] | None = None,
+    clip_percentiles: tuple[float, float] | None = None,
     imagenet_norm: bool = True,
     device: str | torch.device = "cpu",
 ) -> torch.Tensor:
@@ -228,7 +228,7 @@ to_norm_tensor = transforms.Compose(
 )
 
 unnormalize = transforms.Normalize(
-    mean=tuple(-m / s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)),
+    mean=tuple(-m / s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD, strict=False)),
     std=tuple(1.0 / s for s in IMAGENET_STD),
 )
 
@@ -271,7 +271,7 @@ to_tensor = transforms.ToTensor()
 
 def load_image(
     path: str, transform: transforms.Compose
-) -> Tuple[torch.Tensor, Image.Image]:
+) -> tuple[torch.Tensor, Image.Image]:
     image = Image.open(path).convert("RGB")
     tensor = transform(image)
     transformed_img = to_img(unnormalize(tensor))
@@ -294,7 +294,7 @@ def flatten(
 
 def ensure_spatial_divisible(
     x: torch.Tensor, patch_size: int, stride: int
-) -> Tuple[torch.Tensor, Tuple[int, int]]:
+) -> tuple[torch.Tensor, tuple[int, int]]:
     """Pad spatial tensor ``(..., H, W)`` by reflection if ``(H - patch_size)``
     is not divisible by ``stride``, returning ``(padded, (orig_h, orig_w))``."""
     orig_h, orig_w = x.shape[-2], x.shape[-1]

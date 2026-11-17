@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -61,7 +61,7 @@ def _train_and_predict_xfuse_2d(
     pretrained: bool,
     stride: int,
     epochs: int,
-    tta_shifts: List[int],
+    tta_shifts: list[int],
     device: str,
 ):
     hr_t = normalize_structural(hr_img, device=device)
@@ -109,7 +109,7 @@ def run_benchmark(
     pretrained: bool = False,
     quick: bool = False,
     device: str = "cpu",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     matplotlib.use("Agg")
     output_dir.mkdir(parents=True, exist_ok=True)
     img_size = 64 if quick else 128
@@ -118,7 +118,7 @@ def run_benchmark(
     tta_shifts = [1] if quick else [1, 2]
     factors = [4, 8] if quick else [4, 8, 16]
 
-    results: Dict[str, Any] = {
+    results: dict[str, Any] = {
         "config": {
             "dino_name": dino_name,
             "pretrained": pretrained,

@@ -1,8 +1,9 @@
-import pytest
-import torch
 import numpy as np
 import porespy as ps
-from x_fuse.utils import xrd_to_tensor, get_multiphase, downsample_xrdct
+import pytest
+import torch
+
+from x_fuse.utils import downsample_xrdct, get_multiphase, xrd_to_tensor
 
 # ── xrd_to_tensor ──────────────────────────────────────────────────────────────
 
@@ -130,15 +131,3 @@ def test_downsample_list_lengths(downsample_inputs):
     _, ds_A, ds_B = downsample_xrdct(gray, phase_A, phase_B, factor=2)
     assert len(ds_A) == 3
     assert len(ds_B) == 3
-
-
-@pytest.mark.gpu
-def test_cuda_is_available():
-    assert torch.cuda.is_available(), "CUDA not available on this device"
-
-
-@pytest.mark.gpu
-def test_tensor_on_gpu():
-    t = torch.tensor([1.0, 2.0, 3.0]).cuda()
-    assert t.device.type == "cuda"
-    assert isinstance(t, torch.Tensor)

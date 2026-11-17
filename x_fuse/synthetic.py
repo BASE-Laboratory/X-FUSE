@@ -4,7 +4,6 @@ volumetric benchmarking.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, shift as nd_shift
@@ -37,7 +36,7 @@ def generate_correlative_phantom_2d(
     hr_noise_std: float = 0.04,
     psf_sigma: float | None = None,
     poisson_counts: float | None = 200.0,
-    misalignment_yx: Tuple[float, float] = (0.0, 0.0),
+    misalignment_yx: tuple[float, float] = (0.0, 0.0),
     seed: int = 42,
 ) -> CorrelativePhantom2D:
     """Synthesize a realistic 3-constituent (Matrix + Phase A + Phase B) 2D
@@ -131,7 +130,7 @@ def generate_correlative_phantom_2d(
 
 
 def generate_correlative_phantom_3d(
-    shape: Tuple[int, int, int] = (32, 64, 64),
+    shape: tuple[int, int, int] = (32, 64, 64),
     downsample_factor: int = 4,
     phase_b_contrast: float = 0.35,
     hr_noise_std: float = 0.06,

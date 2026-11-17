@@ -1,5 +1,6 @@
 # tests/test_loaders.py
 from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pytest
 
@@ -63,9 +64,9 @@ def test_load_xrdct_phase_returns_one_array_per_phase(mock_h5, mock_ls):
     result = load_xrdct_phase(
         "fake_folder", phases=phases, shape=shape, entry_names=entry_names
     )
-    assert len(result) == len(
-        phases
-    ), f"Expected {len(phases)} arrays, got {len(result)}"
+    assert len(result) == len(phases), (
+        f"Expected {len(phases)} arrays, got {len(result)}"
+    )
 
 
 # ── load_diad_xrdct ───────────────────────────────────────────────────────────

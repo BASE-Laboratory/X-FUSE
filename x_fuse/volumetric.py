@@ -3,8 +3,9 @@ inference, inter-plane epistemic uncertainty, and sparse-slice 2D -> 3D chemical
 propagation (e.g., sparse XRD-CT or FIB-EDS slices guiding a dense 3D XCT/FIB stack).
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, Literal, Sequence, Tuple
+from typing import Literal
 
 import numpy as np
 import torch
@@ -146,7 +147,7 @@ class VolumetricFuser:
         )
         self._global_prior: torch.Tensor | None = None
 
-    def _vol_stats(self, hr_volume: np.ndarray) -> Tuple[float, float]:
+    def _vol_stats(self, hr_volume: np.ndarray) -> tuple[float, float]:
         lo, hi = np.percentile(hr_volume, (0.5, 99.5))
         if hi - lo < 1e-8:
             lo, hi = float(hr_volume.min()), float(hr_volume.max())
@@ -161,7 +162,7 @@ class VolumetricFuser:
         vmin: float,
         vmax: float,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
         slab = pack_25d_slice(hr_volume, index=index, axis=axis, delta=delta)
         slab_clipped = np.clip(slab, vmin, vmax)
         if vmax - vmin > 1e-8:
@@ -178,7 +179,7 @@ class VolumetricFuser:
     def fit_sparse_slices(
         self,
         hr_volume: np.ndarray | torch.Tensor,
-        sparse_guides: Dict[int, np.ndarray | torch.Tensor],
+        sparse_guides: dict[int, np.ndarray | torch.Tensor],
         epochs: int = 12,
         delta: int = 1,
         axis: int = 0,
@@ -196,7 +197,7 @@ class VolumetricFuser:
         vmin, vmax = self._vol_stats(vol)
         dev = next(self.fuser.dinov2.parameters()).device
 
-        prepared_guides: Dict[int, torch.Tensor] = {}
+        prepared_guides: dict[int, torch.Tensor] = {}
         prior_accum = []
         for idx, g_raw in sparse_guides.items():
             g_t = guide_to_tensor(g_raw, device=dev, normalize=True)
@@ -229,7 +230,7 @@ class VolumetricFuser:
         vmin: float,
         vmax: float,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run slice-by-slice 2.5D logit inference along ``axis``, returning
         ``(mean_logits_zyx, tta_prob_var_zyx)`` transposed back to ``(M, Z, Y, X)``."""
         depth = vol.shape[axis]
@@ -324,7 +325,7 @@ class VolumetricFuser:
         mode: Literal["2d", "2.5d_slab", "triplane"] = "2.5d_slab",
         delta: int = 1,
         coarse_guide_3d: np.ndarray | torch.Tensor | None = None,
-        sparse_guides: Dict[int, np.ndarray | torch.Tensor] | None = None,
+        sparse_guides: dict[int, np.ndarray | torch.Tensor] | None = None,
         pred_mode: Literal["multiclass", "multilabel"] = "multilabel",
         calibrate_to_guide: bool = True,
     ) -> VolumetricUncertaintyReport:
@@ -430,8 +431,13 @@ class VolumetricFuser:
             g3_min = g3.flatten(1).min(dim=1).values.view(-1, 1, 1, 1)
             g3_max = g3.flatten(1).max(dim=1).values.view(-1, 1, 1, 1)
             g3_norm = (g3 - g3_min) / (g3_max - g3_min).clamp(min=1e-6)
+            out_3d = (
+                int(g3_norm.shape[-3]),
+                int(g3_norm.shape[-2]),
+                int(g3_norm.shape[-1]),
+            )
             pred_lr_3d = F.adaptive_avg_pool3d(
-                fg_probs_3d.unsqueeze(0), output_size=g3_norm.shape[-3:]
+                fg_probs_3d.unsqueeze(0), output_size=out_3d
             ).squeeze(0)
             res_lr = (pred_lr_3d - g3_norm).abs().mean(dim=0, keepdim=True).unsqueeze(0)
             phys_res_3d = (
@@ -448,9 +454,10 @@ class VolumetricFuser:
             for s_idx, g_s in sparse_guides.items():
                 if 0 <= int(s_idx) < z_dim:
                     g_t = guide_to_tensor(g_s, normalize=True).cpu()
+                    out_2d = (int(g_t.shape[-2]), int(g_t.shape[-1]))
                     p_s = F.adaptive_avg_pool2d(
                         fg_probs_3d[:, int(s_idx)].unsqueeze(0),
-                        output_size=g_t.shape[-2:],
+                        output_size=out_2d,
                     )
                     res_s = (p_s - g_t).abs().mean(dim=1, keepdim=True)
                     phys_res_3d[int(s_idx)] = (

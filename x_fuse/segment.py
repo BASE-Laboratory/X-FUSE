@@ -2,15 +2,15 @@
 segmentation boundary/overlap metrics, and optional certainty-aware SAM2 refinement.
 """
 
-from typing import Any, Dict, Literal, Tuple
+from typing import Any, Literal
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from scipy.ndimage import binary_dilation, binary_erosion
 from scipy.optimize import linear_sum_assignment
 from skimage.filters import threshold_otsu
 from sklearn.cluster import MiniBatchKMeans
-import torch
-import torch.nn.functional as F
 
 from .uncertainty import (
     UncertaintyReport,
@@ -35,7 +35,7 @@ def do_single_pca(features: torch.Tensor, n_components: int = 3) -> np.ndarray:
     return ((arr - mn) / span).astype(np.float32)
 
 
-def rescale_pca(pca_flat: torch.Tensor | np.ndarray, hw: Tuple[int, int]) -> np.ndarray:
+def rescale_pca(pca_flat: torch.Tensor | np.ndarray, hw: tuple[int, int]) -> np.ndarray:
     """Reshape flattened ``(H*W, K)`` PCA output to ``(H, W, K)`` in ``[0, 1]``."""
     arr = (
         pca_flat.detach().cpu().float().numpy()
@@ -53,7 +53,7 @@ def rescale_pca(pca_flat: torch.Tensor | np.ndarray, hw: Tuple[int, int]) -> np.
 def pca_otsu_segment(
     features: torch.Tensor,
     guide_lr: torch.Tensor | np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Segment a gated ``(1, C, H, W)`` feature map via 1st-component PCA + Otsu,
     automatically resolving the arbitrary ``+-1`` eigenvector sign flip by
     correlating against ``guide_lr``.
@@ -128,7 +128,7 @@ def _to_4d_guide(guide_lr: torch.Tensor | np.ndarray) -> torch.Tensor:
 
 def bicubic_upsample_baseline(
     guide_lr: torch.Tensor | np.ndarray,
-    target_hw: Tuple[int, int],
+    target_hw: tuple[int, int],
     mode: Literal["multiclass", "multilabel"] = "multilabel",
     calibrate: bool = True,
 ) -> UncertaintyReport:
@@ -267,7 +267,7 @@ def dino_kmeans_baseline(
 
     row_ind, col_ind = linear_sum_assignment(cost)
     matched_probs = np.zeros((1, n_guides, height, width), dtype=np.float32)
-    for r, c in zip(row_ind, col_ind):
+    for r, c in zip(row_ind, col_ind, strict=False):
         matched_probs[0, r] = cluster_probs[:, :, c]
 
     probs_t = torch.from_numpy(matched_probs).to(features.device)
@@ -301,7 +301,7 @@ def compute_segmentation_metrics(
     pred_mask: np.ndarray | torch.Tensor,
     gt_mask: np.ndarray | torch.Tensor,
     boundary_tolerance_px: int = 2,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Compute pixel accuracy, macro foreground IoU, Dice, and boundary F1 score
     (BF1) between predicted and ground-truth 2D or 3D masks.
 

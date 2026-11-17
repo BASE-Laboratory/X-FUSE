@@ -8,8 +8,6 @@ Supports both:
    forward-model supervision and physical residual uncertainty scoring.
 """
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,7 +35,7 @@ class ForwardPSFDownsampler(nn.Module):
     def forward(
         self,
         hr_map: torch.Tensor,
-        target_size: Tuple[int, int],
+        target_size: tuple[int, int],
         psf_sigma: float | None = None,
     ) -> torch.Tensor:
         """Downsample ``hr_map`` ``(B, M, H, W)`` to ``(H_lr, W_lr)``."""
@@ -94,6 +92,7 @@ class JointBilateralUpsampler(nn.Module):
         self.dilation = max(1, int(dilation))
         self.diameter = 2 * radius + 1
         self.learned = learned
+        self.range_proj: nn.Sequential | None = None
 
         if learned:
             self.sigma_spatial = nn.Parameter(torch.tensor(float(sigma_spatial)))
@@ -111,7 +110,6 @@ class JointBilateralUpsampler(nn.Module):
                 "inv_two_sigma_r2",
                 torch.tensor(1.0 / (2.0 * max(sigma_range, 1e-4) ** 2)),
             )
-            self.range_proj = None
 
     def _spatial_weights(
         self, device: torch.device, dtype: torch.dtype
@@ -137,7 +135,9 @@ class JointBilateralUpsampler(nn.Module):
             g_min = g_float.flatten(1).min(dim=1).values.view(bsz, 1, 1, 1)
             g_max = g_float.flatten(1).max(dim=1).values.view(bsz, 1, 1, 1)
             proj = (g_float - g_min) / (g_max - g_min).clamp(min=1e-6)
-            temp = self.inv_two_sigma_r2.to(device=g_float.device, dtype=torch.float32)
+            inv_buf = self.inv_two_sigma_r2
+            assert isinstance(inv_buf, torch.Tensor)
+            temp = inv_buf.to(device=g_float.device, dtype=torch.float32)
 
         k_ch = proj.shape[1]
         pad = self.radius * self.dilation

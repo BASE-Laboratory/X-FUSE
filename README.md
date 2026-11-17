@@ -1,6 +1,9 @@
 # X-FUSE: Physics-Guided Foundation-Model Feature Fusion & Uncertainty-Aware Segmentation for Correlative Materials Imaging
 
+[![CI](https://github.com/BASE-Laboratory/X-FUSE/actions/workflows/ci.yml/badge.svg)](https://github.com/BASE-Laboratory/X-FUSE/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Typed](https://img.shields.io/badge/typing-PEP%20561-informational.svg)](x_fuse/py.typed)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **X-FUSE** bridges the ubiquitous resolution-vs.-specificity trade-off in materials characterization. Across electron, X-ray, and neutron imaging, researchers routinely acquire a **high-resolution structural image** ($I_{\text{HR}}$, fast & sharp, but chemically ambiguous) alongside a **coarser or sparse physical/chemical guide modality** ($G_{\text{LR}}$, chemically or crystallographically specific, but 4×–32× coarser or restricted to sparse 2D slices).
@@ -137,6 +140,22 @@ print(list(list_open_datasets().keys()))
 
 ---
 
+## Command-Line Interface & Tutorials
+
+Once installed, the `xfuse` CLI provides instant environment diagnostics, Zenodo dataset discovery, and a self-contained synthetic correlative smoke check:
+
+```bash
+xfuse info
+xfuse datasets
+xfuse demo --epochs 15
+```
+
+Interactive step-by-step notebooks (stored with outputs stripped) are available in [`notebooks/`](notebooks/):
+- `notebooks/01_correlative_2d_and_uncertainty.ipynb` — 2D multi-channel correlative fusion, JBU comparison, and tri-part pixel uncertainty.
+- `notebooks/02_volumetric_25d_propagation.ipynb` — SuRVoS-style 2.5D slab packing, sparse $z$-slice training, and 3D tri-plane propagation.
+
+---
+
 ## Repository Layout
 
 ```text
@@ -144,7 +163,7 @@ X-FUSE/
 ├── x_fuse/
 │   ├── backbones.py      # Self-contained ViT loader & dense sub-patch TTA extractor
 │   ├── fusion.py         # CorrelativeFuser (XFuse), Forward-PSF gating & cross-attention
-│   ├── upsamplers.py     # Pure-PyTorch progressive JBU & ForwardPSFDownsampler
+│   ├── upsamplers.py     # Pure-PyTorch scale-dilated JBU & ForwardPSFDownsampler
 │   ├── uncertainty.py    # Online Welford TTA variance, entropy, physical residual, ECE, AUSE
 │   ├── volumetric.py     # SuRVoS-style 2.5D slice packing, sparse 2D->3D & tri-plane fusion
 │   ├── segment.py        # Sign-aligned PCA+Otsu, JBU/bicubic/KMeans baselines, BF1, SAM2 hook
@@ -152,12 +171,15 @@ X-FUSE/
 │   ├── datasets.py       # Bundled sample locator, Zenodo fetcher & experimental hold-out tool
 │   ├── loaders.py        # XCT/XRD-CT HDF5/NeXus, SEM-EDS hypermaps & generic TIFF pairs
 │   ├── transforms.py     # Invertible sub-patch TTA & float32-native structural normalization
-│   └── vit_patch.py      # ViT stride / pos-embed patching & TorchPCA
+│   ├── vit_patch.py      # ViT stride / pos-embed patching & TorchPCA
+│   └── cli.py            # `xfuse` CLI entrypoint
 ├── benchmarks/           # Reproducible quantitative benchmark CLI & summary generators
+├── notebooks/            # Clean, output-stripped tutorial notebooks (2D + 2.5D)
 ├── data/samples/         # Bundled Zn13X & MOR-GIS sample correlative slices
-└── tests/                # Comprehensive CPU & optional GPU pytest suite
+├── tests/                # Comprehensive CPU & CUDA GPU pytest suite (>=80% coverage gate)
+└── Makefile              # Developer shortcuts: sync, format, lint, typecheck, test, build
 ```
 
-## License & Acknowledgements
+## Contributing, Citation & License
 
-Released under the [MIT License](LICENSE) by the **BASE Laboratory**. Self-contained ViT patching, ALiBi attention, and JBU modules acknowledge inspiration and adapted components from [`HR-Dv2`](https://github.com/tldr-group/HR-Dv2), [`dino-saw`](https://github.com/tldr-group/dino-saw), and [`FeatUp`](https://github.com/mhamilton723/FeatUp).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for developer setup (`make lint`, `make typecheck`, `make test`) and [`CITATION.cff`](CITATION.cff) for software citation metadata. Released under the [MIT License](LICENSE) by the **BASE Laboratory**. Self-contained ViT patching, ALiBi attention, and JBU modules acknowledge inspiration and adapted components from [`HR-Dv2`](https://github.com/tldr-group/HR-Dv2), [`dino-saw`](https://github.com/tldr-group/dino-saw), and [`FeatUp`](https://github.com/mhamilton723/FeatUp).

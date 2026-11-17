@@ -2,8 +2,9 @@
 conversion, and ALiBi / DINOv3 model checkpoint wrappers.
 """
 
+from collections.abc import Sequence
 from types import MethodType
-from typing import Sequence
+from typing import Any
 
 import cv2
 import h5py as h5
@@ -16,6 +17,7 @@ from torch.nn.modules.utils import _pair
 
 from .alibi import (
     MODEL_LIST,
+    AlibiSlopeType,
     AlibiVitWrapper,
     DistanceMatrixWrapper,
     PretrainedViTWrapper,
@@ -235,7 +237,7 @@ def get_alibi_model(
 ) -> PretrainedViTWrapper:
     """Load an ALiBi ViT checkpoint into ``AlibiVitWrapper``."""
     weights = torch.load(model_path, weights_only=True, map_location=device)
-    slope_type = "learned" if "_l" in model_type else "constant"
+    slope_type: AlibiSlopeType = "learned" if "_l" in model_type else "constant"
     add_cls = "nr" not in model_type
     n_reg_tokens = 0 if "nr" in model_type else 4
     arch_to_model = {
@@ -263,10 +265,10 @@ def get_alibi_model(
 
 
 def _inject_alibi_dv3(
-    dv3_model: nn.Module,
+    dv3_model: Any,
     distance_matrix: DistanceMatrixWrapper,
-    slope_type: str,
-    device: str,
+    slope_type: AlibiSlopeType,
+    device: str | torch.device,
 ) -> None:
     """Patch DINOv3 attention in-place to add ALiBi spatial distance bias."""
     num_heads = dv3_model.blocks[0].attn.num_heads
@@ -324,7 +326,7 @@ def get_dv3_model(
 
     distance_matrix = None
     if use_alibi:
-        slope_type = "learned" if "_l" in model_type else "constant"
+        slope_type: AlibiSlopeType = "learned" if "_l" in model_type else "constant"
         distance_matrix = DistanceMatrixWrapper(
             n_tokens_h=16,
             n_tokens_w=16,

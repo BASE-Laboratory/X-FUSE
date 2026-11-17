@@ -2,12 +2,12 @@
 experimental hold-out downsampling utilities for quantitative benchmarking.
 """
 
-from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
 import urllib.request
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import gaussian_filter
@@ -26,7 +26,7 @@ class OpenCorrelativeDataset:
     description: str
 
 
-OPEN_DATASETS: Dict[str, OpenCorrelativeDataset] = {
+OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
     "edxia_cement_sem_eds": OpenCorrelativeDataset(
         key="edxia_cement_sem_eds",
         title="EPFL edxia Cementitious Microstructure SEM-BSE + EDS Hypermaps",
@@ -110,7 +110,7 @@ def get_sample_dataset_path(name: str = "Zn13X") -> Path:
     return candidate
 
 
-def list_open_datasets() -> Dict[str, OpenCorrelativeDataset]:
+def list_open_datasets() -> dict[str, OpenCorrelativeDataset]:
     """Return the dictionary of registered open correlative benchmark datasets."""
     return dict(OPEN_DATASETS)
 
@@ -119,7 +119,7 @@ def fetch_open_dataset(
     dataset_key: str,
     dest_root: str | Path | None = None,
     filenames: Iterable[str] | None = None,
-) -> List[Path]:
+) -> list[Path]:
     """Download files for a registered Zenodo dataset with MD5 verification."""
     if dataset_key not in OPEN_DATASETS:
         raise KeyError(
@@ -138,7 +138,7 @@ def fetch_open_dataset(
         record = json.loads(resp.read().decode("utf-8"))
 
     wanted = set(filenames) if filenames is not None else None
-    downloaded: List[Path] = []
+    downloaded: list[Path] = []
     for f_entry in record.get("files", []):
         fname = f_entry["key"]
         if wanted is not None and fname not in wanted:
@@ -170,7 +170,7 @@ def make_experimental_holdout(
     psf_sigma: float | None = None,
     poisson_counts: float | None = None,
     seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create a realistic coarse-guide input from a full-resolution experimental
     chemical/crystallographic map (e.g., STEM-EDS, SEM-EDS, EELS, Bragg-edge) so
     super-resolved predictions and uncertainty can be evaluated against real

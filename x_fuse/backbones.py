@@ -2,15 +2,15 @@
 extractor (replacing the external HR-Dv2 dependency and fixing double loading).
 """
 
-from functools import partial
 import re
+from functools import partial
 from types import MethodType
-from typing import List, Literal, Tuple, TypeAlias
+from typing import Any, Literal, TypeAlias
 
-from timm import create_model
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm import create_model
 from torch.nn.modules.utils import _pair
 
 from .transforms import iden_partial
@@ -32,10 +32,10 @@ Interpolation: TypeAlias = Literal[
 
 def infer_vit_params(
     dino_name: str, model: nn.Module | None = None
-) -> Tuple[int, int, int]:
+) -> tuple[int, int, int]:
     """Infer ``(feat_dim, patch_size, n_heads)`` from a model instance or name."""
     if model is not None:
-        inner = getattr(model, "model", model)
+        inner: Any = getattr(model, "model", model)
         embed_dim = getattr(inner, "embed_dim", getattr(inner, "num_features", None))
         n_heads = getattr(inner, "num_heads", None)
         if n_heads is None and hasattr(inner, "blocks") and len(inner.blocks) > 0:
@@ -112,9 +112,9 @@ def load_backbone(
     if "dinov3" in dino_name:
         lib_path = kwargs.get("lib_path")
         chk_path = kwargs.get("chk_path")
-        assert (chk_path is not None) and (
-            lib_path is not None
-        ), "Must supply local lib_path and chk_path for DINOv3!"
+        assert (chk_path is not None) and (lib_path is not None), (
+            "Must supply local lib_path and chk_path for DINOv3!"
+        )
         return torch.hub.load(lib_path, dino_name, source="local", weights=chk_path)
 
     if "dino" in dino_name:
@@ -159,10 +159,11 @@ class HighResBackbone(nn.Module):
 
         feat, patch, n_heads = infer_vit_params(dino_name, self.dinov2)
         if "dinov2" not in dino_name:
-            if not hasattr(self.dinov2, "num_heads"):
-                self.dinov2.num_heads = n_heads  # type: ignore[attr-defined]
-            if not hasattr(self.dinov2, "num_register_tokens"):
-                self.dinov2.num_register_tokens = 0  # type: ignore[attr-defined]
+            dino_any: Any = self.dinov2
+            if not hasattr(dino_any, "num_heads"):
+                dino_any.num_heads = n_heads
+            if not hasattr(dino_any, "num_register_tokens"):
+                dino_any.num_register_tokens = 0
 
         self.original_patch_size: int = patch
         self.original_stride = _pair(patch)
@@ -174,8 +175,8 @@ class HighResBackbone(nn.Module):
         self.set_model_stride(self.dinov2, patch)
         self.set_model_stride(self.dinov2, stride)
 
-        self.transforms: List[partial] = []
-        self.inverse_transforms: List[partial] = []
+        self.transforms: list[partial] = []
+        self.inverse_transforms: list[partial] = []
         self.interpolation_mode: Interpolation = interpolation_mode
         self.jbu_upsampler = JointBilateralUpsampler(
             guidance_dim=3, radius=2, sigma_spatial=1.5, sigma_range=0.15, learned=False
@@ -196,45 +197,45 @@ class HighResBackbone(nn.Module):
         self.track_grad = track_grad
         self.patch_last_block(self.dinov2, dino_name)
 
-    def get_model_params(self, dino_name: str) -> Tuple[int, int, int]:
+    def get_model_params(self, dino_name: str) -> tuple[int, int, int]:
         return infer_vit_params(dino_name, getattr(self, "dinov2", None))
 
     def set_model_stride(
         self, dino_model: nn.Module, stride_l: int, verbose: bool = False
     ) -> None:
+        dino_any: Any = dino_model
         new_stride_pair = _pair(stride_l)
         self.stride = new_stride_pair
 
         # Handle wrapped ALiBi / DINOv3 models whose ViT lives at .model
-        if hasattr(dino_model, "model") and hasattr(dino_model.model, "patch_embed"):
-            dino_model.model.patch_embed.proj.stride = new_stride_pair
-            dino_model.stride = stride_l  # type: ignore[attr-defined]
+        if hasattr(dino_any, "model") and hasattr(dino_any.model, "patch_embed"):
+            dino_any.model.patch_embed.proj.stride = new_stride_pair
+            dino_any.stride = stride_l
             if verbose:
                 print(f"Setting wrapped stride to ({stride_l},{stride_l})")
             return
 
-        if hasattr(dino_model, "patch_embed") and hasattr(
-            dino_model.patch_embed, "proj"
-        ):
-            dino_model.patch_embed.proj.stride = new_stride_pair
-            if hasattr(dino_model.patch_embed, "strict_img_size"):
-                setattr(dino_model.patch_embed, "strict_img_size", False)
+        if hasattr(dino_any, "patch_embed") and hasattr(dino_any.patch_embed, "proj"):
+            dino_any.patch_embed.proj.stride = new_stride_pair
+            if hasattr(dino_any.patch_embed, "strict_img_size"):
+                dino_any.patch_embed.strict_img_size = False
             # For non-timm DINO/DINOv2 models, patch interpolate_pos_encoding
             if (
                 not self.dino_name.startswith("timm:")
-                and hasattr(dino_model, "pos_embed")
-                and dino_model.pos_embed is not None
+                and hasattr(dino_any, "pos_embed")
+                and dino_any.pos_embed is not None
             ):
                 patched_pos = MethodType(
                     Patch._fix_pos_enc(self.original_patch_size, new_stride_pair),
-                    dino_model,
+                    dino_any,
                 )
-                setattr(dino_model, "interpolate_pos_encoding", patched_pos)
+                dino_any.interpolate_pos_encoding = patched_pos
         if verbose:
             print(f"Setting stride to ({stride_l},{stride_l})")
 
     def patch_last_block(self, dino_model: nn.Module, dino_name: str) -> None:
-        if hasattr(dino_model, "forward_feats_attn"):
+        dino_any: Any = dino_model
+        if hasattr(dino_any, "forward_feats_attn"):
             return
 
         if "alibi" in dino_name or "nope" in dino_name:
@@ -244,11 +245,7 @@ class HighResBackbone(nn.Module):
                 feats = feats.permute(0, 2, 1)
                 return {"x_norm_patchtokens": feats, "masks": masks}
 
-            setattr(
-                dino_model,
-                "forward_feats_attn",
-                MethodType(forward_feats_attn, dino_model),
-            )
+            dino_any.forward_feats_attn = MethodType(forward_feats_attn, dino_any)
             return
 
         if dino_name.startswith("timm:"):
@@ -259,14 +256,10 @@ class HighResBackbone(nn.Module):
                 patch_tokens = feats[:, n_prefix:, :]
                 return {"x_norm_patchtokens": patch_tokens, "masks": masks}
 
-            setattr(
-                dino_model,
-                "forward_feats_attn",
-                MethodType(forward_feats_timm, dino_model),
-            )
+            dino_any.forward_feats_attn = MethodType(forward_feats_timm, dino_any)
             return
 
-        final_block = dino_model.blocks[-1]  # type: ignore[index]
+        final_block = dino_any.blocks[-1]
         attn_block = final_block.attn
         attn_block._original_forward = attn_block.forward
         if "dinov3" not in dino_name:
@@ -276,49 +269,49 @@ class HighResBackbone(nn.Module):
             final_block.forward = MethodType(
                 Patch._fix_block_forward_dv2(), final_block
             )
-            dino_model.forward_feats_attn = MethodType(  # type: ignore[attr-defined]
-                Patch._add_new_forward_features_dv2(), dino_model
+            dino_any.forward_feats_attn = MethodType(
+                Patch._add_new_forward_features_dv2(), dino_any
             )
         elif "dinov3" in dino_name:
-            dino_model.forward_feats_attn = MethodType(  # type: ignore[attr-defined]
-                Patch._add_new_forward_features_dv3(dino_model), dino_model
+            dino_any.forward_feats_attn = MethodType(
+                Patch._add_new_forward_features_dv3(dino_any), dino_any
             )
         elif "dino" in dino_name:
-            for blk in dino_model.blocks:  # type: ignore[union-attr]
+            for blk in dino_any.blocks:
                 blk.forward = MethodType(Patch._fix_block_forward_dino(), blk)
                 blk.attn._original_forward = blk.attn.forward
                 blk.attn.forward = MethodType(Patch._fix_mem_eff_attn(), blk.attn)
-            dino_model.forward_feats_attn = MethodType(  # type: ignore[attr-defined]
-                Patch._add_new_forward_features_dino(), dino_model
+            dino_any.forward_feats_attn = MethodType(
+                Patch._add_new_forward_features_dino(), dino_any
             )
         else:
-            for blk in dino_model.blocks:  # type: ignore[union-attr]
+            for blk in dino_any.blocks:
                 blk.forward = MethodType(Patch._fix_block_forward_dino(), blk)
                 blk.attn._original_forward = blk.attn.forward
                 blk.attn.forward = MethodType(Patch._fix_mem_eff_attn(), blk.attn)
-            dino_model.forward_feats_attn = MethodType(  # type: ignore[attr-defined]
-                Patch._add_new_forward_features_vit(), dino_model
+            dino_any.forward_feats_attn = MethodType(
+                Patch._add_new_forward_features_vit(), dino_any
             )
 
-    def get_n_patches(self, img_h: int, img_w: int) -> Tuple[int, int]:
+    def get_n_patches(self, img_h: int, img_w: int) -> tuple[int, int]:
         stride_l = self.stride[0]
         n_patch_h = 1 + (img_h - self.original_patch_size) // stride_l
         n_patch_w = 1 + (img_w - self.original_patch_size) // stride_l
         return n_patch_h, n_patch_w
 
     def set_transforms(
-        self, transforms: List[partial], inv_transforms: List[partial]
+        self, transforms: list[partial], inv_transforms: list[partial]
     ) -> None:
-        assert len(transforms) == len(
-            inv_transforms
-        ), "Each transform must have an inverse!"
+        assert len(transforms) == len(inv_transforms), (
+            "Each transform must have an inverse!"
+        )
         self.transforms = list(transforms)
         self.inverse_transforms = list(inv_transforms)
 
     def _upsample_patch_map(
         self,
         patch_map: torch.Tensor,
-        target_hw: Tuple[int, int],
+        target_hw: tuple[int, int],
         guidance_img: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.interpolation_mode == "jbu" and guidance_img is not None:
@@ -331,14 +324,14 @@ class HighResBackbone(nn.Module):
 
     @torch.no_grad()
     def get_transformed_input_batch(
-        self, x: torch.Tensor, transforms: List[partial]
+        self, x: torch.Tensor, transforms: list[partial]
     ) -> torch.Tensor:
         if len(transforms) == 0:
             self.transforms = [iden_partial]
             self.inverse_transforms = [iden_partial]
             transforms = self.transforms
 
-        img_list: List[torch.Tensor] = [tr_fn(x) for tr_fn in transforms]
+        img_list: list[torch.Tensor] = [tr_fn(x) for tr_fn in transforms]
         if img_list[0].ndim == 3:
             img_batch = torch.stack(img_list)
         else:

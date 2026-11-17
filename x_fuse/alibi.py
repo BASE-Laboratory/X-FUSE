@@ -11,25 +11,21 @@ https://github.com/tldr-group/dino-saw/blob/main/all_in_one_alibi_vit.py
 
 """
 
-import torch
-from torch import nn
-import torch.nn.functional as F
-from torchvision import transforms
-
-from timm import create_model
-from timm.data.transforms_factory import create_transform
-from timm.data.config import resolve_data_config
-from timm.layers.mlp import Mlp
-from timm.layers.attention import Attention
-from timm.models.vision_transformer import VisionTransformer, Block
-
-
-from typing import Type, Literal, Optional, Callable
-
-
 import re
-from typing import cast
+from collections.abc import Callable
 from types import MethodType
+from typing import Any, Literal, cast
+
+import torch
+import torch.nn.functional as F
+from timm import create_model
+from timm.data.config import resolve_data_config
+from timm.data.transforms_factory import create_transform
+from timm.layers.attention import Attention
+from timm.layers.mlp import Mlp
+from timm.models.vision_transformer import Block, VisionTransformer
+from torch import nn
+from torchvision import transforms
 
 FLASH_ATTN_INSTALLED = False
 try:
@@ -124,9 +120,9 @@ class PretrainedViTWrapper(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        assert (
-            model_identifier in MODEL_LIST
-        ), f"Model type {model_identifier} not tested yet."
+        assert model_identifier in MODEL_LIST, (
+            f"Model type {model_identifier} not tested yet."
+        )
         self.model_identifier = model_identifier
 
         self.stride = stride
@@ -169,7 +165,7 @@ class PretrainedViTWrapper(nn.Module):
 
     @property
     def n_output_dims(self) -> int:
-        assert self.model.pos_embed
+        assert self.model.pos_embed is not None
         return self.model.pos_embed.shape[-1]
 
     @property
@@ -212,7 +208,7 @@ class PretrainedViTWrapper(nn.Module):
         reshape: bool = True,
         return_prefix_tokens: bool = False,
         norm: bool = True,
-    ) -> list[torch.Tensor] | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> Any:
         return self.model.forward_intermediates(
             x,
             n,
@@ -258,7 +254,7 @@ def get_distance_matrix(
     normalize: bool = True,
     wrap: bool = False,
     add_cls: bool = True,
-    device: str = "cpu",
+    device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     coords = torch.stack(
@@ -268,9 +264,7 @@ def get_distance_matrix(
             indexing="ij",
         ),
         dim=-1,
-    ).reshape(
-        -1, 2
-    )  # (N, 2)
+    ).reshape(-1, 2)  # (N, 2)
     diff = coords.unsqueeze(1) - coords.unsqueeze(0)
     diff = diff.abs()
 
@@ -300,7 +294,9 @@ AlibiSlopeType = Literal["fixed", "learned", "constant"]
 
 
 def get_alibi_slope(
-    num_heads: int, slope_type: AlibiSlopeType = "constant", device: str = "cpu"
+    num_heads: int,
+    slope_type: AlibiSlopeType = "constant",
+    device: str | torch.device = "cpu",
 ) -> torch.Tensor | nn.Parameter:
     m: torch.Tensor | nn.Parameter
     match slope_type:
@@ -314,7 +310,7 @@ def get_alibi_slope(
         case "constant":
             m = torch.ones(num_heads, device=device)
         case _:
-            raise ValueError(f"Unknown slope type {type}")
+            raise ValueError(f"Unknown slope type {slope_type}")
 
     m = m.unsqueeze(-1).unsqueeze(-1)
     if slope_type == "learned":
@@ -384,10 +380,11 @@ class DistanceMatrixWrapper(nn.Module):
             # nop if nothing has changed
             return
 
-        try:
-            device = self.matrix.device
-            dtype = self.matrix.dtype
-        except AttributeError:
+        existing_mat = getattr(self, "matrix", None)
+        if isinstance(existing_mat, torch.Tensor):
+            device: str | torch.device = existing_mat.device
+            dtype: torch.dtype = existing_mat.dtype
+        else:
             device = "cpu"
             dtype = torch.float32
 
@@ -420,7 +417,7 @@ class AlibiAttention(Attention):
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        norm_layer: Type[nn.Module] = nn.LayerNorm,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
         slope_type: AlibiSlopeType = "constant",
     ) -> None:
         super().__init__(
@@ -442,7 +439,7 @@ class AlibiAttention(Attention):
         self.set_alibi_slope(slope_type)
 
     def set_alibi_slope(self, slope_type: AlibiSlopeType):
-        m = get_alibi_slope(  # type: ignore
+        m = get_alibi_slope(
             self.num_heads, slope_type=slope_type, device=self.qkv.weight.device
         )
 
@@ -453,7 +450,7 @@ class AlibiAttention(Attention):
         else:
             raise Exception(f"Unexpected slope type {type(m)}")
 
-    def forward(
+    def forward(  # type: ignore[override]
         self, x: torch.Tensor, attn_mask=None, attn_bias=None, **kwargs
     ) -> torch.Tensor:
         B, N, C = x.shape
@@ -498,11 +495,11 @@ class AlibiBlock(Block):
         proj_bias: bool = True,
         proj_drop: float = 0.0,
         attn_drop: float = 0.0,
-        init_values: Optional[float] = None,
+        init_values: float | None = None,
         drop_path: float = 0.0,
-        act_layer: Type[nn.Module] = nn.GELU,
-        norm_layer: Type[nn.Module] = nn.LayerNorm,
-        mlp_layer: Type[nn.Module] = Mlp,
+        act_layer: type[nn.Module] = nn.GELU,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
+        mlp_layer: type[nn.Module] = Mlp,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -564,7 +561,7 @@ class AlibiVitWrapper(PretrainedViTWrapper):
         )
 
         def block_fn_wrapper(
-            dim: int, num_heads: int, **block_kwargs: dict
+            dim: int, num_heads: int, **block_kwargs: Any
         ) -> AlibiBlock:
             return AlibiBlock(
                 distance_matrix=distance_matrix,

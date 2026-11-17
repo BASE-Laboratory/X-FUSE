@@ -13,7 +13,7 @@ Upgrades over v0.1:
 """
 
 from functools import partial
-from typing import Literal, Tuple, TypeAlias
+from typing import Literal, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -64,7 +64,7 @@ class XRDCrossAttention(nn.Module):
         self.psf_downsampler = ForwardPSFDownsampler()
 
     def _prepare_guide(
-        self, guide_map: torch.Tensor, target_hw: Tuple[int, int]
+        self, guide_map: torch.Tensor, target_hw: tuple[int, int]
     ) -> torch.Tensor:
         if guide_map.dim() == 2:
             guide_map = guide_map.unsqueeze(0).unsqueeze(0)
@@ -455,7 +455,6 @@ class CorrelativeFuser(HighResBackbone):
         interpolation_mode: Interpolation = "nearest-exact",
         pretrained: bool = True,
         lr: float = 1e-3,
-        *args,
         **kwargs,
     ):
         device = kwargs.get("device", None)
@@ -467,7 +466,6 @@ class CorrelativeFuser(HighResBackbone):
             track_grad=track_grad,
             pretrained=pretrained,
             interpolation_mode=interpolation_mode,
-            *args,
             **kwargs,
         )
         self.xrd_fuse_method: FusionOptions = xrd_fuse_method
@@ -559,16 +557,16 @@ class CorrelativeFuser(HighResBackbone):
         x: torch.Tensor,
         attn_choice: AttentionOptions = "none",
         top_k: int | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run TTA-ensembled feature extraction + guide fusion while tracking
         online Welford spatial variance across transforms in ``O(1)`` extra memory.
 
         Returns:
             ``(mean_features, feature_variance)`` each of shape ``(1, C, H, W)``.
         """
-        assert (
-            self.xrd_fusion_module is not None
-        ), "Call set_guide_transforms / set_xrd_transforms before forward."
+        assert self.xrd_fusion_module is not None, (
+            "Call set_guide_transforms / set_xrd_transforms before forward."
+        )
 
         x_in = x.to(self.dtype) if self.dtype != torch.float32 else x.clone()
         img_batch = self.get_transformed_input_batch(x_in, self.transforms)
@@ -689,9 +687,9 @@ class CorrelativeFuser(HighResBackbone):
         full ``UncertaintyReport`` (chemical entropy, TTA epistemic variance, and
         physical forward-model residual) in a single TTA sweep."""
         if guide_lr is None:
-            assert (
-                self.xrd_fusion_module is not None
-            ), "Provide guide_lr or call set_guide_transforms first."
+            assert self.xrd_fusion_module is not None, (
+                "Provide guide_lr or call set_guide_transforms first."
+            )
             guide_lr = self.xrd_fusion_module.xrd_image
         if guide_lr.ndim == 2:
             guide_lr = guide_lr.unsqueeze(0).unsqueeze(0)

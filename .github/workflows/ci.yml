@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**", "chore/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  quality:
+    name: Lint, Format & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install developer dependencies
+        run: uv sync --extra cpu --extra dev
+
+      - name: Check lint rules (Ruff)
+        run: uv run ruff check x_fuse tests benchmarks
+
+      - name: Check code formatting (Ruff)
+        run: uv run ruff format --check x_fuse tests benchmarks
+
+      - name: Static type check (Mypy)
+        run: uv run mypy x_fuse
+
+  test:
+    name: Unit Tests (Py ${{ matrix.python-version }} / ${{ matrix.os }})
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --python ${{ matrix.python-version }} --extra cpu --extra dev
+
+      - name: Run CPU test suite with coverage gate
+        run: >
+          uv run pytest -m "not gpu"
+          --cov=x_fuse
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=80
+          -v
+
+      - name: Upload coverage report
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  build-and-smoke:
+    name: Package Build & Benchmark Smoke
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Verify isolated wheel installation & CLI outside repo
+        run: |
+          uv venv /tmp/xfuse-wheel-smoke
+          uv pip install --python /tmp/xfuse-wheel-smoke \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --index-strategy unsafe-best-match \
+            dist/*.whl
+          cd /tmp
+          /tmp/xfuse-wheel-smoke/bin/xfuse --version
+          /tmp/xfuse-wheel-smoke/bin/xfuse info
+          /tmp/xfuse-wheel-smoke/bin/xfuse datasets --json
+
+      - name: Run synthetic & bundled-sample benchmark smoke suite
+        run: |
+          uv sync --extra cpu --extra dev
+          uv run python -m benchmarks.run_synthetic_suite --quick
+
+      - name: Upload smoke benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-outputs
+          path: |
+            dist/*
+            benchmarks/outputs/*
