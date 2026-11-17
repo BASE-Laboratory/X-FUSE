@@ -1,278 +1,72 @@
 # Installation Guide
 
-This guide covers installing X-FUSE with support for both macOS (CPU) and Linux (CUDA) systems for reproducible environments.
+`x-fuse` (`v0.2.0+`) is a **100% self-contained pure-PyTorch package** with no external sub-repositories or custom C++/CUDA extensions to compile. It runs cleanly on Linux, macOS (Intel & Apple Silicon), and Windows.
 
 ## Prerequisites
 
-### Required
-- **Python 3.10** or higher (3.10, 3.11, 3.12 supported)
-- **uv** package manager ([install here](https://docs.astral.sh/uv/getting-started/installation/))
+- **Python 3.10+** (`3.10`, `3.11`, or `3.12`)
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** (recommended) or standard `pip`
 
-### Optional
-- **Git** (for cloning the repository)
-- **CUDA Toolkit 12.1** (Linux only, for GPU acceleration)
+---
 
-## Quick Start
+## Quick Installation with `uv`
 
-### macOS (CPU-only)
+### 1. Linux / macOS (CPU)
+
 ```bash
-# Clone the repository
-git clone <repository-url>
+git clone https://github.com/BASE-Laboratory/X-FUSE.git
 cd X-FUSE
 
-# Install dependencies (CPU-only)
-uv sync
-
-# Activate virtual environment
-source .venv/bin/activate
+uv sync --extra cpu --extra dev --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-### Linux (CUDA 12.1)
+### 2. Linux (CUDA 12.1 GPU)
+
 ```bash
-# Clone the repository
-git clone <repository-url>
+git clone https://github.com/BASE-Laboratory/X-FUSE.git
 cd X-FUSE
 
-# Install dependencies with CUDA support
-uv sync --extra cuda
-
-# Activate virtual environment
-source .venv/bin/activate
+uv sync --extra cuda --extra dev
 ```
 
-## Detailed Installation
-
-### 1. Clone and Navigate
+### 3. Standard `pip` Installation
 
 ```bash
-git clone <repository-url>
-cd X-FUSE
+pip install -e ".[dev,synthetic]"
 ```
 
-### 2. Install with uv
+---
 
-#### For macOS (CPU-only):
-```bash
-# Default installation (CPU PyTorch)
-uv sync
+## Optional Dependency Extras
 
-# This installs:
-# - featup (with CPU support)
-# - hr_dv2 (with CPU support)
-# - All dependencies using macOS-compatible wheels
-```
+| Extra | Command (`uv sync ...`) | Included Packages / Purpose |
+| :--- | :--- | :--- |
+| `io` | `--extra io` | `tifffile`, `zarr`, `rosettasciio` for OME-TIFF/Zarr export & vendor `.emd`/`.dm4`/`.bcf`/`.hspy` readers |
+| `dev` | `--extra dev` | `pytest`, `pytest-cov`, `pytest-benchmark`, `ruff`, `mypy`, `nbformat`, `nbstripout`, `pre-commit` |
+| `docs` | `--extra docs` | `mkdocs`, `mkdocs-material`, `mkdocstrings[python]` for building documentation |
+| `synthetic` | `--extra synthetic` | `porespy` for classical PoreSpy blob/sphere generators |
+| `sam` | `--extra sam` | `sam2` for certainty-guided SAM2 boundary refinement (`refine_with_sam2`) |
+| `notebooks` | `--extra notebooks` | `jupyterlab`, `ipykernel`, `ipywidgets` for interactive notebooks |
+| `cuda` | `--extra cuda` | CUDA-enabled PyTorch & `xformers` on Linux x86_64 |
+| `cpu` | `--extra cpu` | Explicit CPU wheel marker |
 
-#### For Linux (CUDA 12.1):
-```bash
-# Installation with CUDA support
-uv sync --extra cuda
+---
 
-# This installs:
-# - featup (with CUDA 12.1 support and extensions)
-# - hr_dv2 (with CUDA 12.1 support)
-# - CUDA-enabled PyTorch wheels
-```
-
-#### For Linux (CPU fallback):
-```bash
-# If CUDA is not available or preferred
-uv sync --extra cpu
-```
-
-### 3. Verify Installation
+## Verify Your Setup
 
 ```bash
-# Activate the environment
-source .venv/bin/activate
+# 1. Verify package import & version
+uv run python -c "import x_fuse; print('x-fuse version:', x_fuse.__version__)"
 
-# Test imports
-python -c "import torch; import featup; import hr_dv2; print('✓ All packages installed successfully')"
+# 2. Run the CPU unit test suite with >=82% coverage gate
+uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=82 -v
 
-# Check PyTorch CUDA availability (Linux)
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+# 3. Run the quick synthetic & paper ablation benchmarks
+uv run python -m benchmarks.run_synthetic_suite --quick
+uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir /tmp/xfuse_paper_quick
+
+# 4. Check Ruff formatting/lint, Mypy types, and strict MkDocs build
+uv run ruff check x_fuse tests benchmarks
+uv run mypy x_fuse
+NO_MKDOCS_2_WARNING=1 uv run mkdocs build --strict
 ```
-
-## Lock Files and Reproducibility
-
-### Generate a Lock File
-
-Lock files ensure reproducible installations across different machines and time:
-
-```bash
-# Generate lock file for current platform
-uv lock
-
-# This creates `uv.lock` - commit this to version control
-git add uv.lock
-git commit -m "Add reproducible lock file"
-```
-
-### Use Existing Lock File
-
-When cloning on another machine:
-
-```bash
-# uv automatically uses uv.lock if it exists
-uv sync
-
-# Force use of lock file
-uv sync --locked
-```
-
-## Development Setup
-
-### Install with Development Dependencies
-
-```bash
-# macOS development setup
-uv sync --extra dev
-
-# Linux development setup with CUDA
-uv sync --extra dev --extra cuda
-```
-
-### Development Tools Included
-- **pytest** - Unit testing
-- **pytest-cov** - Code coverage
-- **pytest-benchmark** - Performance benchmarking
-- **ipython** - Enhanced Python REPL (FeatUp only)
-- **jupyter** - Jupyter notebooks (FeatUp only)
-
-### Run Tests
-
-```bash
-# Activate environment
-source .venv/bin/activate
-
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov
-
-# Run benchmarks
-pytest --benchmark-only
-```
-
-## Troubleshooting
-
-### Issue: "ModuleNotFoundError" after installation
-
-**Solution:**
-```bash
-# Ensure virtual environment is activated
-source .venv/bin/activate
-
-# Reinstall packages
-uv sync --force
-```
-
-### Issue: CUDA-related errors on Linux
-
-**Solutions:**
-1. Check CUDA toolkit installation:
-   ```bash
-   nvidia-smi
-   nvcc --version
-   ```
-
-2. Ensure CUDA 12.1 compatibility:
-   ```bash
-   python -c "import torch; print(torch.__version__)"
-   ```
-
-3. Fallback to CPU:
-   ```bash
-   uv sync --extra cpu
-   ```
-
-### Issue: macOS M1/M2 ARM64 specific issues
-
-**Solution:** uv automatically selects the correct ARM64 wheels. If issues persist:
-
-```bash
-# Force reinstall native wheels
-rm -rf .venv
-uv sync --force
-```
-
-### Issue: Different results between Mac and Linux
-
-**Ensure reproducibility:**
-1. Use the same `uv.lock` file on both systems
-2. Check Python version: `python --version`
-3. Verify torch CUDA availability matches expected platform
-
-## Platform Comparison
-
-| Feature | macOS | Linux |
-|---------|-------|-------|
-| PyTorch | CPU-only | CUDA 12.1 |
-| CUDA Extensions (FeatUp) | ❌ Not built | ✅ Built |
-| Installation | `uv sync` | `uv sync --extra cuda` |
-| Performance | CPU-bound | GPU-accelerated |
-| Reproducible | ✅ Yes | ✅ Yes |
-
-## Advanced Usage
-
-### Override PyTorch Version
-
-```bash
-# Use different CUDA version (e.g., CUDA 12.4)
-uv sync --override torch=torch[cu124]
-
-# Use development version
-uv sync --override torch=torch[dev,cu121]
-```
-
-### Clean Installation
-
-```bash
-# Remove virtual environment and lock file
-rm -rf .venv uv.lock
-
-# Fresh install
-uv sync
-```
-
-### Check Dependency Tree
-
-```bash
-# Show all installed packages
-pip list
-
-# Show dependency tree (if pipdeptree installed)
-pip install pipdeptree
-pipdeptree
-```
-
-## Continuous Integration / Automation
-
-### GitHub Actions Example
-
-```yaml
-- name: Install X-FUSE on macOS
-  if: runner.os == 'macos'
-  run: |
-    uv sync --locked
-
-- name: Install X-FUSE on Linux with CUDA
-  if: runner.os == 'linux'
-  run: |
-    uv sync --locked --extra cuda
-```
-
-## Support
-
-For issues with:
-- **Installation**: Check the [uv documentation](https://docs.astral.sh/uv/)
-- **FeatUp package**: See [FeatUp GitHub](https://github.com/mhamilton723/FeatUp)
-- **HR-Dv2 package**: See [HR-Dv2 GitHub](https://github.com/tldr-group/HR-Dv2)
-
-## Next Steps
-
-After successful installation:
-1. Check out example notebooks in `FeatUp/example_usage.ipynb`
-2. Run tests: `pytest`
-3. Review package documentation in respective READMEs
-4. Explore the Gradio app: `python FeatUp/gradio_app.py` (FeatUp)

@@ -1,17 +1,35 @@
-# this file stores the data loaders and data loading functions for the X-FUSE framework
+"""Data loading utilities for synchrotron tomography (XCT + XRD-CT), electron
+microscopy (SEM/STEM + EDS/EELS), and generic correlative TIFF/HDF5 pairs.
+"""
 
-import numpy as np
-import h5py
 import os
+import re
+from collections.abc import Sequence
+from pathlib import Path
+
+import h5py
+import numpy as np
+from PIL import Image
+
+
+def _natural_sort_key(name: str):
+    return [
+        int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", name)
+    ]
 
 
 def load_xct(xct_path: str, recon: str = "Tomopy", **kwargs) -> np.ndarray:
-    assert xct_path.endswith(".h5"), "Expected a .h5 file for the xct data."
+    """Load reconstructed 3D XCT volume from Diamond HDF5 file as ``(Y, X, Z)``."""
+    assert str(xct_path).endswith(".h5"), "Expected a .h5 file for the xct data."
 
     recon_methods = {
         "Tomopy": "4-TomopyRecon-tomo",
         "Astra": "4-AstraReconGpu-tomo",
     }
+    if recon not in recon_methods:
+        raise KeyError(
+            f"Unknown recon method '{recon}'. Choose from {list(recon_methods)}"
+        )
 
     with h5py.File(xct_path, "r") as f:
         return np.transpose(np.array(f[recon_methods[recon]]["data"]), (1, 2, 0))
@@ -19,35 +37,37 @@ def load_xct(xct_path: str, recon: str = "Tomopy", **kwargs) -> np.ndarray:
 
 def load_xrdct_phase(
     phase_folder: str,
-    phases: list,
-    shape: list,
+    phases: Sequence[str],
+    shape: Sequence[int],
     crop: slice = slice(None),
-    entry_names: dict[str, str] = {"default": "data"},
+    entry_names: dict[str, str] | None = None,
     **kwargs,
 ) -> list[np.ndarray]:
+    """Load stacked NeXus (``.nxs``) XRD-CT slices in deterministic natural order."""
+    resolved_entries = entry_names if entry_names is not None else {"default": "data"}
+    default_entry = resolved_entries.get("default", "data")
 
-    xrdct_data = []
-    for i in range(len(phases)):
-        files = [f for f in os.listdir(phase_folder) if phases[i].lower() in f.lower()][
-            crop
-        ]
+    all_entries = sorted(os.listdir(phase_folder), key=_natural_sort_key)
+    xrdct_data: list[np.ndarray] = []
 
-        assert (
-            len(files) > 0
-        ), f"No files found for phase {phases[i]} in folder {phase_folder}."
-        assert any(
-            f.endswith(".nxs") for f in files
-        ), f"Expected .nxs files for phase {phases[i]}, but found none."
-        assert (
-            len(files) == shape[0]
-        ), f"Expected {shape[0]} files for phase {phases[i]}, but found {len(files)}."
+    for phase in phases:
+        files = [f for f in all_entries if phase.lower() in f.lower()][crop]
 
-        xrdct_i = np.zeros(shape)
+        assert len(files) > 0, (
+            f"No files found for phase {phase} in folder {phase_folder}."
+        )
+        assert any(f.endswith(".nxs") for f in files), (
+            f"Expected .nxs files for phase {phase}, but found none."
+        )
+        assert len(files) == shape[0], (
+            f"Expected {shape[0]} files for phase {phase}, but found {len(files)}."
+        )
+
+        entry_key = resolved_entries.get(phase, default_entry)
+        xrdct_i = np.zeros(shape, dtype=np.float64)
         for idx in range(shape[0]):
             with h5py.File(os.path.join(phase_folder, files[idx]), "r") as file:
-                data = np.transpose(
-                    np.array(file[entry_names.get(phases[i])]), (0, 1, 2)
-                )
+                data = np.array(file[entry_key])
                 xrdct_i[idx] += data.squeeze()
         xrdct_data.append(xrdct_i)
 
@@ -55,27 +75,94 @@ def load_xrdct_phase(
 
 
 def load_diad_xct_zn13x(xct_path: str, **kwargs) -> np.ndarray:
+    """Load and crop DIAD Zn13X Astra-reconstructed XCT volume."""
     return load_xct(xct_path, recon="Astra")[150:2000, 350:2200, 350:2200]
 
 
 def load_diad_xrdct(
-    phase_folder: str, phases: list[str] = ["Na", "Zn"], **kwargs
+    phase_folder: str,
+    phases: Sequence[str] | None = None,
+    **kwargs,
 ) -> dict[str, np.ndarray]:
+    """Load DIAD XRD-CT NeXus phase stacks as ``{phase_name: (Z, Y, X)}``."""
+    phase_list = list(phases) if phases is not None else ["Na", "Zn"]
     phase_arrays = load_xrdct_phase(
         phase_folder,
         shape=(21, 20, 20),
-        phases=phases,
+        phases=phase_list,
         crop=slice(5, -1),
-        entry_names=dict(
-            {"Na": "entry/peak at q~1.651", "Zn": "entry/peak at q~1.656"}
-        ),
+        entry_names={
+            "Na": "entry/peak at q~1.651",
+            "Zn": "entry/peak at q~1.656",
+            "default": "data",
+        },
         **kwargs,
     )
 
     return {
-        phase: np.flip(arr, axis=2).copy() for phase, arr in zip(phases, phase_arrays)
+        phase: np.flip(arr, axis=2).copy()
+        for phase, arr in zip(phase_list, phase_arrays, strict=False)
     }
 
 
 def load_i13_xct(xct_path: str, **kwargs) -> np.ndarray:
+    """Load Diamond I13 Tomopy-reconstructed XCT volume."""
     return load_xct(xct_path, recon="Tomopy")
+
+
+# ── Modality-Agnostic Correlative Loaders ─────────────────────────────────────
+
+
+def load_image_array(path: str | Path) -> np.ndarray:
+    """Load a 2D/3D TIFF, PNG, or NPY micrograph/map preserving bit depth as float32."""
+    p = Path(path)
+    if p.suffix.lower() == ".npy":
+        return np.load(p).astype(np.float32)
+    with Image.open(p) as img:
+        return np.array(img, dtype=np.float32)
+
+
+def load_correlative_tiff_pair(
+    hr_path: str | Path,
+    guide_paths: Sequence[str | Path] | dict[str, str | Path],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Load a high-res structural image (e.g. BSE-SEM, HAADF-STEM, XCT slice)
+    and one or more coarse physical guide maps (e.g. multi-element EDS, XRD-CT).
+
+    Returns:
+        ``(hr_image, guide_stack, channel_names)`` where ``guide_stack`` has
+        shape ``(M, H_lr, W_lr)``.
+    """
+    hr_img = load_image_array(hr_path)
+    if isinstance(guide_paths, dict):
+        names = list(guide_paths.keys())
+        paths = list(guide_paths.values())
+    else:
+        paths = list(guide_paths)
+        names = [Path(p).stem for p in paths]
+
+    maps = [load_image_array(p) for p in paths]
+    shapes = {m.shape for m in maps}
+    if len(shapes) > 1:
+        raise ValueError(f"All guide maps must share spatial dimensions, got {shapes}.")
+    guide_stack = np.stack(maps, axis=0).astype(np.float32)
+    return hr_img, guide_stack, names
+
+
+def load_eds_text_hypermap(
+    folder: str | Path,
+    prefix: str,
+    elements: Sequence[str],
+    bse_suffix: str = "BSE",
+    delimiter: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Load ``edxia``-style SEM-BSE + multi-element EDS ASCII/CSV maps
+    (e.g. ``{prefix}_BSE.txt``, ``{prefix}_Ca.txt``, ``{prefix}_Si.txt``)."""
+    root = Path(folder)
+    bse_path = root / f"{prefix}_{bse_suffix}.txt"
+    hr_bse = np.loadtxt(bse_path, delimiter=delimiter, dtype=np.float32)
+    elem_maps = [
+        np.loadtxt(root / f"{prefix}_{el}.txt", delimiter=delimiter, dtype=np.float32)
+        for el in elements
+    ]
+    return hr_bse, np.stack(elem_maps, axis=0), list(elements)

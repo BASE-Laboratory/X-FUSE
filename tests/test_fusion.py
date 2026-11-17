@@ -1,6 +1,7 @@
 import pytest
 import torch
-from x_fuse.fusion import XRDCrossAttention, LearnedChannelGating, XRDFusionMethod
+
+from x_fuse.fusion import LearnedChannelGating, XRDCrossAttention, XRDFusionMethod
 
 # ── XRDCrossAttention ──────────────────────────────────────────────────────────
 

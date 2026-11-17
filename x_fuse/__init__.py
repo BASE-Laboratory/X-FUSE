@@ -1,9 +1,181 @@
-"""
-X-FUSE: XRD Fusion toolkit integrating FeatUp and HR-Dv2 models.
-
-This is a workspace package that coordinates the FeatUp and HR-Dv2 modules.
+"""X-FUSE: Physics-Guided Foundation-Model Feature Fusion & Uncertainty-Aware
+Segmentation for Correlative Multiscale Materials Imaging.
 """
 
-__version__ = "0.1.0"
+from .active import (
+    ActiveROI2D,
+    ActiveSliceRecommendation,
+    suggest_2d_rois,
+    suggest_next_slices,
+)
+from .backbones import HighResBackbone, HighResDV2, LayerSelection, load_backbone
+from .datasets import (
+    OPEN_DATASETS,
+    OpenCorrelativeDataset,
+    fetch_open_dataset,
+    get_sample_dataset_path,
+    list_open_datasets,
+    make_experimental_holdout,
+)
+from .fusion import (
+    CorrelativeFuser,
+    FusionOptions,
+    GuideFusionMethod,
+    LearnedChannelGating,
+    LossOptions,
+    SpatialCrossAttention,
+    XFuse,
+    XRDCrossAttention,
+    XRDFusionMethod,
+    compute_channel_correlation_gates,
+)
+from .io import (
+    load_microscopy_file,
+    load_uncertainty_report,
+    save_uncertainty_report,
+)
+from .loaders import (
+    load_correlative_tiff_pair,
+    load_diad_xrdct,
+    load_eds_text_hypermap,
+    load_image_array,
+    load_xct,
+    load_xrdct_phase,
+)
+from .registration import AlignMode, DifferentiableGuideAligner
+from .segment import (
+    bicubic_upsample_baseline,
+    compute_segmentation_metrics,
+    dino_kmeans_baseline,
+    do_single_pca,
+    jbu_guided_baseline,
+    pca_otsu_segment,
+    refine_with_sam2,
+    rescale_pca,
+)
+from .synthetic import (
+    CorrelativePhantom2D,
+    CorrelativePhantom3D,
+    generate_correlative_phantom_2d,
+    generate_correlative_phantom_3d,
+)
+from .tiling import generate_tile_boxes, hann_window_2d, run_tiled_2d
+from .transforms import (
+    build_default_tta,
+    combine_transforms,
+    ensure_spatial_divisible,
+    get_flip_transforms,
+    get_rotation_transforms,
+    get_shift_transforms,
+    normalize_structural,
+)
+from .uncertainty import (
+    UncertaintyReport,
+    WelfordAccumulator,
+    brier_score,
+    build_uncertainty_report,
+    compute_bald_mutual_information,
+    compute_physical_residual,
+    compute_posterior_uncertainty,
+    expected_calibration_error,
+    match_coarse_priors,
+    sparsification_curve,
+)
+from .upsamplers import (
+    ForwardPSFDownsampler,
+    JointBilateralUpsampler,
+    joint_bilateral_upsample,
+)
+from .utils import downsample_xrdct, get_multiphase, guide_to_tensor, xrd_to_tensor
+from .volumetric import (
+    VolumeSliceAccessor,
+    VolumetricFuser,
+    VolumetricUncertaintyReport,
+    pack_25d_slice,
+    z_slice_consistency_score,
+)
 
-__all__ = ["__version__"]
+__version__ = "0.4.0"
+
+__all__ = [
+    "__version__",
+    "CorrelativeFuser",
+    "XFuse",
+    "HighResBackbone",
+    "HighResDV2",
+    "LayerSelection",
+    "load_backbone",
+    "LearnedChannelGating",
+    "XRDCrossAttention",
+    "SpatialCrossAttention",
+    "XRDFusionMethod",
+    "GuideFusionMethod",
+    "FusionOptions",
+    "LossOptions",
+    "compute_channel_correlation_gates",
+    "AlignMode",
+    "DifferentiableGuideAligner",
+    "generate_tile_boxes",
+    "hann_window_2d",
+    "run_tiled_2d",
+    "JointBilateralUpsampler",
+    "ForwardPSFDownsampler",
+    "joint_bilateral_upsample",
+    "UncertaintyReport",
+    "WelfordAccumulator",
+    "compute_posterior_uncertainty",
+    "compute_bald_mutual_information",
+    "compute_physical_residual",
+    "match_coarse_priors",
+    "build_uncertainty_report",
+    "expected_calibration_error",
+    "brier_score",
+    "sparsification_curve",
+    "VolumeSliceAccessor",
+    "VolumetricFuser",
+    "VolumetricUncertaintyReport",
+    "pack_25d_slice",
+    "z_slice_consistency_score",
+    "ActiveSliceRecommendation",
+    "ActiveROI2D",
+    "suggest_next_slices",
+    "suggest_2d_rois",
+    "save_uncertainty_report",
+    "load_uncertainty_report",
+    "load_microscopy_file",
+    "pca_otsu_segment",
+    "do_single_pca",
+    "rescale_pca",
+    "bicubic_upsample_baseline",
+    "jbu_guided_baseline",
+    "dino_kmeans_baseline",
+    "compute_segmentation_metrics",
+    "refine_with_sam2",
+    "CorrelativePhantom2D",
+    "CorrelativePhantom3D",
+    "generate_correlative_phantom_2d",
+    "generate_correlative_phantom_3d",
+    "OPEN_DATASETS",
+    "OpenCorrelativeDataset",
+    "list_open_datasets",
+    "fetch_open_dataset",
+    "get_sample_dataset_path",
+    "make_experimental_holdout",
+    "load_xct",
+    "load_xrdct_phase",
+    "load_diad_xrdct",
+    "load_image_array",
+    "load_correlative_tiff_pair",
+    "load_eds_text_hypermap",
+    "guide_to_tensor",
+    "xrd_to_tensor",
+    "get_multiphase",
+    "downsample_xrdct",
+    "build_default_tta",
+    "combine_transforms",
+    "get_shift_transforms",
+    "get_flip_transforms",
+    "get_rotation_transforms",
+    "normalize_structural",
+    "ensure_spatial_divisible",
+]
