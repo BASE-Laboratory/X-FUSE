@@ -150,7 +150,7 @@ class VolumetricFuser:
     def _vol_stats(self, hr_volume: np.ndarray) -> tuple[float, float]:
         lo, hi = np.percentile(hr_volume, (0.5, 99.5))
         if hi - lo < 1e-8:
-            lo, hi = float(hr_volume.min()), float(hr_volume.max())
+            lo, hi = float(np.min(hr_volume)), float(np.max(hr_volume))
         return float(lo), float(hi)
 
     def _prepare_slab_tensor(

@@ -192,7 +192,7 @@ def normalize_structural(
         lo, hi = np.percentile(arr, clip_percentiles)
         arr = np.clip(arr, lo, hi)
 
-    mn, mx = float(arr.min()), float(arr.max())
+    mn, mx = float(np.min(arr)), float(np.max(arr))
     if mx - mn > 1e-12:
         arr = (arr - mn) / (mx - mn)
     else:

@@ -100,7 +100,7 @@ def pca_otsu_segment(
             pc1 = -pc1
 
     pc1_np = pc1.detach().cpu().numpy().astype(np.float32)
-    mn, mx = float(pc1_np.min()), float(pc1_np.max())
+    mn, mx = float(np.min(pc1_np)), float(np.max(pc1_np))
     if mx - mn < 1e-8:
         return np.zeros((height, width), dtype=np.int64), np.zeros_like(pc1_np)
 

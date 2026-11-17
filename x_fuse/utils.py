@@ -83,7 +83,7 @@ def get_multiphase(
             phase_b_mask[phase_a != phase_b] = 1
             phase_b = phase_b_mask.astype(np.float32)
 
-        g_min, g_max = float(gray_img.min()), float(gray_img.max())
+        g_min, g_max = float(np.min(gray_img)), float(np.max(gray_img))
         if g_max - g_min > 1e-8:
             gray_img = ((gray_img - g_min) / (g_max - g_min)).astype(np.float32)
 
