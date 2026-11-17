@@ -1,159 +1,334 @@
-from hr_dv2.high_res import HighResDV2
-import torch
-import torch.nn as nn
-from torch.nn.modules.utils import _pair
-from types import MethodType
+"""Physics-guided foundation-model feature fusion modules and the unified
+``CorrelativeFuser`` (aliased as ``XFuse``) engine.
 
-import torch.nn.functional as F
-import re
-
-from timm import create_model
+Upgrades over v0.1:
+- Single-pass ViT backbone initialization (no double ``torch.hub`` loading).
+- Vectorized multi-channel correlation/BCE gating across all ``C`` ViT channels
+  and ``M`` physical guide channels simultaneously.
+- Forward-PSF downsampling loss (``forward_psf_bce`` / ``forward_psf_mse``)
+  supervising sharp HR phase predictions against coarse physical measurements.
+- Device-safe and trainable ``XRDCrossAttention`` / ``SpatialCrossAttention``.
+- Extract-once multi-channel fusion + online Welford TTA epistemic variance +
+  optional pure-PyTorch Joint Bilateral Upsampling (JBU).
+"""
 
 from functools import partial
-from typing import List, Tuple, TypeAlias, Literal
+from typing import Literal, Tuple, TypeAlias
 
-from .utils import get_alibi_model, get_dv3_model
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-Interpolation: TypeAlias = Literal[
-    "nearest", "linear", "bilinear", "bicubic", "trilinear", "area", "nearest-exact"
-]
-AttentionOptions: TypeAlias = Literal["q", "k", "v", "o", "none"]
+from .backbones import HighResBackbone, Interpolation
+from .uncertainty import (
+    UncertaintyReport,
+    WelfordAccumulator,
+    build_uncertainty_report,
+    match_coarse_priors,
+)
+from .upsamplers import ForwardPSFDownsampler
+from .vit_patch import AttentionOptions
+
 FusionOptions: TypeAlias = Literal["gating", "learned_gating", "attention"]
+LossOptions: TypeAlias = Literal["pearson", "bce", "forward_psf_bce", "forward_psf_mse"]
 
 
 class XRDCrossAttention(nn.Module):
-    """Cross-attention: XRD attends to feature space to find relevant features."""
+    """Cross-attention where ``M`` coarse physical guide channels query the
+    dense ``(B, C, H, W)`` ViT feature space."""
 
-    def __init__(self, feat_dim: int = 384, num_heads: int = 8):
+    def __init__(
+        self,
+        feat_dim: int = 384,
+        num_heads: int = 8,
+        guide_channels: int = 1,
+        loss_fn: LossOptions = "bce",
+    ):
         super().__init__()
+        # Fall back cleanly when feat_dim % num_heads != 0 (e.g. ViT-T 192 / 8)
+        while feat_dim % num_heads != 0 and num_heads > 1:
+            num_heads -= 1
         self.feat_dim = feat_dim
         self.num_heads = num_heads
+        self.guide_channels = guide_channels
+        self.loss_fn = loss_fn
 
-        # Project XRD intensity to query space
-        self.xrd_to_query = nn.Linear(1, feat_dim)
-
-        # Multi-head attention layer
+        self.xrd_to_query = nn.Linear(guide_channels, feat_dim)
         self.attention = nn.MultiheadAttention(
             embed_dim=feat_dim,
             num_heads=num_heads,
             batch_first=True,
             dropout=0.1,
         )
+        self.pred_head = nn.Linear(feat_dim, guide_channels)
+        self.psf_downsampler = ForwardPSFDownsampler()
+
+    def _prepare_guide(
+        self, guide_map: torch.Tensor, target_hw: Tuple[int, int]
+    ) -> torch.Tensor:
+        if guide_map.dim() == 2:
+            guide_map = guide_map.unsqueeze(0).unsqueeze(0)
+        elif guide_map.dim() == 3:
+            guide_map = guide_map.unsqueeze(0)
+        if guide_map.shape[-2:] != target_hw:
+            guide_map = F.interpolate(
+                guide_map.float(),
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return guide_map
 
     def forward(self, features: torch.Tensor, xrd_map: torch.Tensor) -> torch.Tensor:
-        """
-        Cross-attention: XRD queries the feature space.
+        """Modulate ``features`` ``(B, C, H, W)`` via guide-queried cross-attention."""
+        bsz, channels, height, width = features.shape
+        orig_dtype = features.dtype
 
-        Args:
-            features: (B, C, H, W) DINO features
-            xrd_map: (1, 1, H, W) or (H, W) XRD intensity map
+        guide = self._prepare_guide(xrd_map, (height, width)).to(
+            device=features.device, dtype=orig_dtype
+        )
+        feat_flat = features.reshape(bsz, channels, -1).permute(0, 2, 1)  # (B, H*W, C)
+        guide_flat = guide.reshape(guide.shape[0], guide.shape[1], -1).permute(0, 2, 1)
 
-        Returns:
-            attended_features: (B, C, H, W) features modulated by XRD attention
-        """
-        B, C = features.shape[:2]
+        queries = self.xrd_to_query(guide_flat)  # (B_g, H*W, C)
+        if queries.shape[0] == 1 and bsz > 1:
+            queries = queries.expand(bsz, -1, -1)
 
-        # Ensure xrd_map has same spatial dims as features
-        if xrd_map.dim() == 2:
-            xrd_map = xrd_map.unsqueeze(0).unsqueeze(0)
-        elif xrd_map.dim() == 3:
-            xrd_map = xrd_map.unsqueeze(0)
+        attended, _ = self.attention(queries, feat_flat, feat_flat)
+        return attended.permute(0, 2, 1).reshape(features.shape).to(orig_dtype)
 
-        # Flatten spatial dimensions
-        feat_flat = features.reshape(B, C, -1).permute(0, 2, 1)  # (B, H*W, C)
-        xrd_flat = xrd_map.reshape(1, -1, 1)  # (1, H*W, 1)
+    def predict_logits(
+        self, features: torch.Tensor, guide_map: torch.Tensor
+    ) -> torch.Tensor:
+        attended = self.forward(features.float(), guide_map.float())
+        bsz, channels, height, width = attended.shape
+        logits = self.pred_head(attended.permute(0, 2, 3, 1))
+        return logits.permute(0, 3, 1, 2).reshape(
+            bsz, self.guide_channels, height, width
+        )
 
-        # Project XRD to query space
-        queries = self.xrd_to_query(xrd_flat)  # (1, H*W, feat_dim)
-
-        # Expand features batch dimension to match queries if needed
-        if B > 1:
-            # Repeat queries for each batch
-            queries = queries.expand(B, -1, -1)  # (B, H*W, feat_dim)
-            feat_batch = feat_flat  # (B, H*W, feat_dim)
-        else:
-            feat_batch = feat_flat  # (B, H*W, feat_dim)
-
-        # Cross-attention: XRD queries attend to feature space
-        attended, _ = self.attention(queries, feat_batch, feat_batch)  # (B, H*W, C)
-
-        # Reshape back to spatial dimensions
-        attended = attended.permute(0, 2, 1).reshape(features.shape)  # (B, C, H, W)
-
-        return attended
+    def compute_loss(
+        self, features: torch.Tensor, guide_map: torch.Tensor
+    ) -> torch.Tensor:
+        if guide_map.dim() == 2:
+            guide_map = guide_map.unsqueeze(0).unsqueeze(0)
+        elif guide_map.dim() == 3:
+            guide_map = guide_map.unsqueeze(0)
+        logits = self.predict_logits(features.float(), guide_map.float())
+        target = guide_map.float().to(logits.device)
+        if target.shape[0] == 1 and logits.shape[0] > 1:
+            target = target.expand(logits.shape[0], -1, -1, -1)
+        if target.shape[-2:] != logits.shape[-2:]:
+            pred_coarse = self.psf_downsampler(logits, target.shape[-2:])
+            return F.binary_cross_entropy_with_logits(pred_coarse, target)
+        return F.binary_cross_entropy_with_logits(logits, target)
 
 
-LossOptions: TypeAlias = Literal["pearson", "bce"]
+SpatialCrossAttention = XRDCrossAttention
 
 
 class LearnedChannelGating(nn.Module):
-    """Linear probe to rank DINO channels by XRD relevance, then hard-select top-K."""
+    """Linear probe ranking ViT channels by physical guide relevance, supporting:
+    - Single- or multi-channel guides (``out_channels = M``),
+    - Class-balanced BCE, Pearson correlation, and FeatUp-inspired
+      **Forward-PSF partial-volume losses** (``forward_psf_bce``, ``forward_psf_mse``),
+    - Direct calibrated HR logit prediction ``predict_logits(features)`` as well
+      as hard top-``K`` channel selection ``select_top_k(k)``.
+    """
 
-    def __init__(self, feat_dim: int = 384, loss_fn: LossOptions = "bce"):
+    def __init__(
+        self,
+        feat_dim: int = 384,
+        loss_fn: LossOptions = "bce",
+        out_channels: int = 1,
+    ):
         super().__init__()
         self.feat_dim = feat_dim
         self.loss_fn = loss_fn
-        self.pred_head = nn.Linear(feat_dim, 1)
+        self.out_channels = out_channels
+        self.pred_head = nn.Linear(feat_dim, out_channels)
+        self.psf_downsampler = ForwardPSFDownsampler()
         self._channel_mask: torch.Tensor | None = None
 
-    def compute_loss(
-        self, features: torch.Tensor, xrd_map: torch.Tensor
-    ) -> torch.Tensor:
-        """Train the linear probe on raw (un-gated) features."""
-        B, C, H, W = features.shape
-        feat_flat = features.float().reshape(B, C, -1).permute(0, 2, 1)  # (B, H*W, C)
-        pred = self.pred_head(feat_flat).squeeze(-1)  # (B, H*W)
-        target = xrd_map.reshape(1, -1).expand(B, -1).float()
+    def predict_logits(self, features: torch.Tensor) -> torch.Tensor:
+        """Predict ``(B, M, H, W)`` phase/element logits directly from features."""
+        bsz, channels, height, width = features.shape
+        feat_nhwc = features.float().permute(0, 2, 3, 1)  # (B, H, W, C)
+        head_f32 = F.linear(
+            feat_nhwc, self.pred_head.weight.float(), self.pred_head.bias.float()
+        )
+        return head_f32.permute(0, 3, 1, 2).reshape(
+            bsz, self.out_channels, height, width
+        )
 
-        if self.loss_fn == "bce":
-            n_pos = target.sum().clamp(min=1)
-            n_neg = (1 - target).sum().clamp(min=1)
-            pos_weight = (n_neg / n_pos).to(pred.device)
+    def compute_loss(
+        self,
+        features: torch.Tensor,
+        xrd_map: torch.Tensor,
+        coarse_target: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Train the linear probe against either spatially matched ``xrd_map`` or
+        un-interpolated ``coarse_target`` via ``ForwardPSFDownsampler``."""
+        bsz, _, height, width = features.shape
+        logits = self.predict_logits(features)  # (B, M, H, W)
+
+        ref = coarse_target if coarse_target is not None else xrd_map
+        if ref.dim() == 2:
+            ref = ref.unsqueeze(0).unsqueeze(0)
+        elif ref.dim() == 3:
+            ref = ref.unsqueeze(0)
+        ref = ref.float().to(logits.device)
+        if ref.shape[0] == 1 and bsz > 1:
+            ref = ref.expand(bsz, -1, -1, -1)
+
+        if self.loss_fn in ("forward_psf_bce", "forward_psf_mse"):
+            pooled_logits = self.psf_downsampler(logits, ref.shape[-2:])
+            if self.loss_fn == "forward_psf_mse":
+                return F.mse_loss(torch.sigmoid(pooled_logits), ref)
+            n_pos = ref.sum(dim=(-2, -1), keepdim=True).clamp(min=1.0)
+            n_neg = (1.0 - ref).sum(dim=(-2, -1), keepdim=True).clamp(min=1.0)
+            pos_weight = (n_neg / n_pos).clamp(0.1, 20.0)
             return F.binary_cross_entropy_with_logits(
-                pred, target, pos_weight=pos_weight
+                pooled_logits, ref, pos_weight=pos_weight
             )
 
-        pred_c = pred - pred.mean(dim=-1, keepdim=True)
-        target_c = target - target.mean(dim=-1, keepdim=True)
+        if ref.shape[-2:] != (height, width):
+            ref = F.interpolate(
+                ref, size=(height, width), mode="bilinear", align_corners=False
+            )
+
+        pred_flat = logits.reshape(bsz * self.out_channels, -1)
+        target_flat = ref.reshape(bsz * self.out_channels, -1)
+
+        if self.loss_fn == "bce":
+            n_pos = target_flat.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            n_neg = (1.0 - target_flat).sum(dim=-1, keepdim=True).clamp(min=1.0)
+            pos_weight = (n_neg / n_pos).to(pred_flat.device)
+            return F.binary_cross_entropy_with_logits(
+                pred_flat, target_flat, pos_weight=pos_weight
+            )
+
+        pred_c = pred_flat - pred_flat.mean(dim=-1, keepdim=True)
+        target_c = target_flat - target_flat.mean(dim=-1, keepdim=True)
         corr = (pred_c * target_c).sum(dim=-1) / (
             pred_c.norm(dim=-1) * target_c.norm(dim=-1) + 1e-8
         )
-        return (1 - corr).mean()
+        return (1.0 - corr).mean()
 
     def select_top_k(self, k: int) -> None:
-        """Derive a hard channel mask from probe weights after training.
-
-        Channels with the highest absolute weight in pred_head are the ones
-        the linear probe found most predictive of the XRD signal.
-        """
-        weights = self.pred_head.weight.data.squeeze(0).abs()  # (feat_dim,)
-        top_k = weights.topk(k).indices
+        """Derive a hard channel mask keeping top-``k`` channels by max probe weight."""
+        k_clamped = max(1, min(int(k), self.feat_dim))
+        weights = self.pred_head.weight.data.abs().amax(dim=0)  # (feat_dim,)
+        top_k = weights.topk(k_clamped).indices
         mask = torch.zeros(self.feat_dim, device=weights.device)
         mask[top_k] = 1.0
         self._channel_mask = mask
 
     def forward(self, features: torch.Tensor, _xrd_map: torch.Tensor) -> torch.Tensor:
-        """Zero out all channels not in the top-K mask."""
+        """Zero out all channels outside the top-``K`` mask."""
         if self._channel_mask is None:
             return features
-        mask = self._channel_mask.to(features.device).view(1, -1, 1, 1)
+        mask = self._channel_mask.to(device=features.device, dtype=features.dtype).view(
+            1, -1, 1, 1
+        )
         return features * mask
 
 
+def compute_channel_correlation_gates(
+    features: torch.Tensor,
+    guide_map: torch.Tensor,
+    loss_fn: LossOptions = "pearson",
+    top_k: int | None = None,
+) -> torch.Tensor:
+    """Vectorized per-channel relevance gates ``(M, C)`` between ``features``
+    ``(B, C, H, W)`` and ``guide_map`` ``(1, M, H_lr, W_lr)`` without Python loops."""
+    bsz, channels, height, width = features.shape
+    if top_k is None:
+        top_k = max(1, channels // 4)
+    top_k = max(1, min(int(top_k), channels))
+
+    if guide_map.dim() == 2:
+        guide_map = guide_map.unsqueeze(0).unsqueeze(0)
+    elif guide_map.dim() == 3:
+        guide_map = guide_map.unsqueeze(0)
+
+    guide_resized = F.interpolate(
+        guide_map.float().to(features.device),
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    if guide_resized.shape[0] == 1 and bsz > 1:
+        guide_resized = guide_resized.expand(bsz, -1, -1, -1)
+
+    n_guides = guide_resized.shape[1]
+    # Flatten across batch and spatial positions:
+    # feat_mat: (C, N), guide_mat: (M, N) where N = B * H * W
+    feat_mat = features.float().permute(1, 0, 2, 3).reshape(channels, -1)
+    guide_mat = guide_resized.permute(1, 0, 2, 3).reshape(n_guides, -1)
+    n_pts = feat_mat.shape[1]
+
+    if loss_fn == "pearson":
+        if n_pts <= 1:
+            scores = torch.zeros(
+                (n_guides, channels), device=features.device, dtype=torch.float32
+            )
+        else:
+            f_centered = feat_mat - feat_mat.mean(dim=1, keepdim=True)
+            g_centered = guide_mat - guide_mat.mean(dim=1, keepdim=True)
+            f_norm = f_centered.norm(dim=1, keepdim=True)  # (C, 1)
+            g_norm = g_centered.norm(dim=1, keepdim=True)  # (M, 1)
+            denom = g_norm @ f_norm.T  # (M, C)
+            cov = g_centered @ f_centered.T  # (M, C)
+            scores = torch.where(
+                denom > 1e-12, cov / denom.clamp(min=1e-12), torch.zeros_like(cov)
+            )
+            scores = torch.nan_to_num(scores, nan=0.0).clamp(0.0, 1.0)
+    else:
+        # Vectorized BCE channel scoring
+        f_min = feat_mat.min(dim=1, keepdim=True).values
+        f_max = feat_mat.max(dim=1, keepdim=True).values
+        f_normed = ((feat_mat - f_min) / (f_max - f_min + 1e-8)).clamp(1e-6, 1.0 - 1e-6)
+        log_f = torch.log(f_normed)  # (C, N)
+        log_1mf = torch.log(1.0 - f_normed)  # (C, N)
+        # Mean BCE(f_c, g_m) = -1/N * [g_m @ log_f.T + (1 - g_m) @ log_1mf.T]
+        bce = -(guide_mat @ log_f.T + (1.0 - guide_mat) @ log_1mf.T) / max(n_pts, 1)
+        scores = (1.0 - bce / 0.693).clamp(0.0, 1.0)
+
+    # Zero all but top_k channels per guide channel (breaking ties deterministically
+    # to keep exact k channels when scores are distinct)
+    topk_vals, topk_idx = scores.topk(top_k, dim=1)
+    thresholds = topk_vals[:, -1:]
+    # If threshold > 0, keep scores >= threshold; if ties push count > top_k on distinct
+    # random inputs or threshold == 0, scatter exact top_k indices when threshold > 0
+    mask = torch.zeros_like(scores)
+    mask.scatter_(1, topk_idx, 1.0)
+    # Preserve original behaviour for all-zero BCE gates: 0 * 1 = 0 anyway!
+    ties_above_thresh = (scores >= thresholds) & (thresholds > 0)
+    gates = torch.where(
+        ties_above_thresh.sum(dim=1, keepdim=True) == top_k,
+        scores * ties_above_thresh.float(),
+        scores * mask,
+    )
+    return gates.to(features.dtype)
+
+
 class XRDFusionMethod(nn.Module):
+    """Applies aligned TTA transforms to the coarse physical guide map and
+    fuses it with dense ViT features via correlation gating, learned channel
+    gating, or spatial cross-attention."""
+
     def __init__(
         self,
-        xrd_img: None,  # normalised XRD image from xrd_to_tensor
-        transform: partial,
+        xrd_img: torch.Tensor,
+        transform: list[partial],
         require_grad: bool = False,
-        learned_gating: nn.Module = None,
-        spatial_attention: nn.Module = None,
+        learned_gating: nn.Module | None = None,
+        spatial_attention: nn.Module | None = None,
         loss_fn: LossOptions = "pearson",
     ):
         super().__init__()
-
         self.require_grad = require_grad
-        # load the XRD image as a normalised tensor
         self.xrd_image = xrd_img
         self.transform = transform
         self.learned_gating_module = learned_gating
@@ -161,353 +336,209 @@ class XRDFusionMethod(nn.Module):
         self.loss_fn = loss_fn
 
     def get_tr(self) -> torch.Tensor:
-        """Apply all transforms to XRD data and return as a batch.
-        Mirrors get_transformed_input_batch.
-        """
+        """Apply all forward TTA transforms to the guide tensor as a batch."""
+        base = self.xrd_image
+        if base.ndim == 2:
+            base = base.unsqueeze(0).unsqueeze(0)
+        elif base.ndim == 3:
+            base = base.unsqueeze(0)
         if len(self.transform) == 0:
-            return self.xrd_image.unsqueeze(0)  # (1, C, H, W)
-        xrd_list = [t(self.xrd_image) for t in self.transform]
-        return torch.stack(xrd_list)  # (N_transforms, C, H, W)
+            return base.unsqueeze(0) if base.ndim == 4 else base
+        tr_list = []
+        for tr_fn in self.transform:
+            t_out = tr_fn(base)
+            if t_out.ndim == 3:
+                t_out = t_out.unsqueeze(0)
+            tr_list.append(t_out)
+        return torch.stack(tr_list)  # (N_transforms, 1, M, H_lr, W_lr)
 
-    def __translen__(self, transform: partial):
+    def __translen__(self, transform: list[partial]) -> int:
         return len(transform)
 
     def forward_xrd(
         self,
-        x: torch.Tensor,  # [B,C,H,W] transformed DINO features
-        idx: int,  # index of the transform applied to the input image
+        x: torch.Tensor,
+        idx: int,
         xrd_fusion_method: FusionOptions,
         top_k: int | None = None,
-    ):
-        # return transformed XRD features ready to be fused with the DINO features
+    ) -> torch.Tensor:
         tr_xrd = self.get_tr()[idx]
-
         if xrd_fusion_method == "gating":
             return self._direct_correlation_gating(x, tr_xrd, top_k=top_k)
-
-        elif xrd_fusion_method == "learned_gating":
+        if xrd_fusion_method == "learned_gating":
             return self._learned_channel_gating(x, tr_xrd)
-
-        elif xrd_fusion_method == "attention":
+        if xrd_fusion_method == "attention":
             return self._spatial_attention(x, tr_xrd)
+        raise ValueError(f"Unknown fusion method '{xrd_fusion_method}'.")
 
     def _direct_correlation_gating(
-        self, features: torch.Tensor, xrd_map: torch.Tensor, top_k: int | None = None
+        self,
+        features: torch.Tensor,
+        xrd_map: torch.Tensor,
+        top_k: int | None = None,
     ) -> torch.Tensor:
-        """
-        Compute per-channel score against XRD map, use as soft gate weights.
-
-        Pearson: weight = correlation clipped to [0, 1] (higher = better match).
-        BCE: weight = 1 - normalised_loss (lower loss = better match = higher weight).
-
-        If top_k is set, only the top_k scoring channels are kept (others zeroed).
-        Defaults to C // 4.
-
-        Args:
-            features: (B, C, H, W) DINO features
-            xrd_map: (1, 1, H, W)
-            top_k: number of channels to keep (default: C // 4)
-
-        Returns:
-            gated_features: (B, C, H, W) with gates applied per channel
-        """
-        B, C, H, W = features.shape
-        B_xrd, C_xrd, H_xrd, W_xrd = xrd_map.shape
-
-        if top_k is None:
-            top_k = C // 4
-
-        # Ensure xrd_map has same spatial dims as features
-        xrd_map = F.interpolate(
-            xrd_map.to(features.dtype),
-            size=(H, W),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        # Flatten spatial dimensions for correlation computation
-        feat_flat = features.float().reshape(B, C, -1)  # (B, C, H*W)
-        xrd_flat = xrd_map.reshape(-1).float()  # (H*W,)
-
-        # Compute per-channel score against XRD
-        gates = []
-        for ch in range(C):
-            # Score each channel across all batch and spatial locations
-            feat_ch = feat_flat[:, ch, :].reshape(-1)  # (B*H*W,)
-
-            if self.loss_fn == "pearson":
-                if feat_ch.shape[0] > 1:
-                    score = torch.corrcoef(torch.stack([feat_ch, xrd_flat]))[0, 1]
-                else:
-                    score = torch.tensor(0.0, device=features.device)
-                score = torch.nan_to_num(score, nan=0.0).clamp(0, 1)
-
-            else:  # bce
-                # Normalise channel to [0, 1] for BCE
-                ch_min, ch_max = feat_ch.min(), feat_ch.max()
-                ch_norm = (feat_ch - ch_min) / (ch_max - ch_min + 1e-8)
-                bce = F.binary_cross_entropy(ch_norm, xrd_flat, reduction="mean")
-                # Invert so high score = good match; max BCE is log(2) ≈ 0.693
-                score = (1 - bce / 0.693).clamp(0, 1)
-
-            gates.append(score)
-
-        gates = torch.stack(gates).to(features.dtype)  # (C,)
-
-        # Zero all but the top_k scoring channels
-        threshold = gates.topk(top_k).values[-1]
-        gates = gates * (gates >= threshold)
-
-        # Apply gates: multiply each channel by its gate weight
-        gated = features * gates.view(1, C, 1, 1)  # Broadcasting
-
-        return gated
+        gates_mc = compute_channel_correlation_gates(
+            features, xrd_map, loss_fn=self.loss_fn, top_k=top_k
+        )  # (M, C)
+        # Aggregate across M guide channels via max-envelope if M > 1
+        gates = gates_mc.amax(dim=0)  # (C,)
+        return features * gates.view(1, -1, 1, 1)
 
     def _learned_channel_gating(
         self, features: torch.Tensor, xrd_map: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Learned channel gating: MLP learns to map XRD intensity → channel gates.
-
-        Args:
-            features: (B, C, H, W) DINO features
-            xrd_map: (1, 1, H, W) or (H, W) XRD intensity map
-
-        Returns:
-            gated_features: (B, C, H, W)
-        """
-        if not hasattr(self, "learned_gating_module"):
+        if self.learned_gating_module is None:
             self.learned_gating_module = LearnedChannelGating(
                 feat_dim=features.shape[1]
             ).to(device=features.device, dtype=features.dtype)
 
-        _, _, H, W = features.shape
+        _, _, height, width = features.shape
         if xrd_map.dim() == 2:
             xrd_map = xrd_map.unsqueeze(0).unsqueeze(0)
         elif xrd_map.dim() == 3:
             xrd_map = xrd_map.unsqueeze(0)
         xrd_map = F.interpolate(
             xrd_map.to(features.dtype),
-            size=(H, W),
+            size=(height, width),
             mode="bilinear",
             align_corners=False,
         )
-
         return self.learned_gating_module(features, xrd_map)
 
     def _spatial_attention(
         self, features: torch.Tensor, xrd_map: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Spatial attention: XRD-guided cross-attention over features.
-
-        Args:
-            features: (B, C, H, W) DINO features
-            xrd_map: (1, 1, H, W) or (H, W) XRD intensity map
-
-        Returns:
-            attended_features: (B, C, H, W)
-        """
-        if not hasattr(self, "spatial_attention_module"):
+        n_guides = (
+            xrd_map.shape[1]
+            if xrd_map.ndim == 4
+            else (xrd_map.shape[0] if xrd_map.ndim == 3 else 1)
+        )
+        if self.spatial_attention_module is None:
             self.spatial_attention_module = XRDCrossAttention(
-                feat_dim=features.shape[1], num_heads=8
+                feat_dim=features.shape[1], num_heads=8, guide_channels=n_guides
             ).to(device=features.device, dtype=features.dtype)
 
-        _, _, H, W = features.shape
+        _, _, height, width = features.shape
         if xrd_map.dim() == 2:
             xrd_map = xrd_map.unsqueeze(0).unsqueeze(0)
         elif xrd_map.dim() == 3:
             xrd_map = xrd_map.unsqueeze(0)
         xrd_map = F.interpolate(
             xrd_map.to(features.dtype),
-            size=(H, W),
+            size=(height, width),
             mode="bilinear",
             align_corners=False,
         )
-
         return self.spatial_attention_module(features, xrd_map)
 
 
-class XFuse(HighResDV2):
+GuideFusionMethod = XRDFusionMethod
+
+
+class CorrelativeFuser(HighResBackbone):
+    """Modality-agnostic correlative fusion model combining dense ViT features
+    from a high-resolution structural image ``I_HR`` with ``M`` coarse physical
+    guide channels ``G_LR``, outputting both gated high-res features and
+    calibrated phase/element segmentations with tri-part pixel certainty.
+    """
+
     def __init__(
         self,
         dino_name: str,
-        xrd_fuse_method: str,
-        stride: int,
-        pca_dim: int,
+        xrd_fuse_method: FusionOptions = "learned_gating",
+        stride: int = 4,
+        pca_dim: int = -1,
         track_grad: bool = False,
         dtype: torch.dtype | int = torch.float16,
         loss_fn: LossOptions = "bce",
+        guide_channels: int = 1,
+        interpolation_mode: Interpolation = "nearest-exact",
+        pretrained: bool = True,
+        lr: float = 1e-3,
         *args,
         **kwargs,
     ):
-        """
-        I want this XFuse class to inherit from HighResDV2 and have the
-        same functionality, however, I will add the extra modules that
-        perform the XRD fusion, given an XCT input.
-        """
-        # pass to HighResDV2 init
+        device = kwargs.get("device", None)
         super().__init__(
             dino_name,
             stride=stride,
             pca_dim=pca_dim,
-            track_grad=track_grad,
             dtype=dtype,
+            track_grad=track_grad,
+            pretrained=pretrained,
+            interpolation_mode=interpolation_mode,
             *args,
             **kwargs,
         )
+        self.xrd_fuse_method: FusionOptions = xrd_fuse_method
+        self.loss_fn: LossOptions = loss_fn
+        self.guide_channels: int = guide_channels
+        self.lr: float = lr
 
-        self.dinov2: nn.Module
-        device = kwargs.get("device", None)
+        self.learned_gating: LearnedChannelGating | None = None
+        self.spatial_attention: XRDCrossAttention | None = None
+        self.fusion_optimizer: torch.optim.Optimizer | None = None
+        self._init_fusion_heads(guide_channels, device=device)
 
-        if "alibi" in dino_name or "nope" in dino_name:
-            model_path = kwargs["model_path"]
-            if "dv3" in dino_name:
-                lib_path = kwargs["lib_path"]
-                self.dinov2 = get_dv3_model(
-                    dino_name, model_path, lib_path, device=device, stride=stride
-                )
-            else:
-                self.dinov2 = get_alibi_model(
-                    dino_name, model_path, device=device, stride=stride
-                )
+        self.xrd_fusion_module: XRDFusionMethod | None = None
 
-        elif "dinov2" in dino_name:
-            hub_path = "facebookresearch/dinov2"
-            self.dinov2 = torch.hub.load(hub_path, dino_name)
-        elif "dinov3" in dino_name:
-            lib_path = kwargs["lib_path"]
-            chk_path = kwargs["chk_path"]
-            assert (chk_path is not None) and (
-                lib_path is not None
-            ), "Must supply a local checkpoint for DINOv3!"
-            self.dinov2 = torch.hub.load(
-                lib_path, dino_name, source="local", weights=chk_path
-            )
-        elif "dino" in dino_name:
-            hub_path = "facebookresearch/dino:main"
-            self.dinov2 = torch.hub.load(hub_path, dino_name)
-        elif "deit" in dino_name:
-            self.dinov2 = create_model(  # was 224
-                "deit_small_patch16_224", pretrained=True
-            )
-        elif "384" in dino_name:
-            self.dinov2 = create_model(  # was 224
-                "vit_small_patch16_384", pretrained=True
-            )
-        else:
-            self.dinov2 = create_model(  # was 224
-                "vit_small_patch16_224", pretrained=True
-            )
-
-        # self.dinov2: nn.Module = torch.hub.load("facebookresearch/dinov2", dino_name)
-
-        self.dinov2.eval()
-
-        if "dinov2" not in dino_name:
-            self.dinov2.num_heads = 6  # type: ignore
-            self.dinov2.num_register_tokens = 0  # type: ignore
-
-        # Get params of Dv2 model and store references to original settings & methods
-        feat, patch, n_heads = self.get_model_params(dino_name)
-        self.original_patch_size: int = patch
-        self.original_stride = _pair(patch)
-        # may need to deepcopy this instead of just referencing
-        # self.original_pos_enc = self.dinov2.interpolate_pos_encoding
-        self.feat_dim: int = feat
-        self.n_heads: int = n_heads
-        self.n_register_tokens = 4
-
-        self.stride = _pair(stride)
-        # we need to set the stride to the original once before set it to desired stride
-        # i don't know why
-        self.set_model_stride(self.dinov2, patch)
-        self.set_model_stride(self.dinov2, stride)
-
-        self.transforms: List[partial] = []
-        self.inverse_transforms: List[partial] = []
-        self.interpolation_mode: Interpolation = "nearest-exact"
-        self.pca_dim = pca_dim
-        self.do_pca = pca_dim > 3
-
-        # define the fusion method for fusing the XRD features with the DINO features
-        self.xrd_fuse_method = xrd_fuse_method
-        self.loss_fn = loss_fn
-
-        # Initialize fusion modules based on method
-        if xrd_fuse_method == "learned_gating":
-            self.learned_gating = LearnedChannelGating(
-                feat_dim=self.feat_dim, loss_fn=loss_fn
-            )
-        else:
-            self.learned_gating = None
-
-        if xrd_fuse_method == "attention":
-            self.spatial_attention = XRDCrossAttention(
-                feat_dim=self.feat_dim, num_heads=8
-            )
-        else:
-            self.spatial_attention = None
-
-        # XRDFusionMethod is created in set_transforms() once transforms are known
-        self.xrd_fusion_module = None
-
-        # If we want to save memory, change to float16
-        if type(dtype) is int:
-            dtype = torch.float16 if dtype == 16 else torch.float32
-
-        self.dtype = dtype
-        if dtype != torch.float32:
-            self.dinov2 = self.dinov2.to(dtype)
-        if device is not None:
-            self.dinov2 = self.dinov2.to(device)
-            if self.learned_gating is not None:
-                self.learned_gating = self.learned_gating.to(device)
-        self.track_grad = track_grad  # off by default to save memory
-
-        if self.learned_gating is not None:
-            self.fusion_optimizer = torch.optim.Adam(
-                self.learned_gating.parameters(), lr=1e-4
-            )
-        else:
-            self.fusion_optimizer = None
-
-        self.patch_last_block(self.dinov2, dino_name)
-
-    def set_model_stride(
-        self, dino_model: nn.Module, stride_l: int, verbose: bool = False
+    def _init_fusion_heads(
+        self, guide_channels: int, device: str | torch.device | None = None
     ) -> None:
-        try:
-            new_stride_pair = _pair(stride_l)
-            self.stride = new_stride_pair
-            dino_model.model.patch_embed.proj.stride = new_stride_pair
-            dino_model.stride = stride_l
-            if verbose:
-                print(f"Setting stride to ({stride_l},{stride_l})")
-        except AttributeError:
-            super().set_model_stride(dino_model, stride_l, verbose)
+        self.guide_channels = guide_channels
+        if self.xrd_fuse_method == "learned_gating":
+            self.learned_gating = LearnedChannelGating(
+                feat_dim=self.feat_dim,
+                loss_fn=self.loss_fn,
+                out_channels=guide_channels,
+            )
+            if device is not None:
+                self.learned_gating = self.learned_gating.to(device)
+            self.fusion_optimizer = torch.optim.Adam(
+                self.learned_gating.parameters(), lr=self.lr
+            )
+        elif self.xrd_fuse_method == "attention":
+            self.spatial_attention = XRDCrossAttention(
+                feat_dim=self.feat_dim,
+                num_heads=8,
+                guide_channels=guide_channels,
+                loss_fn=self.loss_fn,
+            )
+            if device is not None:
+                self.spatial_attention = self.spatial_attention.to(device)
+            self.fusion_optimizer = torch.optim.Adam(
+                self.spatial_attention.parameters(), lr=self.lr
+            )
 
-    def patch_last_block(self, dino_model: nn.Module, dino_name: str) -> None:
-        if "alibi" not in dino_name and "nope" not in dino_name:
-            super().patch_last_block(dino_model, dino_name)
-            return
+    def set_guide_transforms(
+        self, guide_tensor: torch.Tensor, fwd: list[partial], inv: list[partial]
+    ) -> None:
+        """Bind a ``(1, M, H_lr, W_lr)`` physical guide tensor and TTA transforms."""
+        super().set_transforms(fwd, inv)
+        if guide_tensor.ndim == 2:
+            guide_tensor = guide_tensor.unsqueeze(0).unsqueeze(0)
+        elif guide_tensor.ndim == 3:
+            guide_tensor = guide_tensor.unsqueeze(0)
 
-        def forward_feats_attn(self_model, x, masks=None, attn_choice="none"):
-            feats = self_model.forward_features(x)  # (B, C, N_patches)
-            feats = feats.permute(0, 2, 1)  # (B, N_patches, C)
-            return {"x_norm_patchtokens": feats, "masks": masks}
+        n_guides = guide_tensor.shape[1]
+        if n_guides != self.guide_channels:
+            dev = next(self.dinov2.parameters()).device
+            self._init_fusion_heads(n_guides, device=dev)
 
-        dino_model.forward_feats_attn = MethodType(forward_feats_attn, dino_model)
+        self.xrd_fusion_module = XRDFusionMethod(
+            xrd_img=guide_tensor,
+            transform=self.transforms,
+            require_grad=self.track_grad,
+            learned_gating=self.learned_gating,
+            spatial_attention=self.spatial_attention,
+            loss_fn=self.loss_fn,
+        )
 
-    def get_model_params(self, dino_name: str) -> Tuple[int, int, int]:
-        for segment in dino_name.split("_"):
-            m = re.match(r"^vit([sblg])(\d+)", segment)
-            if m:
-                arch, patch_size = m.group(1), int(m.group(2))
-                feat_dim_lookup = {"s": 384, "b": 768, "l": 1024, "g": 1536}
-                n_heads_lookup = {"s": 6, "b": 12, "l": 16, "g": 16}
-                return feat_dim_lookup[arch], patch_size, n_heads_lookup[arch]
-        return super().get_model_params(dino_name)
+    def set_xrd_transforms(
+        self, xrd_tensor: torch.Tensor, fwd: list[partial], inv: list[partial]
+    ) -> None:
+        """Backward-compatible alias for ``set_guide_transforms``."""
+        self.set_guide_transforms(xrd_tensor, fwd, inv)
 
     @torch.no_grad()
     def forward_sequential(
@@ -516,148 +547,241 @@ class XFuse(HighResDV2):
         attn_choice: AttentionOptions = "none",
         top_k: int | None = None,
     ) -> torch.Tensor:
-        """Perform transform -> featurise -> upscale -> inverse -> average forward pass
-        sequentially, performing more calls to DINOv2 but reducing the memory overhead.
-
-        :param x: unbatched image tensor
-        :type x: torch.Tensor
-        :param top_k: for 'gating' method, number of channels to keep (default: C // 4)
-        :type top_k: int | None
-        :return: tuple of low-res Dv2 features and our upsample high-res Dv2 features
-        :rtype: Tuple[torch.Tensor, torch.Tensor]
-        """
-        x.requires_grad = self.track_grad
-        if self.dtype != torch.float32:  # cast (i.e to f16)
-            x = x.type(self.dtype)
-        img_batch = self.get_transformed_input_batch(x, self.transforms)
-        temp_stride = self.stride
-
-        _, img_h, img_w = x.shape
-
-        if attn_choice != "none":
-            c = self.n_heads + self.feat_dim
-        else:
-            c = self.feat_dim
-
-        stride_l = temp_stride[0]
-        n_patch_w: int = 1 + (img_w - self.original_patch_size) // stride_l
-        n_patch_h: int = 1 + (img_h - self.original_patch_size) // stride_l
-
-        out_feature_img: torch.Tensor = torch.zeros(
-            1,
-            c,
-            img_h,
-            img_w,
-            device=x.device,
-            dtype=self.dtype,
-            requires_grad=self.track_grad,
+        """Run TTA-ensembled feature extraction + guide fusion."""
+        mean_feats, _ = self.forward_with_variance(
+            x, attn_choice=attn_choice, top_k=top_k
         )
+        return mean_feats
 
-        N_transforms = len(self.transforms)
-        for i in range(N_transforms):
+    @torch.no_grad()
+    def forward_with_variance(
+        self,
+        x: torch.Tensor,
+        attn_choice: AttentionOptions = "none",
+        top_k: int | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run TTA-ensembled feature extraction + guide fusion while tracking
+        online Welford spatial variance across transforms in ``O(1)`` extra memory.
+
+        Returns:
+            ``(mean_features, feature_variance)`` each of shape ``(1, C, H, W)``.
+        """
+        assert (
+            self.xrd_fusion_module is not None
+        ), "Call set_guide_transforms / set_xrd_transforms before forward."
+
+        x_in = x.to(self.dtype) if self.dtype != torch.float32 else x.clone()
+        img_batch = self.get_transformed_input_batch(x_in, self.transforms)
+        _, img_h, img_w = x_in.shape
+        channels = (
+            self.n_heads + self.feat_dim if attn_choice != "none" else self.feat_dim
+        )
+        n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
+
+        welford = WelfordAccumulator()
+        n_transforms = len(self.transforms)
+
+        for i in range(n_transforms):
             transformed_img = img_batch[i].unsqueeze(0)
-            out_dict = self.dinov2.forward_feats_attn(
+            out_dict = self.dinov2.forward_feats_attn(  # type: ignore[operator]
                 transformed_img, None, attn_choice
-            )  # type: ignore
+            )
             if attn_choice != "none":
-                feats, attn = out_dict["x_norm_patchtokens"], out_dict["x_patchattn"]
-                features = torch.concat((feats, attn), dim=-1)
+                feats = torch.cat(
+                    (out_dict["x_norm_patchtokens"], out_dict["x_patchattn"]), dim=-1
+                )
             else:
-                features = out_dict["x_norm_patchtokens"]
+                feats = out_dict["x_norm_patchtokens"]
 
-            features = features.squeeze(0)
-            feat_patch = features.view((n_patch_h, n_patch_w, c))
-            permuted = feat_patch.permute((2, 0, 1)).unsqueeze(0)
+            permuted = (
+                feats.squeeze(0)
+                .reshape(n_patch_h, n_patch_w, channels)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+            )
             fused_img = self.xrd_fusion_module.forward_xrd(
                 permuted, i, self.xrd_fuse_method, top_k=top_k
             )
-
-            full_size = F.interpolate(
-                fused_img,
-                (img_h, img_w),
-                mode=self.interpolation_mode,
+            full_size = self._upsample_patch_map(
+                fused_img, (img_h, img_w), guidance_img=transformed_img
             )
-            inv_transform = self.inverse_transforms[i]
-            inverted: torch.Tensor = inv_transform(full_size)
-            out_feature_img += inverted
+            inverted = self.inverse_transforms[i](full_size)
+            welford.update(inverted)
 
-        mean = out_feature_img / N_transforms
-        return mean
+        mean_f32, var_f32 = welford.finalize()
+        return mean_f32.to(self.dtype), var_f32
 
     def train_fusion_step(self, x: torch.Tensor) -> float:
-        """Update LearnedChannelGating weights for one step.
-
-        DINO backbone is frozen throughout. Only the gating MLP and
-        prediction head are updated.
-
-        :param x: unbatched XCT image tensor (C, H, W)
-        :return: mean MSE loss across transforms
-        """
+        """Update ``LearnedChannelGating`` or ``XRDCrossAttention`` weights for
+        one optimization step across all TTA views while keeping the ViT frozen."""
+        assert self.xrd_fuse_method in (
+            "learned_gating",
+            "attention",
+        ), "train_fusion_step applies to 'learned_gating' or 'attention'."
         assert (
-            self.xrd_fuse_method == "learned_gating"
-        ), "train_fusion_step only applies to learned_gating"
-        assert (
-            self.xrd_fusion_module is not None
-        ), "Call set_xrd_transforms before training"
+            self.xrd_fusion_module is not None and self.fusion_optimizer is not None
+        ), "Call set_guide_transforms / set_xrd_transforms before training."
 
-        if self.dtype != torch.float32:
-            x = x.type(self.dtype)
-
-        _, img_h, img_w = x.shape
-        stride_l = self.stride[0]
-        n_patch_w = 1 + (img_w - self.original_patch_size) // stride_l
-        n_patch_h = 1 + (img_h - self.original_patch_size) // stride_l
+        x_in = x.to(self.dtype) if self.dtype != torch.float32 else x
+        _, img_h, img_w = x_in.shape
+        n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
 
         with torch.no_grad():
-            img_batch = self.get_transformed_input_batch(x, self.transforms)
+            img_batch = self.get_transformed_input_batch(x_in, self.transforms)
 
-        N_transforms = len(self.transforms)
-        total_loss = torch.tensor(0.0, dtype=torch.float32)
-
+        n_transforms = len(self.transforms)
+        total_loss = 0.0
         self.fusion_optimizer.zero_grad()
 
-        for i in range(N_transforms):
-            # Extract DINO features — backbone frozen
+        for i in range(n_transforms):
             with torch.no_grad():
                 transformed_img = img_batch[i].unsqueeze(0)
-                out_dict = self.dinov2.forward_feats_attn(
+                out_dict = self.dinov2.forward_feats_attn(  # type: ignore[operator]
                     transformed_img, None, "none"
-                )  # type: ignore
+                )
                 features = out_dict["x_norm_patchtokens"].squeeze(0)
-                feat_patch = features.view((n_patch_h, n_patch_w, self.feat_dim))
-                permuted = feat_patch.permute((2, 0, 1)).unsqueeze(0)  # (1, C, H, W)
+                permuted = (
+                    features.reshape(n_patch_h, n_patch_w, self.feat_dim)
+                    .permute(2, 0, 1)
+                    .unsqueeze(0)
+                )
 
-            # Interpolate XRD map to match feature spatial dims
-            tr_xrd = self.xrd_fusion_module.get_tr()[i]
-            _, _, H, W = permuted.shape
-            if tr_xrd.dim() == 3:
-                tr_xrd = tr_xrd.unsqueeze(0)
-            tr_xrd = F.interpolate(
-                tr_xrd.to(permuted.dtype),
-                size=(H, W),
-                mode="bilinear",
-                align_corners=False,
+            tr_guide_coarse = self.xrd_fusion_module.get_tr()[i]
+            if tr_guide_coarse.dim() == 3:
+                tr_guide_coarse = tr_guide_coarse.unsqueeze(0)
+
+            if self.xrd_fuse_method == "learned_gating":
+                assert self.learned_gating is not None
+                if self.loss_fn in ("forward_psf_bce", "forward_psf_mse"):
+                    hr_feats = self._upsample_patch_map(
+                        permuted.float(), (img_h, img_w), guidance_img=transformed_img
+                    )
+                    loss = self.learned_gating.compute_loss(
+                        hr_feats, tr_guide_coarse, coarse_target=tr_guide_coarse
+                    )
+                else:
+                    loss = self.learned_gating.compute_loss(permuted, tr_guide_coarse)
+                params = self.learned_gating.parameters()
+            else:
+                assert self.spatial_attention is not None
+                loss = self.spatial_attention.compute_loss(permuted, tr_guide_coarse)
+                params = self.spatial_attention.parameters()
+
+            scaled_loss = loss / max(n_transforms, 1)
+            scaled_loss.backward()
+            total_loss += float(loss.detach().cpu().item())
+
+        torch.nn.utils.clip_grad_norm_(list(params), max_norm=1.0)
+        self.fusion_optimizer.step()
+        return total_loss / max(n_transforms, 1)
+
+    @torch.no_grad()
+    def predict_with_uncertainty(
+        self,
+        x: torch.Tensor,
+        guide_lr: torch.Tensor | None = None,
+        mode: Literal["multiclass", "multilabel"] = "multilabel",
+        calibrate_to_guide: bool = True,
+        abstain_threshold: float | None = None,
+        top_k: int | None = None,
+    ) -> UncertaintyReport:
+        """Produce calibrated high-resolution phase/element probabilities and a
+        full ``UncertaintyReport`` (chemical entropy, TTA epistemic variance, and
+        physical forward-model residual) in a single TTA sweep."""
+        if guide_lr is None:
+            assert (
+                self.xrd_fusion_module is not None
+            ), "Provide guide_lr or call set_guide_transforms first."
+            guide_lr = self.xrd_fusion_module.xrd_image
+        if guide_lr.ndim == 2:
+            guide_lr = guide_lr.unsqueeze(0).unsqueeze(0)
+        elif guide_lr.ndim == 3:
+            guide_lr = guide_lr.unsqueeze(0)
+
+        x_in = x.to(self.dtype) if self.dtype != torch.float32 else x.clone()
+        img_batch = self.get_transformed_input_batch(x_in, self.transforms)
+        _, img_h, img_w = x_in.shape
+        n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
+
+        logit_welford = WelfordAccumulator()
+        prob_welford = WelfordAccumulator()
+
+        for i in range(len(self.transforms)):
+            transformed_img = img_batch[i].unsqueeze(0)
+            out_dict = self.dinov2.forward_feats_attn(  # type: ignore[operator]
+                transformed_img, None, "none"
+            )
+            permuted = (
+                out_dict["x_norm_patchtokens"]
+                .squeeze(0)
+                .reshape(n_patch_h, n_patch_w, self.feat_dim)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+            )
+            hr_feats = self._upsample_patch_map(
+                permuted.float(), (img_h, img_w), guidance_img=transformed_img
             )
 
-            # Train probe on raw features — no gating during training
-            loss = self.learned_gating.compute_loss(permuted, tr_xrd)
-            total_loss = total_loss + loss.cpu().float()
-            loss.backward()
+            if self.xrd_fuse_method == "learned_gating" and self.learned_gating:
+                logits_view = self.learned_gating.predict_logits(hr_feats)
+            elif self.xrd_fuse_method == "attention" and self.spatial_attention:
+                tr_g = (
+                    self.xrd_fusion_module.get_tr()[i]
+                    if self.xrd_fusion_module is not None
+                    else guide_lr
+                )
+                logits_view = self.spatial_attention.predict_logits(hr_feats, tr_g)
+            else:
+                tr_g = (
+                    self.xrd_fusion_module.get_tr()[i]
+                    if self.xrd_fusion_module is not None
+                    else guide_lr
+                )
+                gates_mc = compute_channel_correlation_gates(
+                    permuted.float(), tr_g, loss_fn=self.loss_fn, top_k=top_k
+                ).float()  # (M, C)
+                feat_std = (hr_feats - hr_feats.mean(dim=(-2, -1), keepdim=True)) / (
+                    hr_feats.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+                )
+                w_norm = gates_mc / gates_mc.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                logits_view = torch.einsum("mc,bchw->bmhw", w_norm, feat_std)
 
-        torch.nn.utils.clip_grad_norm_(self.learned_gating.parameters(), max_norm=1.0)
-        self.fusion_optimizer.step()
-        return (total_loss / N_transforms).item()
+            inv_logits = self.inverse_transforms[i](logits_view)
+            logit_welford.update(inv_logits)
+            prob_welford.update(torch.sigmoid(inv_logits))
 
-    def set_xrd_transforms(self, xrd_tensor, fwd, inv):
-        super().set_transforms(fwd, inv)
-        assert len(fwd) == len(
-            inv
-        ), "Forward and inverse transform lists must be same length!"
-        self.xrd_fusion_module = XRDFusionMethod(
-            xrd_img=xrd_tensor,
-            transform=self.transforms,
-            require_grad=self.track_grad,
-            learned_gating=self.learned_gating,
-            spatial_attention=self.spatial_attention,
-            loss_fn=self.loss_fn,
+        mean_logits, _ = logit_welford.finalize()
+        _, epistemic_prob_var = prob_welford.finalize()
+
+        if mode == "multiclass":
+            # Add implicit background logit = 0 so M foreground phases + 1 background
+            # compete cleanly via softmax!
+            bg_logit = torch.zeros(
+                (mean_logits.shape[0], 1, img_h, img_w),
+                device=mean_logits.device,
+                dtype=mean_logits.dtype,
+            )
+            full_logits = torch.cat([bg_logit, mean_logits], dim=1)
+            probs = (
+                match_coarse_priors(full_logits, guide_lr, mode="multiclass")
+                if calibrate_to_guide
+                else F.softmax(full_logits, dim=1)
+            )
+        else:
+            probs = (
+                match_coarse_priors(mean_logits, guide_lr, mode="multilabel")
+                if calibrate_to_guide
+                else torch.sigmoid(mean_logits)
+            )
+
+        return build_uncertainty_report(
+            probs_hr=probs,
+            guide_lr=guide_lr,
+            epistemic_var=epistemic_prob_var,
+            mode=mode,
+            abstain_threshold=abstain_threshold,
         )
+
+
+# Backward-compatible class alias
+XFuse = CorrelativeFuser
