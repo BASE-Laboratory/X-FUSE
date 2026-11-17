@@ -4,6 +4,20 @@ All notable changes to **X-FUSE** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-11-17
+
+### Added
+- **Quantitative Forward Physics & 3D Spectral Cube Unmixing (`x_fuse.physics`)**: Added `PhysicsForwardModel` supporting Poisson shot-noise deviance NLL (`loss_fn="forward_psf_poisson"`) with learnable gain/background for low-dose EDS/EELS/XRF/Bragg-edge counts, simplex mass/atomic-fraction conservation (`loss_fn="compositional_kl"`), raw 3D `(E, H_lr, W_lr)` hyperspectral/diffraction cube unmixing via SPA-seeded multiplicative NMF (`SpectralUnmixingDictionary`, `spectral_unmix=True`), and physical count/simplex preserving `GuideNormalization` modes in `guide_to_tensor`.
+- **Texture-Aware Cross-Attention Upsampler & Spatial MLP Head (`x_fuse.upsamplers`, `x_fuse.heads`)**: Added `JAFAR`/`AnyUp`-inspired `CrossAttentionFeatureUpsampler` (`interpolation_mode="cross_attn"`, conditioned on 8 multiscale structural & local texture descriptors `extract_multiscale_texture_descriptors`) and residual `SpatialConvMLPHead` (`fusion_method="spatial_mlp"`) with edge-weighted Total Variation regularization (`edge_aware_tv_loss`) to separate iso-intensity textured phases.
+- **Apositional Feature Debiasing (`x_fuse.debias`)**: Added `ApositionalFeatureDebiaser` (`debias_positional=True`) projecting ViT patch channels onto the orthogonal complement of bivariate Legendre spatial polynomials (`build_orthonormal_spatial_basis`, `measure_positional_r2`) to prevent coordinate-ramp shortcut learning on macroscopic chemical gradients, plus direct `"alibi:<timm_id>"` loading and explicit `dino-saw` attribution in `x_fuse.alibi`.
+- **Split Conformal Prediction & Cubic B-Spline Registration (`x_fuse.uncertainty`, `x_fuse.registration`)**: Added `ConformalCalibrator` (`"lac"` & `"aps"` score quantiles + `calibrate_coarse` zero-label physical calibration) producing finite-sample `(1 - alpha)` boolean `prediction_sets` and `conformal_interval_halfwidth` on `UncertaintyReport` (`empirical_conformal_coverage`), plus non-rigid cubic B-spline scan-distortion alignment (`align_guide="bspline"`) with thin-plate bending energy and minimum Jacobian determinant diagnostics.
+- **Competing Field Baselines & Stress-Test Phantoms (`benchmarks/baselines.py`, `x_fuse.synthetic`)**: Added `gram_schmidt_pansharpen_baseline`, `cnmf_pansharpen_baseline` (Coupled NMF), `guided_variational_sr_baseline` (edge-weighted TV solver), and `coordinate_inr_baseline` (`SIREN`), plus `generate_textured_isointensity_phantom_2d`, `generate_macroscopic_gradient_phantom_2d`, and `generate_spectral_cube_phantom_2d`.
+
+### Changed
+- **Compositional `CorrelativeFuser` Architecture (`x_fuse.fusion`)**: Refactored `CorrelativeFuser` (`XFuse`) from a `HighResBackbone` subclass into a clean compositional `nn.Module` owning `backbone_extractor`, pluggable fusion heads, `guide_aligner`, and `calibrator` while preserving 100% backward compatibility.
+- **Memory-Safe $O(HW)$ Cross-Attention (`WindowedGuideCrossAttentionHead`)**: Replaced dense $O((HW)^2)$ pixel-to-pixel attention in `XRDCrossAttention` with $O(HW \cdot H_{\text{LR}} W_{\text{LR}})$ HR-pixel-to-coarse-guide cross-attention capable of scaling cleanly to $512 \times 512+$ tiles.
+- Removed top-level `cv2` and `matplotlib` imports from `x_fuse.utils` and debug `print` side effects from `x_fuse.alibi`.
+
 ## [0.4.0] - 2026-11-17
 
 ### Added

@@ -1,7 +1,8 @@
-"""Pixel- and voxel-level uncertainty quantification, calibration, and physical
-forward-model consistency diagnostics for correlative materials fusion.
+"""Pixel- and voxel-level uncertainty quantification, calibration, physical
+forward-model consistency diagnostics, and finite-sample Split Conformal
+Prediction sets for correlative materials fusion.
 
-Provides three complementary uncertainty axes:
+Provides four complementary uncertainty & statistical guarantee mechanisms:
 1. **Aleatoric / Chemical Ambiguity**: Calibrated class/element posterior entropy
    and top-1 vs. top-2 probability margin.
 2. **Epistemic / Spatial & Volumetric Variance**: Online Welford variance across
@@ -11,8 +12,14 @@ Provides three complementary uncertainty axes:
    PSF-downsampled high-resolution predictions and the measured coarse physical
    guide—flagging regions where the structural modality lacks contrast for a
    chemical gradient.
+4. **Split Conformal Prediction (``ConformalCalibrator``)**: Distribution-free
+   ``(1 - alpha)`` phase prediction sets ``C_{1-alpha}(x)`` and locally adaptive
+   coarse physical error bounds calibrated on held-out spatial blocks or labels.
 """
 
+from __future__ import annotations
+
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -56,7 +63,7 @@ class WelfordAccumulator:
 
 @dataclass
 class UncertaintyReport:
-    """Container for pixel/voxel-level certainty maps alongside phase predictions."""
+    """Container for pixel/voxel-level certainty maps and conformal prediction sets."""
 
     probabilities: torch.Tensor  # (B, K, H, W) calibrated probabilities
     hard_mask: torch.Tensor  # (B, H, W) integer class or binary mask (-1 if abstained)
@@ -71,8 +78,14 @@ class UncertaintyReport:
         torch.Tensor
     )  # (B, H, W) bool flag where HR lacks physical contrast
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    prediction_sets: torch.Tensor | None = (
+        None  # Optional (B, K, H, W) bool (1-alpha) conformal phase set
+    )
+    conformal_interval_halfwidth: torch.Tensor | None = (
+        None  # Optional (B, M, H, W) calibrated coarse physical error halfwidth
+    )
 
-    def crop_spatial(self, height: int, width: int) -> "UncertaintyReport":
+    def crop_spatial(self, height: int, width: int) -> UncertaintyReport:
         """Crop all spatial tensors back to unpadded ``(height, width)``."""
         return UncertaintyReport(
             probabilities=self.probabilities[:, :, :height, :width],
@@ -84,7 +97,392 @@ class UncertaintyReport:
             combined_uncertainty=self.combined_uncertainty[:, :height, :width],
             unresolved_mask=self.unresolved_mask[:, :height, :width],
             diagnostics=dict(self.diagnostics),
+            prediction_sets=(
+                self.prediction_sets[:, :, :height, :width]
+                if self.prediction_sets is not None
+                else None
+            ),
+            conformal_interval_halfwidth=(
+                self.conformal_interval_halfwidth[:, :, :height, :width]
+                if self.conformal_interval_halfwidth is not None
+                else None
+            ),
         )
+
+
+def _conformal_quantile(scores: torch.Tensor, alpha: float) -> float:
+    """Exact finite-sample split-conformal quantile at rank
+    ``ceil((n + 1) * (1 - alpha))`` (1-indexed) on nonconformity ``scores``.
+    """
+    flat = scores.detach().float().reshape(-1)
+    n = int(flat.numel())
+    if n == 0:
+        return 1.0
+    a_clamped = min(max(float(alpha), 1e-4), 0.999)
+    rank = min(n, max(1, int(math.ceil((n + 1) * (1.0 - a_clamped)))))
+    sorted_vals = torch.sort(flat).values
+    return float(sorted_vals[rank - 1].cpu().item())
+
+
+class ConformalCalibrator:
+    """Distribution-free Split Conformal Prediction calibrator supporting both:
+    1. **Supervised / Sparse-Label Calibration (``calibrate_labels``)**: Exact
+       Least-Ambiguous Set-Valued Classifier (LAC) / Adaptive Prediction Sets (APS)
+       achieving finite-sample coverage ``P(Y in C_{1-alpha}(X)) >= 1 - alpha``.
+    2. **Zero-Label Coarse-Physics Calibration (``calibrate_coarse``)**: Calibrates
+       locally adaptive coarse physical forward-PSF error intervals and pure-cell
+       phase set thresholds on held-out spatial checkerboard blocks of ``G_LR``,
+       expanding sets automatically where ``physical_residual`` signals missing
+       structural contrast.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.10,
+        method: Literal["lac", "aps"] = "lac",
+    ) -> None:
+        if not (0.0 < alpha < 1.0):
+            raise ValueError(
+                f"Conformal miscoverage alpha must be in (0, 1), got {alpha}."
+            )
+        self.alpha = float(alpha)
+        self.method: Literal["lac", "aps"] = method
+        self.q_label: float | None = None
+        self.q_coarse_per_channel: torch.Tensor | None = None
+        self.n_calibration_points: int = 0
+
+    @staticmethod
+    def make_spatial_holdout_mask(
+        lr_hw: tuple[int, int],
+        holdout_fraction: float = 0.20,
+        block_size: int = 2,
+        seed: int = 42,
+    ) -> torch.Tensor:
+        """Create a deterministic ``(H_lr, W_lr)`` boolean calibration mask holding
+        out spatial blocks of coarse pixels during probe fitting.
+        """
+        h_lr, w_lr = max(1, int(lr_hw[0])), max(1, int(lr_hw[1]))
+        b_sz = max(1, min(int(block_size), max(1, min(h_lr, w_lr) // 2)))
+        gh = max(1, math.ceil(h_lr / b_sz))
+        gw = max(1, math.ceil(w_lr / b_sz))
+        rng = np.random.default_rng(seed)
+        n_blocks = gh * gw
+        n_cal = max(1, min(n_blocks - 1, int(round(holdout_fraction * n_blocks))))
+        perm = rng.permutation(n_blocks)
+        cal_grid = np.zeros(n_blocks, dtype=bool)
+        cal_grid[perm[:n_cal]] = True
+        cal_2d = np.repeat(
+            np.repeat(cal_grid.reshape(gh, gw), b_sz, axis=0), b_sz, axis=1
+        )[:h_lr, :w_lr]
+        return torch.from_numpy(cal_2d)
+
+    @torch.no_grad()
+    def calibrate_labels(
+        self,
+        probs: torch.Tensor,
+        targets: torch.Tensor,
+        cal_mask: torch.Tensor | None = None,
+    ) -> float:
+        """Calibrate phase prediction sets on ground-truth or sparse-scribble
+        integer class labels ``targets`` (``(B, H, W)`` or ``(H, W)``).
+        """
+        p = probs.detach().float()
+        if p.ndim == 3:
+            p = p.unsqueeze(0)
+        if p.shape[1] == 1:
+            p = torch.cat([1.0 - p, p], dim=1)
+        p = p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+        y = targets.detach().long().to(p.device)
+        if y.ndim == 2:
+            y = y.unsqueeze(0)
+
+        bsz, n_classes, height, width = p.shape
+        p_flat = p.permute(0, 2, 3, 1).reshape(-1, n_classes)
+        y_flat = y.reshape(-1)
+        valid = (y_flat >= 0) & (y_flat < n_classes)
+        if cal_mask is not None:
+            valid = valid & cal_mask.to(p.device).reshape(-1).bool()
+
+        p_cal = p_flat[valid]
+        y_cal = y_flat[valid]
+        self.n_calibration_points = int(y_cal.numel())
+        if self.n_calibration_points == 0:
+            self.q_label = 1.0 - self.alpha
+            return self.q_label
+
+        if self.method == "aps":
+            # Romano et al. (2020): cumulative sorted probability up to true class
+            sorted_p, sorted_idx = torch.sort(p_cal, dim=-1, descending=True)
+            cumsum_p = torch.cumsum(sorted_p, dim=-1)
+            match = (sorted_idx == y_cal.unsqueeze(-1)).float()
+            # Include true class probability mass
+            scores = (cumsum_p * match).sum(dim=-1)
+        else:
+            # Sadinle et al. (2019) LAC: 1 - p(true_class)
+            true_p = p_cal.gather(1, y_cal.unsqueeze(-1)).squeeze(-1)
+            scores = 1.0 - true_p
+
+        self.q_label = _conformal_quantile(scores, self.alpha)
+        return self.q_label
+
+    @torch.no_grad()
+    def calibrate_coarse(
+        self,
+        probs_hr: torch.Tensor,
+        guide_lr: torch.Tensor,
+        epistemic_var_hr: torch.Tensor | None = None,
+        cal_mask_lr: torch.Tensor | None = None,
+        downsampler: ForwardPSFDownsampler | None = None,
+        aligner: DifferentiableGuideAligner | None = None,
+        mode: Literal["multiclass", "multilabel"] = "multiclass",
+    ) -> dict[str, Any]:
+        """Zero-label coarse physical split-conformal calibration using held-out
+        coarse pixels ``cal_mask_lr`` (or all coarse pixels if ``None``).
+        """
+        p = probs_hr.detach().float()
+        g = guide_lr.detach().float().to(p.device)
+        if g.ndim == 2:
+            g = g.unsqueeze(0).unsqueeze(0)
+        elif g.ndim == 3:
+            g = g.unsqueeze(0)
+
+        n_guide = g.shape[1]
+        fg_probs = (
+            p[:, 1:]
+            if (mode == "multiclass" and p.shape[1] == n_guide + 1)
+            else p[:, :n_guide]
+        )
+        ds = downsampler if downsampler is not None else ForwardPSFDownsampler()
+        h_lr, w_lr = int(g.shape[-2]), int(g.shape[-1])
+        src = (
+            aligner(fg_probs, (h_lr, w_lr))
+            if (aligner is not None and aligner.mode != "none")
+            else fg_probs
+        )
+        pred_lr = ds(src, (h_lr, w_lr))
+
+        # Normalize g into [0, 1] scale if raw counts were supplied
+        g_eval = g
+        if float(g.max().item()) > 1.5:
+            g_max = (
+                g.flatten(start_dim=2).max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
+            )
+            g_eval = g / g_max.clamp(min=1e-6)
+
+        entropy_hr, _ = compute_posterior_uncertainty(p, mode=mode)
+        epi_hr = (
+            torch.zeros_like(entropy_hr)
+            if epistemic_var_hr is None
+            else (
+                epistemic_var_hr.mean(dim=1)
+                if epistemic_var_hr.ndim == 4
+                else epistemic_var_hr
+            )
+            .float()
+            .to(p.device)
+        )
+        difficulty_hr = (0.5 * entropy_hr + 0.5 * epi_hr.sqrt()).clamp(min=0.08)
+        difficulty_lr = F.adaptive_avg_pool2d(
+            difficulty_hr.unsqueeze(1), output_size=(h_lr, w_lr)
+        )  # (B, 1, H_lr, W_lr)
+
+        norm_res = (pred_lr - g_eval).abs() / difficulty_lr
+        mask_flat = (
+            cal_mask_lr.to(p.device).reshape(-1).bool()
+            if cal_mask_lr is not None
+            else torch.ones(h_lr * w_lr, device=p.device, dtype=torch.bool)
+        )
+        self.n_calibration_points = int(mask_flat.sum().item())
+
+        q_ch = []
+        for m in range(n_guide):
+            s_m = norm_res[:, m].reshape(norm_res.shape[0], -1)[:, mask_flat]
+            q_ch.append(_conformal_quantile(s_m, self.alpha))
+        self.q_coarse_per_channel = torch.tensor(
+            q_ch, device=p.device, dtype=torch.float32
+        )
+
+        # Calibrate phase set threshold on high-purity coarse superpixels
+        p_full = (
+            torch.cat([1.0 - p, p], dim=1)
+            if p.shape[1] == 1
+            else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        )
+        p_pool = F.adaptive_avg_pool2d(p_full, output_size=(h_lr, w_lr))
+        if p_full.shape[1] == n_guide + 1:
+            bg_g = (1.0 - g_eval.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
+            g_simplex = torch.cat([bg_g, g_eval], dim=1)
+        elif p_full.shape[1] == 2 and n_guide == 1:
+            g_simplex = torch.cat([1.0 - g_eval, g_eval], dim=1)
+        else:
+            g_simplex = g_eval
+
+        max_frac, pseudo_cls = g_simplex.max(dim=1)  # (B, H_lr, W_lr)
+        pure_mask = (max_frac.reshape(-1) >= 0.75) & mask_flat
+        if int(pure_mask.sum().item()) >= 4:
+            p_pure = p_pool.permute(0, 2, 3, 1).reshape(-1, p_full.shape[1])[pure_mask]
+            y_pure = pseudo_cls.reshape(-1)[pure_mask]
+            true_p = p_pure.gather(1, y_pure.unsqueeze(-1)).squeeze(-1)
+            self.q_label = _conformal_quantile(1.0 - true_p, self.alpha)
+        elif self.q_label is None:
+            self.q_label = 1.0 - self.alpha
+
+        return {
+            "conformal_alpha": self.alpha,
+            "conformal_q_label": round(float(self.q_label), 4),
+            "conformal_q_coarse": [round(float(v), 4) for v in q_ch],
+            "conformal_n_cal": self.n_calibration_points,
+        }
+
+    @torch.no_grad()
+    def predict_sets_and_intervals(
+        self,
+        probs_hr: torch.Tensor,
+        guide_lr: torch.Tensor | None = None,
+        epistemic_var_hr: torch.Tensor | None = None,
+        mode: Literal["multiclass", "multilabel"] = "multiclass",
+        downsampler: ForwardPSFDownsampler | None = None,
+        aligner: DifferentiableGuideAligner | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Construct ``(1 - alpha)`` boolean ``prediction_sets`` ``(B, K, H, W)``
+        and optional ``conformal_interval_halfwidth`` ``(B, M, H, W)``.
+        """
+        p = probs_hr.detach().float()
+        p_cls = (
+            torch.cat([1.0 - p, p], dim=1)
+            if p.shape[1] == 1
+            else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        )
+        q_lbl = self.q_label if self.q_label is not None else (1.0 - self.alpha)
+
+        if self.method == "aps":
+            sorted_p, sorted_idx = torch.sort(p_cls, dim=1, descending=True)
+            cumsum_p = torch.cumsum(sorted_p, dim=1)
+            # Include classes until cumulative mass reaches q_lbl (always include top-1)
+            prev_cumsum = cumsum_p - sorted_p
+            in_sorted = prev_cumsum <= q_lbl
+            in_sorted[:, 0] = True
+            pred_sets = torch.zeros_like(p_cls, dtype=torch.bool)
+            pred_sets.scatter_(1, sorted_idx, in_sorted)
+        else:
+            pred_sets = (1.0 - p_cls) <= q_lbl
+            # Guarantee non-empty sets unless q_lbl explicitly rejects all
+            top1 = p_cls.argmax(dim=1, keepdim=True)
+            if q_lbl >= 0.5:
+                pred_sets.scatter_(1, top1, True)
+
+        halfwidth: torch.Tensor | None = None
+        if guide_lr is not None and self.q_coarse_per_channel is not None:
+            entropy_hr, _ = compute_posterior_uncertainty(p, mode=mode)
+            epi_hr = (
+                torch.zeros_like(entropy_hr)
+                if epistemic_var_hr is None
+                else (
+                    epistemic_var_hr.mean(dim=1)
+                    if epistemic_var_hr.ndim == 4
+                    else epistemic_var_hr
+                )
+                .float()
+                .to(p.device)
+            )
+            difficulty_hr = (0.5 * entropy_hr + 0.5 * epi_hr.sqrt()).clamp(min=0.08)
+            q_vec = self.q_coarse_per_channel.to(p.device).view(1, -1, 1, 1)
+            halfwidth = (q_vec * difficulty_hr.unsqueeze(1)).clamp(0.0, 1.0)
+
+            # Physical contrast safeguard: where coarse guide shows excess phase m
+            # unexplained by D(P_HR) beyond halfwidth, include phase m in the set!
+            g = guide_lr.detach().float().to(p.device)
+            if g.ndim == 2:
+                g = g.unsqueeze(0).unsqueeze(0)
+            elif g.ndim == 3:
+                g = g.unsqueeze(0)
+            if float(g.max().item()) <= 1.5:
+                n_guide = g.shape[1]
+                fg_p = (
+                    p_cls[:, 1:]
+                    if p_cls.shape[1] == n_guide + 1
+                    else p_cls[:, :n_guide]
+                )
+                ds = downsampler if downsampler is not None else ForwardPSFDownsampler()
+                h_lr, w_lr = int(g.shape[-2]), int(g.shape[-1])
+                src = (
+                    aligner(fg_p, (h_lr, w_lr))
+                    if (aligner is not None and aligner.mode != "none")
+                    else fg_p
+                )
+                deficit_lr = (g - ds(src, (h_lr, w_lr))).clamp(min=0.0)
+                deficit_hr = F.interpolate(
+                    deficit_lr,
+                    size=p.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                missing_contrast = deficit_hr > halfwidth
+                offset = 1 if p_cls.shape[1] == n_guide + 1 else 0
+                for m in range(min(n_guide, pred_sets.shape[1] - offset)):
+                    pred_sets[:, m + offset] = (
+                        pred_sets[:, m + offset] | missing_contrast[:, m]
+                    )
+
+        return pred_sets, halfwidth
+
+
+def empirical_conformal_coverage(
+    prediction_sets: np.ndarray | torch.Tensor,
+    targets: np.ndarray | torch.Tensor,
+) -> dict[str, float]:
+    """Evaluate empirical marginal coverage ``P(Y in C(X))`` and average set
+    cardinality ``E[|C(X)|]`` against ground-truth integer labels.
+    Supports full grids ``(B, K, H, W)`` / ``(K, H, W)`` and masked 1D slices
+    ``(B, K, N)`` / ``(K, N)``.
+    """
+    s = (
+        prediction_sets.detach().cpu().numpy().astype(bool)
+        if isinstance(prediction_sets, torch.Tensor)
+        else np.asarray(prediction_sets, dtype=bool)
+    )
+    y = (
+        targets.detach().cpu().numpy().astype(np.int64)
+        if isinstance(targets, torch.Tensor)
+        else np.asarray(targets, dtype=np.int64)
+    )
+    if s.ndim == 2:
+        # Masked (K, N) slice paired with (N,) targets
+        n_classes = s.shape[0]
+        s_flat = s.T.reshape(-1, n_classes)
+    elif (
+        s.ndim == 3
+        and y.ndim == 2
+        and s.shape[0] == y.shape[0]
+        and s.shape[2] == y.shape[1]
+    ):
+        # Batched masked (B, K, N) slice paired with (B, N) targets
+        n_classes = s.shape[1]
+        s_flat = np.moveaxis(s, 1, -1).reshape(-1, n_classes)
+    else:
+        if s.ndim == 3:
+            s = s[None, ...]
+        n_classes = s.shape[1]
+        s_flat = np.moveaxis(s, 1, -1).reshape(-1, n_classes)
+
+    y_flat = y.reshape(-1)
+    valid = (y_flat >= 0) & (y_flat < n_classes)
+    if not np.any(valid):
+        return {
+            "empirical_coverage": 1.0,
+            "mean_set_size": 1.0,
+            "singleton_fraction": 1.0,
+        }
+    s_v = s_flat[valid]
+    y_v = y_flat[valid]
+    covered = s_v[np.arange(len(y_v)), y_v]
+    sizes = s_v.sum(axis=-1)
+    return {
+        "empirical_coverage": float(np.mean(covered)),
+        "mean_set_size": float(np.mean(sizes)),
+        "singleton_fraction": float(np.mean(sizes == 1)),
+    }
 
 
 def compute_posterior_uncertainty(
@@ -92,18 +490,7 @@ def compute_posterior_uncertainty(
     mode: Literal["multiclass", "multilabel"] = "multiclass",
     eps: float = 1e-7,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute normalized predictive entropy in ``[0, 1]`` and confidence margin.
-
-    Args:
-        probs: ``(B, K, H, W)`` probabilities (summing to 1 along dim=1 if
-            ``multiclass``, or independent ``[0, 1]`` Bernoulli channels if
-            ``multilabel``).
-        mode: ``"multiclass"`` (mutually exclusive phases, K >= 2) or
-            ``"multilabel"`` (co-located elements / single-phase binary).
-
-    Returns:
-        ``(normalized_entropy, confidence_margin)`` each of shape ``(B, H, W)``.
-    """
+    """Compute normalized predictive entropy in ``[0, 1]`` and confidence margin."""
     p = probs.float().clamp(eps, 1.0 - eps)
     if mode == "multiclass" and p.shape[1] >= 2:
         p = p / p.sum(dim=1, keepdim=True).clamp(min=eps)
@@ -116,7 +503,6 @@ def compute_posterior_uncertainty(
         margin = top2[:, 0] - top2[:, 1]
         return entropy.clamp(0.0, 1.0), margin.clamp(0.0, 1.0)
 
-    # Binary / multilabel: mean binary entropy across channels
     bin_ent = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p)) / float(np.log(2.0))
     entropy = bin_ent.mean(dim=1)
     margin = (2.0 * (p - 0.5).abs()).mean(dim=1)
@@ -127,8 +513,8 @@ def compute_bald_mutual_information(
     prob_samples: torch.Tensor, eps: float = 1e-7
 ) -> torch.Tensor:
     """Compute Bayesian Active Learning by Disagreement (BALD) epistemic mutual
-    information ``H(E[p]) - E[H(p)]`` from ``(N_samples, B, K, H, W)`` TTA/plane
-    probability samples."""
+    information ``H(E[p]) - E[H(p)]`` from ``(N_samples, B, K, H, W)`` samples.
+    """
     p_s = prob_samples.float().clamp(eps, 1.0 - eps)
     mean_p = p_s.mean(dim=0)
     if p_s.shape[2] >= 2:
@@ -156,19 +542,7 @@ def compute_physical_residual(
     downsampler: ForwardPSFDownsampler | None = None,
     aligner: DifferentiableGuideAligner | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate forward physical consistency ``|D(W(P_HR)) - G_LR|``.
-
-    Args:
-        pred_probs_hr: ``(B, M, H, W)`` predicted foreground phase/element maps.
-        guide_lr: ``(B, M, H_lr, W_lr)`` measured coarse guide maps in ``[0, 1]``.
-        psf_sigma: Optional fixed isotropic/anisotropic blur sigma override.
-        downsampler: Optional learned/configured ``ForwardPSFDownsampler``.
-        aligner: Optional ``DifferentiableGuideAligner`` mapping HR frame to LR frame.
-
-    Returns:
-        ``(residual_hr, residual_lr)`` where ``residual_hr`` has shape ``(B, H, W)``
-        and ``residual_lr`` has shape ``(B, M, H_lr, W_lr)``.
-    """
+    """Evaluate normalized forward physical consistency ``|D(W(P_HR)) - G_LR|``."""
     if guide_lr.ndim == 2:
         guide_lr = guide_lr.unsqueeze(0).unsqueeze(0)
     elif guide_lr.ndim == 3:
@@ -180,8 +554,17 @@ def compute_physical_residual(
     if aligner is not None and aligner.mode != "none":
         src = aligner(src, (h_lr, w_lr))
     pred_lr = ds(src, (h_lr, w_lr), psf_sigma=psf_sigma)
-    residual_lr = (pred_lr - guide_lr.float().to(pred_lr.device)).abs()
 
+    g_ref = guide_lr.float().to(pred_lr.device)
+    if float(g_ref.max().item()) > 1.5:
+        g_max = (
+            g_ref.flatten(start_dim=2).max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
+        )
+        g_ref = g_ref / g_max.clamp(min=1e-6)
+    if g_ref.shape[1] != pred_lr.shape[1]:
+        g_ref = g_ref[:, : pred_lr.shape[1]]
+
+    residual_lr = (pred_lr - g_ref).abs()
     residual_mean_lr = residual_lr.mean(dim=1, keepdim=True)
     residual_hr = F.interpolate(
         residual_mean_lr,
@@ -199,15 +582,22 @@ def match_coarse_priors(
     max_iters: int = 40,
     lr: float = 0.25,
 ) -> torch.Tensor:
-    """Calibrate per-channel logit biases (prior shift) and temperature so the
-    spatial mean of high-resolution probabilities matches the measured coarse
-    physical phase fractions ``mean(G_LR)`` without needing HR ground-truth labels!"""
+    """Calibrate per-channel logit biases so the spatial mean of HR probabilities
+    matches the measured coarse physical phase fractions ``mean(G_LR)`` without
+    needing HR ground-truth labels.
+    """
     logits = logits_hr.detach().float().clone()
     if guide_lr.ndim == 2:
         guide_lr = guide_lr.unsqueeze(0).unsqueeze(0)
     elif guide_lr.ndim == 3:
         guide_lr = guide_lr.unsqueeze(0)
-    target_mean = guide_lr.float().to(logits.device).mean(dim=(-2, -1))  # (B, M)
+    g_ref = guide_lr.float().to(logits.device)
+    if float(g_ref.max().item()) > 1.5:
+        g_max = (
+            g_ref.flatten(start_dim=2).max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
+        )
+        g_ref = g_ref / g_max.clamp(min=1e-6)
+    target_mean = g_ref.mean(dim=(-2, -1))
 
     with torch.enable_grad():
         bias = torch.zeros(
@@ -222,14 +612,13 @@ def match_coarse_priors(
             opt.zero_grad()
             shifted = logits + bias
             if mode == "multiclass" and logits.shape[1] > target_mean.shape[1]:
-                # First channel is background, remaining M channels match guide_lr
                 probs = F.softmax(shifted, dim=1)[:, 1:]
             elif mode == "multiclass":
                 probs = F.softmax(shifted, dim=1)
             else:
                 probs = torch.sigmoid(shifted)
-            pred_mean = probs.mean(dim=(-2, -1))
-            loss = F.mse_loss(pred_mean, target_mean)
+            pred_mean = probs[:, : target_mean.shape[1]].mean(dim=(-2, -1))
+            loss = F.mse_loss(pred_mean, target_mean[:, : pred_mean.shape[1]])
             if loss.item() < 1e-7:
                 break
             loss.backward()
@@ -251,13 +640,14 @@ def build_uncertainty_report(
     unresolved_residual_cutoff: float = 0.30,
     downsampler: ForwardPSFDownsampler | None = None,
     aligner: DifferentiableGuideAligner | None = None,
+    calibrator: ConformalCalibrator | None = None,
     diagnostics: dict[str, Any] | None = None,
 ) -> UncertaintyReport:
-    """Assemble a complete ``UncertaintyReport`` from HR probabilities, coarse
-    guide measurements, and optional TTA / 2.5D epistemic variance."""
+    """Assemble a complete ``UncertaintyReport`` (including optional Split
+    Conformal prediction sets & intervals when ``calibrator`` is provided).
+    """
     entropy, margin = compute_posterior_uncertainty(probs_hr, mode=mode)
 
-    # Align foreground channels with guide_lr for physical residual check
     n_guide = (
         guide_lr.shape[1]
         if guide_lr.ndim == 4
@@ -266,7 +656,7 @@ def build_uncertainty_report(
     if mode == "multiclass" and probs_hr.shape[1] == n_guide + 1:
         fg_probs = probs_hr[:, 1:]
     else:
-        fg_probs = probs_hr[:, :n_guide]
+        fg_probs = probs_hr[:, : min(n_guide, probs_hr.shape[1])]
 
     phys_res, _ = compute_physical_residual(
         fg_probs, guide_lr, downsampler=downsampler, aligner=aligner
@@ -281,8 +671,6 @@ def build_uncertainty_report(
         p99 = torch.quantile(epi.flatten(), 0.99).clamp(min=1e-6)
         epi_norm = (epi / p99).clamp(0.0, 1.0)
 
-    # Composite uncertainty blends chemical entropy, spatial epistemic variance,
-    # and physical forward-model mismatch
     combined = (0.45 * entropy + 0.25 * epi_norm + 0.30 * phys_res).clamp(0.0, 1.0)
     unresolved = phys_res > unresolved_residual_cutoff
 
@@ -296,6 +684,18 @@ def build_uncertainty_report(
             combined > abstain_threshold, torch.full_like(hard, -1), hard
         )
 
+    pred_sets: torch.Tensor | None = None
+    conf_hw: torch.Tensor | None = None
+    if calibrator is not None:
+        pred_sets, conf_hw = calibrator.predict_sets_and_intervals(
+            probs_hr=probs_hr,
+            guide_lr=guide_lr,
+            epistemic_var_hr=epi,
+            mode=mode,
+            downsampler=downsampler,
+            aligner=aligner,
+        )
+
     return UncertaintyReport(
         probabilities=probs_hr,
         hard_mask=hard,
@@ -306,6 +706,8 @@ def build_uncertainty_report(
         combined_uncertainty=combined,
         unresolved_mask=unresolved,
         diagnostics=dict(diagnostics) if diagnostics is not None else {},
+        prediction_sets=pred_sets,
+        conformal_interval_halfwidth=conf_hw,
     )
 
 
@@ -317,11 +719,7 @@ def expected_calibration_error(
     targets: np.ndarray | torch.Tensor,
     n_bins: int = 15,
 ) -> float:
-    """Compute Expected Calibration Error (ECE) over ``n_bins`` confidence bins.
-
-    Supports both binary ``(H, W)`` / ``(B, 1, H, W)`` probabilities and
-    multiclass ``(B, K, H, W)`` probabilities against integer ``targets``.
-    """
+    """Compute Expected Calibration Error (ECE) over ``n_bins`` confidence bins."""
     p = (
         probs.detach().cpu().float().numpy()
         if isinstance(probs, torch.Tensor)
@@ -387,12 +785,7 @@ def sparsification_curve(
     uncertainty: np.ndarray | torch.Tensor,
     n_fractions: int = 11,
 ) -> dict[str, np.ndarray | float]:
-    """Evaluate selective prediction (risk-coverage / sparsification curve).
-
-    Progressively abstains on the most uncertain fraction ``q`` of pixels
-    (``q in [0, 0.9]``) and measures segmentation accuracy & IoU on retained
-    pixels, plus Area Under the Sparsification Error curve (AUSE vs. oracle).
-    """
+    """Evaluate selective prediction (risk-coverage / sparsification curve)."""
     pred_arr = (
         preds.detach().cpu().numpy()
         if isinstance(preds, torch.Tensor)
@@ -410,9 +803,9 @@ def sparsification_curve(
     ).ravel()
 
     n_pix = len(unc_arr)
-    order_model = np.argsort(unc_arr)  # ascending uncertainty (most certain first)
+    order_model = np.argsort(unc_arr)
     errors = (pred_arr != tgt_arr).astype(np.float32)
-    order_oracle = np.argsort(errors)  # true errors removed first
+    order_oracle = np.argsort(errors)
 
     fractions = np.linspace(0.0, 0.9, n_fractions)
     retained_acc = np.zeros_like(fractions)

@@ -1,14 +1,14 @@
-"""Utility functions for synthetic multiphase generation, float-safe guide tensor
-conversion, and ALiBi / DINOv3 model checkpoint wrappers.
+"""Utility functions for quantitative guide tensor conversion, ALiBi / DINOv3
+checkpoint wrappers, and backward-compatible synthetic multiphase helpers.
 """
+
+from __future__ import annotations
 
 from collections.abc import Sequence
 from types import MethodType
 from typing import Any
 
-import cv2
 import h5py as h5
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -23,6 +23,7 @@ from .alibi import (
     PretrainedViTWrapper,
     get_alibi_slope,
 )
+from .physics import GuideNormalization
 
 
 def get_multiphase(
@@ -34,12 +35,14 @@ def get_multiphase(
     vis: bool = False,
     dataset_size: int = 1,
 ):
-    """Generate 2D multi-phase grayscale images and binary Phase A / Phase B masks."""
+    """Generate 2D multi-phase grayscale images and binary Phase A / Phase B masks
+    (preserved for backward compatibility; prefer ``generate_correlative_phantom_2d``).
+    """
     seed_base = 1337
     rng = np.random.default_rng(seed_base)
-    gray_imgs = []
-    phase_a_masks = []
-    phase_b_masks = []
+    gray_imgs: list[np.ndarray] = []
+    phase_a_masks: list[np.ndarray] = []
+    phase_b_masks: list[np.ndarray] = []
 
     im_a_kw = dict(imA_kwargs)
     im_b_kw = dict(imB_kwargs)
@@ -75,13 +78,11 @@ def get_multiphase(
                 )
 
         phase_a = im_a.astype(np.float32)
-        phase_b = im_b.astype(np.float32)
-
-        if extract_spheres:
-            phase_b_mask = np.zeros_like(phase_b)
-            phase_b_mask[phase_a == phase_b] = 0
-            phase_b_mask[phase_a != phase_b] = 1
-            phase_b = phase_b_mask.astype(np.float32)
+        phase_b = (
+            (phase_a != im_b.astype(np.float32)).astype(np.float32)
+            if extract_spheres
+            else im_b.astype(np.float32)
+        )
 
         g_min, g_max = float(np.min(gray_img)), float(np.max(gray_img))
         if g_max - g_min > 1e-8:
@@ -91,25 +92,16 @@ def get_multiphase(
         phase_a_masks.append(phase_a)
         phase_b_masks.append(phase_b)
 
-        if vis:
-            _, ax = plt.subplots(1, 4, figsize=(24, 12))
-            ax[0].imshow(multi_phase, cmap="gray")
-            ax[0].set_title("Multi-phase image (0=bg, 1=A, 2=B, 3=overlap)")
-            ax[0].axis("off")
-            im_handle = ax[1].imshow(gray_img, cmap="gray")
-            ax[1].set_title("Grayscale multi-phase image")
-            ax[1].axis("off")
-            ax[2].imshow(phase_a, cmap="gray")
-            ax[2].set_title("Phase A")
-            ax[2].axis("off")
-            ax[3].imshow(phase_b, cmap="gray")
-            ax[3].set_title("Phase B")
-            ax[3].axis("off")
-            plt.colorbar(im_handle, ax=ax[1])
-            plt.tight_layout()
-            plt.show()
-
     return gray_imgs, phase_a_masks, phase_b_masks
+
+
+def _area_downsample_2d(arr: np.ndarray, factor: int) -> np.ndarray:
+    """Pure-PyTorch/NumPy exact area-averaged downsampling without OpenCV dependency."""
+    h, w = arr.shape
+    th, tw = max(1, h // factor), max(1, w // factor)
+    t = torch.from_numpy(np.asarray(arr, dtype=np.float32)).unsqueeze(0).unsqueeze(0)
+    pooled = F.adaptive_avg_pool2d(t, output_size=(th, tw))
+    return pooled.squeeze(0).squeeze(0).numpy().astype(np.float32)
 
 
 def downsample_xrdct(
@@ -119,43 +111,9 @@ def downsample_xrdct(
     factor: int = 2,
     vis: bool = False,
 ):
-    """Downsample Phase A and Phase B masks by ``factor``."""
-    downsampled_a = []
-    downsampled_b = []
-
-    shape_a = phase_A_masks[0].shape
-    shape_b = phase_B_masks[0].shape
-
-    for i in range(len(gray_imgs)):
-        ds_a = cv2.resize(
-            phase_A_masks[i],
-            (shape_a[1] // factor, shape_a[0] // factor),
-            interpolation=cv2.INTER_AREA,
-        )
-        ds_b = cv2.resize(
-            phase_B_masks[i],
-            (shape_b[1] // factor, shape_b[0] // factor),
-            interpolation=cv2.INTER_AREA,
-        )
-        downsampled_a.append(ds_a.astype(np.float32))
-        downsampled_b.append(ds_b.astype(np.float32))
-
-    if vis:
-        _, ax = plt.subplots(len(gray_imgs), 3, figsize=(24, 12))
-        ax_grid = np.atleast_2d(ax)
-        for i in range(len(gray_imgs)):
-            ax_grid[i, 0].imshow(gray_imgs[i], cmap="gray")
-            ax_grid[i, 0].set_title(f"Grayscale Multi-phase Image {i + 1}")
-            ax_grid[i, 0].axis("off")
-            ax_grid[i, 1].imshow(downsampled_a[i], cmap="gray")
-            ax_grid[i, 1].set_title(f"Downsampled Phase A Mask {i + 1}")
-            ax_grid[i, 1].axis("off")
-            ax_grid[i, 2].imshow(downsampled_b[i], cmap="gray")
-            ax_grid[i, 2].set_title(f"Downsampled Phase B Mask {i + 1}")
-            ax_grid[i, 2].axis("off")
-        plt.tight_layout()
-        plt.show()
-
+    """Area-downsample Phase A and Phase B masks by ``factor``."""
+    downsampled_a = [_area_downsample_2d(m, factor) for m in phase_A_masks]
+    downsampled_b = [_area_downsample_2d(m, factor) for m in phase_B_masks]
     return gray_imgs, downsampled_a, downsampled_b
 
 
@@ -190,13 +148,21 @@ def guide_to_tensor(
     guide_img: np.ndarray | torch.Tensor,
     device: str | torch.device = "cpu",
     normalize: bool = True,
+    normalization: GuideNormalization | None = None,
 ) -> torch.Tensor:
     """Convert a 2D ``(H, W)``, 3D ``(M, H, W)``, or 4D ``(B, M, H, W)`` coarse
-    physical guide map into a ``(B, M, H, W)`` float32 tensor without 8-bit
-    quantization loss.
+    physical guide map (or spectral cube) into a ``(B, M, H, W)`` float32 tensor.
 
-    When ``normalize=True``, each channel ``m`` is independently min-max scaled
-    into ``[0, 1]`` (with zero-variance channels safely mapped to ``0.0``).
+    Normalization modes (``normalization`` overrides ``normalize`` when set):
+    - ``"minmax"`` (default when ``normalize=True``): Independent per-channel
+      min-max scaling into ``[0, 1]`` (zero-variance channels map to ``0.0``).
+    - ``"preserve_counts"`` (default when ``normalize=False``): Clamps negative
+      detector baseline artifacts to ``0.0`` while preserving raw physical photon/X-ray
+      counts for ``loss_fn="forward_psf_poisson"``.
+    - ``"global_max"``: Divides all channels jointly by the global maximum across
+      channels so relative stoichiometry and zero/trace channels are preserved!
+    - ``"simplex"``: Normalizes non-negative channels per pixel so ``sum_m G_m = 1``
+      (when total > 0) for ``loss_fn="compositional_kl"``.
     """
     if isinstance(guide_img, torch.Tensor):
         t = guide_img.detach().clone().to(dtype=torch.float32)
@@ -210,7 +176,13 @@ def guide_to_tensor(
     elif t.ndim != 4:
         raise ValueError(f"Expected 2D, 3D, or 4D guide map, got shape {t.shape}.")
 
-    if normalize:
+    mode: GuideNormalization = (
+        normalization
+        if normalization is not None
+        else ("minmax" if normalize else "preserve_counts")
+    )
+
+    if mode == "minmax":
         flat = t.flatten(start_dim=2)
         mn = flat.min(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
         mx = flat.max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
@@ -218,6 +190,22 @@ def guide_to_tensor(
         t = torch.where(
             span > 1e-12, (t - mn) / span.clamp(min=1e-12), torch.zeros_like(t)
         )
+    elif mode == "preserve_counts":
+        t = t.clamp(min=0.0)
+    elif mode == "global_max":
+        t_pos = t.clamp(min=0.0)
+        g_max = t_pos.flatten(start_dim=1).max(dim=-1).values.view(-1, 1, 1, 1)
+        t = torch.where(
+            g_max > 1e-12, t_pos / g_max.clamp(min=1e-12), torch.zeros_like(t_pos)
+        )
+    elif mode == "simplex":
+        t_pos = t.clamp(min=0.0)
+        denom = t_pos.sum(dim=1, keepdim=True)
+        t = torch.where(
+            denom > 1e-12, t_pos / denom.clamp(min=1e-12), torch.zeros_like(t_pos)
+        )
+    else:
+        raise ValueError(f"Unknown guide normalization mode '{mode}'.")
 
     return t.to(device=device, dtype=torch.float32)
 

@@ -20,8 +20,8 @@ typecheck: ## Run static type checking with Mypy
 docs-check: ## Build MkDocs documentation in strict mode
 	NO_MKDOCS_2_WARNING=1 uv run mkdocs build --strict
 
-test: ## Run CPU unit test suite with >=82% coverage enforcement
-	uv run pytest -m "not gpu" --cov=x_fuse --cov-report=term-missing --cov-fail-under=82 -v
+test: ## Run CPU unit test suite with >=85% coverage enforcement
+	uv run pytest -m "not gpu" --cov=x_fuse --cov-report=term-missing --cov-fail-under=85 -v
 
 test-gpu: ## Run CUDA GPU integration tests (requires NVIDIA GPU)
 	uv run pytest -m gpu -v

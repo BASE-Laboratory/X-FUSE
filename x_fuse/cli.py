@@ -15,10 +15,12 @@ import numpy as np
 import torch
 
 from . import __version__
-from .backbones import LayerSelection
+from .backbones import Interpolation, LayerSelection
 from .datasets import list_open_datasets
 from .fusion import XFuse
+from .heads import FusionOptions
 from .io import load_microscopy_file, save_uncertainty_report
+from .physics import LossOptions
 from .registration import AlignMode
 from .segment import compute_segmentation_metrics, jbu_guided_baseline
 from .synthetic import generate_correlative_phantom_2d
@@ -127,6 +129,11 @@ def _cmd_fuse(
     guide_paths: Sequence[Path],
     output_path: Path,
     backbone: str = "dinov2_vits14",
+    fusion_method: FusionOptions = "learned_gating",
+    loss_fn: LossOptions = "forward_psf_bce",
+    upsampler: Interpolation = "jbu",
+    debias_positional: bool = False,
+    conformal_alpha: float | None = None,
     layers: Literal["last", "multiscale"] = "last",
     align_guide: AlignMode = "none",
     learn_psf: bool = False,
@@ -156,11 +163,13 @@ def _cmd_fuse(
     layer_sel: LayerSelection = layers
     model = XFuse(
         backbone=backbone,
-        fusion_method="learned_gating",
+        fusion_method=fusion_method,
         stride=stride,
         dtype=torch.float32,
-        loss_fn="forward_psf_bce",
-        interpolation_mode="jbu",
+        loss_fn=loss_fn,
+        interpolation_mode=upsampler,
+        debias_positional=debias_positional,
+        conformal_alpha=conformal_alpha,
         pretrained=pretrained,
         lr=8e-3,
         layers=layer_sel,
@@ -182,6 +191,7 @@ def _cmd_fuse(
         "saved_report": str(saved),
         "hr_shape": list(hr_arr.shape),
         "guide_shape": list(guide_stack.shape),
+        "has_conformal_sets": rep.prediction_sets is not None,
         "diagnostics": rep.diagnostics,
     }
     print(json.dumps(out_summary, indent=2))
@@ -243,10 +253,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output report path (.ome.tif, .h5, or .zarr).",
     )
     p_fuse.add_argument("--backbone", default="dinov2_vits14")
+    p_fuse.add_argument(
+        "--fusion-method",
+        choices=["gating", "learned_gating", "spatial_mlp", "attention"],
+        default="learned_gating",
+    )
+    p_fuse.add_argument(
+        "--loss",
+        choices=[
+            "bce",
+            "pearson",
+            "forward_psf_bce",
+            "forward_psf_mse",
+            "forward_psf_poisson",
+            "compositional_kl",
+        ],
+        default="forward_psf_bce",
+    )
+    p_fuse.add_argument(
+        "--upsampler",
+        choices=["jbu", "cross_attn", "bilinear", "nearest-exact"],
+        default="jbu",
+    )
+    p_fuse.add_argument(
+        "--debias-positional",
+        action="store_true",
+        help="Project out linear/quadratic positional biases from ViT features.",
+    )
+    p_fuse.add_argument(
+        "--conformal-alpha",
+        type=float,
+        default=None,
+        help="Optional miscoverage level alpha (e.g. 0.10 for 90%% conformal sets).",
+    )
     p_fuse.add_argument("--layers", choices=["last", "multiscale"], default="last")
     p_fuse.add_argument(
         "--align-guide",
-        choices=["none", "translation", "rigid", "affine"],
+        choices=["none", "translation", "rigid", "affine", "bspline"],
         default="none",
     )
     p_fuse.add_argument("--learn-psf", action="store_true")
@@ -282,6 +325,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             guide_paths=args.guide,
             output_path=args.output,
             backbone=args.backbone,
+            fusion_method=args.fusion_method,
+            loss_fn=args.loss,
+            upsampler=args.upsampler,
+            debias_positional=bool(args.debias_positional),
+            conformal_alpha=args.conformal_alpha,
             layers=args.layers,
             align_guide=args.align_guide,
             learn_psf=bool(args.learn_psf),

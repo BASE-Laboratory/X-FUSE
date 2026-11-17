@@ -39,9 +39,12 @@ def generate_paper_figures(
         series = [
             ("bicubic_miou", "Bicubic Interpolation", "o--", "#7f8c8d"),
             ("jbu_miou", "Classical JBU (edxia)", "s--", "#2980b9"),
+            ("cnmf_miou", "CNMF Pan-Sharpening", "v--", "#16a085"),
+            ("guided_tv_miou", "Guided Variational TV", "p--", "#27ae60"),
+            ("siren_inr_miou", "SIREN Coordinate INR", "h:", "#d35400"),
             ("vit_kmeans_miou", "ViT + K-Means", "^:", "#8e44ad"),
             ("xfuse_last_miou", "X-FUSE (Last Layer)", "d-", "#e67e22"),
-            ("xfuse_multiscale_miou", "X-FUSE (Multi-Scale + PSF)", "*-", "#c0392b"),
+            ("xfuse_multiscale_miou", "X-FUSE v1.0 (CrossAttn + PSF)", "*-", "#c0392b"),
         ]
         for key, label, style, color in series:
             if key in ablation_rows[0]:
@@ -55,26 +58,28 @@ def generate_paper_figures(
         axes[0].set_xticks(factors)
         axes[0].set_xticklabels([f"{f}×" for f in factors])
         axes[0].grid(True, alpha=0.3)
-        axes[0].legend(loc="best")
+        axes[0].legend(loc="best", fontsize=7.5)
 
         bf1_keys = [
             ("bicubic_bf1", "Bicubic", "#7f8c8d"),
             ("jbu_bf1", "Classical JBU", "#2980b9"),
+            ("guided_tv_bf1", "Guided TV", "#27ae60"),
             ("xfuse_last_bf1", "X-FUSE (Last)", "#e67e22"),
-            ("xfuse_multiscale_bf1", "X-FUSE (Multi-Scale)", "#c0392b"),
+            ("xfuse_multiscale_bf1", "X-FUSE v1.0", "#c0392b"),
         ]
         x_pos = np.arange(len(factors))
-        width = 0.18
-        for idx, (bkey, blabel, bcol) in enumerate(bf1_keys):
-            if bkey in ablation_rows[0]:
-                vals = [row[bkey] for row in ablation_rows]
-                axes[1].bar(
-                    x_pos + (idx - 1.5) * width,
-                    vals,
-                    width=width,
-                    label=blabel,
-                    color=bcol,
-                )
+        present_bf1 = [item for item in bf1_keys if item[0] in ablation_rows[0]]
+        width = 0.8 / max(len(present_bf1), 1)
+        offset0 = -0.5 * (len(present_bf1) - 1)
+        for idx, (bkey, blabel, bcol) in enumerate(present_bf1):
+            vals = [row[bkey] for row in ablation_rows]
+            axes[1].bar(
+                x_pos + (offset0 + idx) * width,
+                vals,
+                width=width,
+                label=blabel,
+                color=bcol,
+            )
         axes[1].set_xticks(x_pos)
         axes[1].set_xticklabels([f"{f}×" for f in factors])
         axes[1].set_xlabel("Resolution Gap")
@@ -176,6 +181,53 @@ def generate_paper_figures(
         fig.tight_layout()
         for ext in ("pdf", "png"):
             p = out_dir / f"fig3_active_beamtime_curve.{ext}"
+            fig.savefig(p, dpi=300)
+            saved_paths.append(p)
+        plt.close(fig)
+
+    # 4. v1.0 Stress Tests: Iso-Intensity Texture & Split Conformal Coverage
+    stress = results.get("v1_stress_tests", {})
+    tex_data = stress.get("textured_isointensity", {})
+    conf_rows = stress.get("conformal_coverage", [])
+    if tex_data and conf_rows:
+        fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2))
+        methods = [
+            ("jbu_miou", "Classical JBU", "#2980b9"),
+            ("cnmf_miou", "CNMF", "#16a085"),
+            ("guided_tv_miou", "Guided TV", "#27ae60"),
+            ("xfuse_cross_attn_miou", "X-FUSE CrossAttn", "#c0392b"),
+        ]
+        labels = [m[1] for m in methods if m[0] in tex_data]
+        vals = [tex_data[m[0]] for m in methods if m[0] in tex_data]
+        cols = [m[2] for m in methods if m[0] in tex_data]
+        axes[0].bar(np.arange(len(vals)), vals, color=cols, width=0.55)
+        axes[0].set_xticks(np.arange(len(vals)))
+        axes[0].set_xticklabels(labels, rotation=15, ha="right")
+        axes[0].set_ylabel("Macro Foreground mIoU")
+        axes[0].set_title("A. Iso-Intensity Textured Phase Disentanglement")
+        axes[0].grid(True, axis="y", alpha=0.3)
+
+        nom = [r["nominal_coverage"] for r in conf_rows]
+        emp = [r["empirical_coverage"] for r in conf_rows]
+        axes[1].plot([0.75, 0.98], [0.75, 0.98], "k--", label="Ideal Guarantee (y = x)")
+        axes[1].plot(
+            nom,
+            emp,
+            "o-",
+            color="#8e44ad",
+            linewidth=2.0,
+            markersize=7,
+            label="X-FUSE Split Conformal Sets",
+        )
+        axes[1].set_xlabel("Nominal Target Coverage (1 - α)")
+        axes[1].set_ylabel("Empirical Test Coverage")
+        axes[1].set_title("B. Finite-Sample Conformal Phase Coverage")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend(loc="lower right")
+
+        fig.tight_layout()
+        for ext in ("pdf", "png"):
+            p = out_dir / f"fig4_field_baselines_and_conformal.{ext}"
             fig.savefig(p, dpi=300)
             saved_paths.append(p)
         plt.close(fig)

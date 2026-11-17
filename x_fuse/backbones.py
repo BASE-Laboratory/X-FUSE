@@ -14,9 +14,10 @@ import torch.nn.functional as F
 from timm import create_model
 from torch.nn.modules.utils import _pair
 
+from .debias import ApositionalFeatureDebiaser
 from .tiling import run_tiled_2d
 from .transforms import iden_partial
-from .upsamplers import JointBilateralUpsampler
+from .upsamplers import CrossAttentionFeatureUpsampler, JointBilateralUpsampler
 from .utils import get_alibi_model, get_dv3_model
 from .vit_patch import AttentionOptions, Patch
 
@@ -29,6 +30,7 @@ Interpolation: TypeAlias = Literal[
     "area",
     "nearest-exact",
     "jbu",
+    "cross_attn",
 ]
 LayerSelection: TypeAlias = Literal["last", "multiscale"] | Sequence[int]
 
@@ -96,6 +98,18 @@ def load_backbone(
 
     dev_str = str(device) if device is not None else "cpu"
 
+    if dino_name.startswith("alibi:") and "model_path" not in kwargs:
+        # Instantiate an un-checkpointed ALiBi-wrapped timm ViT directly!
+        from .alibi import MODEL_LIST, AlibiVitWrapper
+
+        spec = dino_name.split("alibi:", 1)[1] or MODEL_LIST[1]
+        return AlibiVitWrapper(
+            model_identifier=spec,
+            stride=stride,
+            device=dev_str,
+            pretrained=pretrained,
+        )
+
     if "alibi" in dino_name or "nope" in dino_name:
         model_path = kwargs["model_path"]
         if "dv3" in dino_name or "dinov3" in dino_name:
@@ -137,8 +151,9 @@ def load_backbone(
 
 
 class HighResBackbone(nn.Module):
-    """Self-contained dense ViT feature extractor using sub-patch stride,
-    invertible TTA ensembles, and optional Joint Bilateral Upsampling (JBU)."""
+    """Self-contained dense ViT feature extractor supporting sub-patch stride,
+    invertible TTA ensembles, JBU or ``AnyUp``/``JAFAR``-style cross-attention
+    upsampling, and apositional coordinate-ramp debiasing."""
 
     def __init__(
         self,
@@ -152,6 +167,9 @@ class HighResBackbone(nn.Module):
         layers: LayerSelection = "last",
         tile_size: int | None = None,
         tile_overlap: int = 64,
+        debias_positional: bool = False,
+        debias_degree: int = 2,
+        learned_upsampler: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -196,6 +214,15 @@ class HighResBackbone(nn.Module):
         self.jbu_upsampler = JointBilateralUpsampler(
             guidance_dim=3, radius=2, sigma_spatial=1.5, sigma_range=0.15, learned=False
         )
+        self.cross_attn_upsampler = CrossAttentionFeatureUpsampler(
+            feat_dim=self.feat_dim,
+            key_dim=16,
+            radius=2,
+            learned=learned_upsampler,
+        )
+        self.debiaser = ApositionalFeatureDebiaser(
+            enabled=debias_positional, degree=debias_degree
+        )
         self.pca_dim = pca_dim
         self.do_pca = pca_dim > 3
 
@@ -208,6 +235,8 @@ class HighResBackbone(nn.Module):
         if device is not None:
             self.dinov2 = self.dinov2.to(device)
             self.jbu_upsampler = self.jbu_upsampler.to(device)
+            self.cross_attn_upsampler = self.cross_attn_upsampler.to(device)
+            self.debiaser = self.debiaser.to(device)
 
         self.track_grad = track_grad
         self.patch_last_block(self.dinov2, dino_name)
@@ -381,13 +410,18 @@ class HighResBackbone(nn.Module):
         target_hw: tuple[int, int],
         guidance_img: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        pm = self.debiaser(patch_map)
+        if self.interpolation_mode == "cross_attn" and guidance_img is not None:
+            return self.cross_attn_upsampler(pm, guidance_img)
         if self.interpolation_mode == "jbu" and guidance_img is not None:
-            return self.jbu_upsampler(patch_map, guidance_img)
+            return self.jbu_upsampler(pm, guidance_img)
         mode = (
-            "bilinear" if self.interpolation_mode == "jbu" else self.interpolation_mode
+            "bilinear"
+            if self.interpolation_mode in ("jbu", "cross_attn")
+            else self.interpolation_mode
         )
         kwargs = {"align_corners": False} if mode in ("bilinear", "bicubic") else {}
-        return F.interpolate(patch_map, size=target_hw, mode=mode, **kwargs)
+        return F.interpolate(pm, size=target_hw, mode=mode, **kwargs)
 
     @torch.no_grad()
     def get_transformed_input_batch(

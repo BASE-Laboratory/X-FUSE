@@ -74,6 +74,14 @@ def _report_to_arrays(
                 report.unresolved_mask[0].detach().cpu().numpy().astype(np.uint8)
             ),
         }
+        if report.prediction_sets is not None:
+            arrays["prediction_sets"] = (
+                report.prediction_sets[0].detach().cpu().numpy().astype(np.uint8)
+            )
+        if report.conformal_interval_halfwidth is not None:
+            arrays["conformal_interval_halfwidth"] = (
+                report.conformal_interval_halfwidth[0].detach().cpu().float().numpy()
+            )
         meta = {
             "report_type": "UncertaintyReport",
             "diagnostics": dict(report.diagnostics),
