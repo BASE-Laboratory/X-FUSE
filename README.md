@@ -23,18 +23,16 @@ Unlike purely geometric foundation models (such as SAM/SAM2) that segment contra
 
 ---
 
-## Key Capabilities (v0.2.0)
+## Key Capabilities (v0.4.0)
 
-1. **100% Self-Contained Pure-PyTorch Package**: Zero vendored external sub-repos or custom C++/CUDA compilation required. Includes native sub-patch ViT stride & positional-encoding patching (`DINOv2`, `DINOv3`, `ALiBi`, `NoPE`, and `timm` ViTs), invertible sub-patch test-time augmentation (TTA), and pure-PyTorch progressive **Joint Bilateral Upsampling (JBU)**.
-2. **Multi-Channel Extract-Once Fusion & Forward-PSF Supervision**: Extracts dense HR ViT features once and fuses $M$ elemental/phase channels (`Ca, Si, Al, Fe, ...`) simultaneously, supervising sharp HR phase predictions via $\mathcal{D}(\hat{P}_{\text{HR}}) \approx G_{\text{LR}}$ rather than training against blurry upsampled targets.
-3. **Tri-Part Pixel & Voxel Certainty Maps (`UncertaintyReport`)**:
+1. **100% Self-Contained Pure-PyTorch Package & 3-Line API**: Zero vendored external sub-repos or custom C++/CUDA compilation required. Run end-to-end normalized, padded, and calibrated correlative fusion in three lines via `XFuse(...).fit_predict(hr_image, coarse_guide)`.
+2. **Multi-Scale ViT Pyramid, Megapixel Tiling & TTA Caching**: Concatenate shallow boundary tokens with deep semantic tokens (`layers="multiscale"`), cache frozen TTA features across training epochs (`~10x–20x` speedup), and tile megapixel micrographs seamlessly via raised-cosine Hann blending (`tile_size=...`).
+3. **Differentiable Sub-Pixel Drift & Anisotropic PSF Learning**: Jointly compensate sample stage/beam drift (`align_guide="translation" | "rigid" | "affine"`) in the canonical HR frame while learning per-channel Gaussian interaction-volume PSF widths (`learn_psf=True`).
+4. **Tri-Part Certainty & Active Beamtime Steering**:
    - **Chemical / Aleatoric Ambiguity**: Prior-calibrated posterior entropy and top-1 vs. top-2 probability margin.
-   - **Spatial / Epistemic Variance**: Online Welford variance across TTA shifts/flips and orthogonal 2.5D planes in $O(1)$ extra memory.
-   - **Physical Forward-Model Residual**: $|\mathcal{D}(\hat{P}_{\text{HR}}) - G_{\text{LR}}|$, automatically flagging **unresolved regions** where $I_{\text{HR}}$ lacks structural contrast for a real chemical gradient.
-4. **SuRVoS-Inspired 2.5D Volumetric Mode (`VolumetricFuser`)**:
-   - Zero-overhead `(z - Δz, z, z + Δz)` 3-slice RGB ViT input packing,
-   - **Sparse-slice 2D → 3D chemical propagation** (train on a few 2D XRD-CT or FIB-EDS slices, segment the full 3D tomogram),
-   - Orthogonal `XY + XZ + YZ` **tri-plane fusion** with inter-plane epistemic variance.
+   - **Spatial / Epistemic Variance**: Online Welford variance across TTA views and orthogonal 2.5D planes in $O(1)$ extra memory.
+   - **Physical Forward-Model Residual**: $|\mathcal{D}(\hat{P}_{\text{HR}}) - G_{\text{LR}}|$, flagging contrast-invisible phases, paired with `suggest_next_slices` and `suggest_2d_rois` for live experiment steering.
+5. **Out-of-Core SuRVoS 2.5D Mode & Scientific I/O**: Lazy HDF5 / Zarr / TIFF-stack slice streaming (`VolumeSliceAccessor`), sparse-slice 2D → 3D propagation (`VolumetricFuser`), OME-TIFF / HDF5 / Zarr report export (`save_uncertainty_report`), and RosettaSciIO vendor microscopy readers (`.emd`, `.dm3`/`.dm4`, `.bcf`, `.hspy`).
 
 ---
 
@@ -46,87 +44,72 @@ Using [`uv`](https://docs.astral.sh/uv/) (recommended):
 git clone https://github.com/BASE-Laboratory/X-FUSE.git
 cd X-FUSE
 
-# CPU + dev + synthetic PoreSpy benchmarks (Linux / macOS)
-uv sync --extra cpu --extra dev --extra synthetic --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cpu
+# CPU + microscopy I/O + dev + docs extras (Linux / macOS)
+uv sync --extra cpu --extra io --extra dev --extra docs \
+  --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Or GPU (CUDA 12.1 on Linux)
-uv sync --extra cuda --extra dev --extra synthetic
+uv sync --extra cuda --extra io --extra dev
 ```
 
-See [INSTALL.md](INSTALL.md) for optional extras (`sam`, `notebooks`) and platform details.
+See [INSTALL.md](INSTALL.md) for optional extras (`io`, `docs`, `synthetic`, `sam`, `notebooks`) and platform details.
 
 ---
 
 ## Quickstart
 
-### 1. 2D Multi-Channel Correlative Fusion + Certainty Map
+### 1. 3-Line 2D Multi-Channel Correlative Fusion + Drift/PSF Recovery
 
 ```python
-import torch
-from x_fuse import (
-    CorrelativeFuser,
-    build_default_tta,
-    ensure_spatial_divisible,
-    generate_correlative_phantom_2d,
-    guide_to_tensor,
-    normalize_structural,
-)
+from x_fuse import XFuse, generate_correlative_phantom_2d, save_uncertainty_report, suggest_2d_rois
 
-# 1. Load or synthesize paired HR structural image + M-channel coarse physical guide
 phantom = generate_correlative_phantom_2d(size=128, downsample_factor=8)
-hr_tensor = normalize_structural(phantom.hr_image)           # float32-native (3, H, W)
-hr_padded, (h, w) = ensure_spatial_divisible(hr_tensor, patch_size=14, stride=4)
-guide_tensor = guide_to_tensor(phantom.coarse_guide)         # (1, M, H_lr, W_lr)
-
-# 2. Initialize self-contained fuser (supports dinov2_vits14, dinov2_vitb14_reg, timm:*, etc.)
-fwd_tta, inv_tta = build_default_tta(shift_dists=[1, 2], pattern="Neumann", include_flips=True)
-fuser = CorrelativeFuser(
-    dino_name="dinov2_vits14",
-    xrd_fuse_method="learned_gating",
-    loss_fn="forward_psf_bce",
-    interpolation_mode="jbu",
+model = XFuse(
+    backbone="dinov2_vits14",
+    layers="multiscale",
+    align_guide="translation",
+    learn_psf=True,
     stride=4,
-    dtype=torch.float32,
 )
-fuser.set_guide_transforms(guide_tensor, fwd_tta, inv_tta)
+report = model.fit_predict(phantom.hr_image, phantom.coarse_guide, epochs=25, mode="multiclass")
 
-# 3. Fit lightweight linear probe against coarse physical measurements
-for _ in range(20):
-    loss = fuser.train_fusion_step(hr_padded)
-
-# 4. Predict HR phase masks + calibrated pixel-level UncertaintyReport
-report = fuser.predict_with_uncertainty(hr_padded, guide_lr=guide_tensor, mode="multiclass")
-phase_mask = report.hard_mask[0, :h, :w]                     # (H, W) int64 phase IDs
-certainty = 1.0 - report.combined_uncertainty[0, :h, :w]     # (H, W) pixel certainty in [0, 1]
-unresolved = report.unresolved_mask[0, :h, :w]               # (H, W) bool physical mismatch flag
+phase_mask = report.hard_mask[0]                             # (H, W) int64 phase IDs
+certainty = 1.0 - report.combined_uncertainty[0]             # (H, W) pixel certainty in [0, 1]
+rois = suggest_2d_rois(report, roi_size=(32, 32), k=2)       # Targeted re-acquisition windows
+save_uncertainty_report(report, "fused_report.ome.tif", pixel_size_um=0.05)
 ```
 
-### 2. SuRVoS-Style 2.5D Sparse-Slice → 3D Tomogram Propagation
+*(Low-level hooks `fuser.set_guide_transforms(...)`, `fuser.train_fusion_step(...)`, and `fuser.predict_with_uncertainty(...)` remain 100% supported for custom research loops.)*
+
+### 2. SuRVoS-Style 2.5D Sparse-Slice → 3D Tomogram + Active Beamtime Steering
 
 ```python
-from x_fuse import CorrelativeFuser, VolumetricFuser, generate_correlative_phantom_3d
+from x_fuse import XFuse, VolumetricFuser, generate_correlative_phantom_3d, suggest_next_slices
 
 phantom_3d = generate_correlative_phantom_3d(shape=(32, 64, 64), downsample_factor=4)
-base = CorrelativeFuser("dinov2_vits14", loss_fn="forward_psf_bce", stride=4, dtype=torch.float32)
-vol_fuser = VolumetricFuser(base)
+vol_fuser = VolumetricFuser(XFuse(backbone="dinov2_vits14", stride=4))
 
-# Train on just 3 sparse 2D chemical/diffraction slices out of Z=32!
+# Train on just 3 sparse 2D chemical/diffraction slices out of Z=32 (supports lazy HDF5/Zarr!)
 sparse_slices = {4: phantom_3d.coarse_guide_3d[:, 1], 16: phantom_3d.coarse_guide_3d[:, 4], 28: phantom_3d.coarse_guide_3d[:, 7]}
 vol_fuser.fit_sparse_slices(phantom_3d.hr_volume, sparse_guides=sparse_slices, epochs=15, delta=1)
 
 # Propagate across the entire 3D volume via orthogonal XY + XZ + YZ tri-planes
 vol_report = vol_fuser.predict_volume(phantom_3d.hr_volume, mode="triplane", pred_mode="multiclass")
-print(vol_report.hard_mask.shape, "Z-consistency:", vol_report.z_slice_consistency)
+plan = suggest_next_slices(vol_report, acquired_indices=list(sparse_slices), k=3, min_spacing=4)
+print("Next optimal z-slices to scan:", plan.recommended_indices)
 ```
 
-### 3. Reproducible Benchmark Suite & Open Datasets
+### 3. Reproducible Paper Benchmarks, Figures & Open Datasets
 
 ```bash
 # Run synthetic super-resolution, invisible-phase residual, sparsification & 2.5D suite
 uv run python -m benchmarks.run_synthetic_suite --quick
 
-# Run full unit test suite
-uv run pytest -m "not gpu" --cov=x_fuse -v
+# Run paper ablation suite + vector PDF/PNG figure generation (multi-scale, drift/PSF, active 3D, Zn13X/MOR-GIS)
+uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir benchmarks/outputs/paper_quick
+
+# Run full unit test suite (>=82% coverage gate)
+uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=82 -v
 ```
 
 Fetch registered open correlative datasets from Zenodo (`edxia` SEM-EDS, HAADF-STEM-EDS/EELS, ISIS IMAT Bragg-Edge):
@@ -142,17 +125,19 @@ print(list(list_open_datasets().keys()))
 
 ## Command-Line Interface & Tutorials
 
-Once installed, the `xfuse` CLI provides instant environment diagnostics, Zenodo dataset discovery, and a self-contained synthetic correlative smoke check:
+Once installed, the `xfuse` CLI provides environment diagnostics, Zenodo dataset discovery, synthetic smoke checks, and zero-code batch correlative fusion:
 
 ```bash
 xfuse info
 xfuse datasets
 xfuse demo --epochs 15
+xfuse fuse --hr data/samples/Zn13X/high_4.tiff --guide data/samples/Zn13X/low_4.tiff --output zn13x.ome.tif
 ```
 
 Interactive step-by-step notebooks (stored with outputs stripped) are available in [`notebooks/`](notebooks/):
 - `notebooks/01_correlative_2d_and_uncertainty.ipynb` — 2D multi-channel correlative fusion, JBU comparison, and tri-part pixel uncertainty.
 - `notebooks/02_volumetric_25d_propagation.ipynb` — SuRVoS-style 2.5D slab packing, sparse $z$-slice training, and 3D tri-plane propagation.
+- `notebooks/03_active_acquisition_and_registration.ipynb` — 3-line `XFuse.fit_predict`, sub-pixel drift/PSF recovery, active experiment steering, and OME-TIFF/HDF5 export.
 
 ---
 
@@ -161,23 +146,28 @@ Interactive step-by-step notebooks (stored with outputs stripped) are available 
 ```text
 X-FUSE/
 ├── x_fuse/
-│   ├── backbones.py      # Self-contained ViT loader & dense sub-patch TTA extractor
-│   ├── fusion.py         # CorrelativeFuser (XFuse), Forward-PSF gating & cross-attention
-│   ├── upsamplers.py     # Pure-PyTorch scale-dilated JBU & ForwardPSFDownsampler
+│   ├── backbones.py      # Multi-layer ViT loader, sub-patch TTA & tiled extractor
+│   ├── fusion.py         # XFuse / CorrelativeFuser, 3-line API, TTA cache & gating
+│   ├── registration.py   # Differentiable sub-pixel translation/rigid/affine aligner
+│   ├── tiling.py         # Hann-windowed overlapping 2D tile inference engine
+│   ├── upsamplers.py     # Scale-dilated JBU & learnable anisotropic ForwardPSFDownsampler
 │   ├── uncertainty.py    # Online Welford TTA variance, entropy, physical residual, ECE, AUSE
-│   ├── volumetric.py     # SuRVoS-style 2.5D slice packing, sparse 2D->3D & tri-plane fusion
-│   ├── segment.py        # Sign-aligned PCA+Otsu, JBU/bicubic/KMeans baselines, BF1, SAM2 hook
+│   ├── volumetric.py     # Lazy HDF5/Zarr 2.5D slice streaming, sparse 2D->3D & tri-plane
+│   ├── active.py         # Active sparse-slice (`suggest_next_slices`) & 2D ROI steering
+│   ├── io.py             # OME-TIFF / HDF5 / Zarr report I/O & RosettaSciIO vendor readers
+│   ├── segment.py        # Sign-aligned PCA+Otsu, JBU/bicubic/KMeans baselines, BF1, SAM2
 │   ├── synthetic.py      # Controlled 2D & 3D multi-phase correlative phantom generators
 │   ├── datasets.py       # Bundled sample locator, Zenodo fetcher & experimental hold-out tool
 │   ├── loaders.py        # XCT/XRD-CT HDF5/NeXus, SEM-EDS hypermaps & generic TIFF pairs
 │   ├── transforms.py     # Invertible sub-patch TTA & float32-native structural normalization
 │   ├── vit_patch.py      # ViT stride / pos-embed patching & TorchPCA
-│   └── cli.py            # `xfuse` CLI entrypoint
-├── benchmarks/           # Reproducible quantitative benchmark CLI & summary generators
-├── notebooks/            # Clean, output-stripped tutorial notebooks (2D + 2.5D)
+│   └── cli.py            # `xfuse` CLI (`info`, `datasets`, `demo`, `fuse`)
+├── docs/                 # MkDocs Material documentation (theory, modality recipes, API)
+├── benchmarks/           # Synthetic & paper ablation runners, Zenodo adapters & PDF plotters
+├── notebooks/            # Clean, output-stripped tutorial notebooks (01, 02, 03)
 ├── data/samples/         # Bundled Zn13X & MOR-GIS sample correlative slices
-├── tests/                # Comprehensive CPU & CUDA GPU pytest suite (>=80% coverage gate)
-└── Makefile              # Developer shortcuts: sync, format, lint, typecheck, test, build
+├── tests/                # Comprehensive CPU & CUDA GPU pytest suite (>=82% coverage gate)
+└── Makefile              # Developer shortcuts: sync, format, lint, typecheck, docs-check, test
 ```
 
 ## Contributing, Citation & License

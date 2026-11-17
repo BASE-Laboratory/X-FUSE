@@ -4,6 +4,17 @@ All notable changes to **X-FUSE** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-17
+
+### Added
+- **3-Line High-Level API (`XFuse.fit` / `predict` / `fit_predict`)**: Modality-neutral initialization (`backbone`, `fusion_method`, `layers`, `align_guide`, `learn_psf`, `tile_size`) with automatic percentile structural normalization, spatial divisibility padding, and exact output cropping (`UncertaintyReport.crop_spatial`).
+- **Frozen TTA Caching, Hann Tiling & Out-of-Core 3D Streaming**: LRU caching of frozen multi-view ViT TTA features across training epochs (`~10x–20x` probe speedup), raised-cosine Hann-windowed overlapping 2D tile inference (`x_fuse.tiling`), and lazy HDF5 / Zarr / TIFF-directory 2.5D slice streaming (`VolumeSliceAccessor` in `x_fuse.volumetric`).
+- **Multi-Scale ViT Pyramid (`layers="multiscale"`)**: Forward-hook token extraction concatenating LayerNorm-stabilized shallow, mid, and deep ViT blocks for crisp sub-patch phase boundary localization.
+- **Differentiable Sub-Pixel Registration & Learnable Anisotropic PSF**: Canonical-frame TTA-equivariant `DifferentiableGuideAligner` (`translation`, `rigid`, `affine` with $\tanh$-bounded shifts and $L_2$ identity regularization) paired with per-channel learnable Gaussian interaction-volume widths (`ForwardPSFDownsampler(learnable=True)`).
+- **Active Experiment Steering (`x_fuse.active`)**: `suggest_next_slices` for sparse-slice 3D tomography scheduling and integral-image NMS `suggest_2d_rois` for targeted 2D re-acquisition.
+- **Standardized Scientific I/O & `xfuse fuse` CLI (`x_fuse.io`, `x_fuse.cli`)**: Export and reload 2D/3D uncertainty reports in `.ome.tif`, `.h5`, and `.zarr`, load vendor `.emd`/`.dm3`/`.dm4`/`.bcf`/`.hspy` archives via optional RosettaSciIO (`x-fuse[io]`), and run batch fusion from the terminal via `xfuse fuse`.
+- **Paper Benchmark Suite, Plotters & MkDocs Documentation**: Added `benchmarks/dataset_adapters.py`, `benchmarks/run_paper_benchmarks.py`, `benchmarks/plot_paper_figures.py`, Tutorial `03_active_acquisition_and_registration.ipynb`, and strict MkDocs Material documentation (`mkdocs.yml`, `docs/`, `.github/workflows/docs.yml`).
+
 ## [0.2.0] - 2026-11-17
 
 ### Added

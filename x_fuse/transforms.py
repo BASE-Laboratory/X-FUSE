@@ -308,5 +308,6 @@ def ensure_spatial_divisible(
     pad_w = (stride - rem_w) % stride if orig_w >= patch_size else rem_w
     if pad_h == 0 and pad_w == 0:
         return x, (orig_h, orig_w)
-    padded = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+    pad_mode = "reflect" if (pad_h < orig_h and pad_w < orig_w) else "replicate"
+    padded = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
     return padded, (orig_h, orig_w)

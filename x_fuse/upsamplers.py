@@ -8,6 +8,8 @@ Supports both:
    forward-model supervision and physical residual uncertainty scoring.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,44 +26,142 @@ def _make_gaussian_kernel_2d(
     return g2d.view(1, 1, 2 * radius + 1, 2 * radius + 1)
 
 
+def _make_anisotropic_gaussian_kernels(
+    sigma_yx: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build differentiable ``(C, 1, 2R+1, 2R+1)`` separable Gaussian kernels
+    from ``sigma_yx`` of shape ``(C, 2)``.
+    """
+    max_sig = float(sigma_yx.detach().max().item())
+    radius = max(1, int(math.ceil(2.5 * max(max_sig, 0.4))))
+    coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    sig_y = sigma_yx[:, 0:1].to(device=device, dtype=dtype).clamp(min=0.15)  # (C, 1)
+    sig_x = sigma_yx[:, 1:2].to(device=device, dtype=dtype).clamp(min=0.15)  # (C, 1)
+    gy = torch.exp(-(coords.unsqueeze(0) ** 2) / (2.0 * sig_y.square()))  # (C, K)
+    gx = torch.exp(-(coords.unsqueeze(0) ** 2) / (2.0 * sig_x.square()))  # (C, K)
+    g2d = gy.unsqueeze(2) * gx.unsqueeze(1)  # (C, K, K)
+    g2d = g2d / g2d.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
+    return g2d.unsqueeze(1)  # (C, 1, K, K)
+
+
 class ForwardPSFDownsampler(nn.Module):
     """Differentiable physical forward operator ``D(P_HR) -> G_LR`` modelling
-    probe/interaction-volume blur followed by coarse detector pixel integration."""
+    probe/interaction-volume blur followed by coarse detector pixel integration.
 
-    def __init__(self, psf_sigma_ratio: float = 0.35):
+    When ``learnable=True``, optimizes per-channel anisotropic PSF blur ratios
+    ``(sigma_ratio_y, sigma_ratio_x)`` directly from coarse guide supervision.
+    """
+
+    def __init__(
+        self,
+        psf_sigma_ratio: float = 0.35,
+        learnable: bool = False,
+        n_channels: int = 1,
+    ):
         super().__init__()
-        self.psf_sigma_ratio = psf_sigma_ratio
+        self.psf_sigma_ratio = float(psf_sigma_ratio)
+        self.learnable = bool(learnable)
+        self.n_channels = max(1, int(n_channels))
+        if self.learnable:
+            init_log = math.log(max(self.psf_sigma_ratio, 0.05))
+            self.log_sigma_ratio = nn.Parameter(
+                torch.full((self.n_channels, 2), init_log, dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("log_sigma_ratio", None)
+
+    def _effective_sigma_yx(
+        self,
+        channels: int,
+        scale_h: float,
+        scale_w: float,
+        device: torch.device,
+    ) -> torch.Tensor:
+        assert self.log_sigma_ratio is not None
+        ratios = self.log_sigma_ratio.to(device=device, dtype=torch.float32).exp()
+        ratios = ratios.clamp(0.05, 1.50)
+        if ratios.shape[0] == 1 and channels > 1:
+            ratios = ratios.expand(channels, -1)
+        elif ratios.shape[0] != channels:
+            ratios = ratios[:1].expand(channels, -1)
+        scales = torch.tensor([[scale_h, scale_w]], device=device, dtype=torch.float32)
+        return ratios * scales  # (C, 2)
 
     def forward(
         self,
         hr_map: torch.Tensor,
         target_size: tuple[int, int],
-        psf_sigma: float | None = None,
+        psf_sigma: float | tuple[float, float] | None = None,
     ) -> torch.Tensor:
         """Downsample ``hr_map`` ``(B, M, H, W)`` to ``(H_lr, W_lr)``."""
-        bsz, channels, h_hr, w_hr = hr_map.shape
+        _, channels, h_hr, w_hr = hr_map.shape
         h_lr, w_lr = target_size
         if (h_hr, w_hr) == (h_lr, w_lr):
             return hr_map
 
         scale_h = h_hr / max(h_lr, 1)
         scale_w = w_hr / max(w_lr, 1)
-        sigma = (
-            psf_sigma
-            if psf_sigma is not None
-            else self.psf_sigma_ratio * 0.5 * (scale_h + scale_w)
-        )
-
         x = hr_map.float()
-        if sigma >= 0.4:
-            kernel = _make_gaussian_kernel_2d(sigma, x.device, x.dtype)
-            pad = kernel.shape[-1] // 2
+
+        if self.learnable and psf_sigma is None and self.log_sigma_ratio is not None:
+            sigma_yx = self._effective_sigma_yx(channels, scale_h, scale_w, x.device)
+            weight = _make_anisotropic_gaussian_kernels(
+                sigma_yx, device=x.device, dtype=torch.float32
+            )
+            pad = weight.shape[-1] // 2
             x_padded = F.pad(x, (pad, pad, pad, pad), mode="reflect")
-            weight = kernel.expand(channels, 1, -1, -1)
             x = F.conv2d(x_padded, weight, groups=channels)
+        elif isinstance(psf_sigma, tuple):
+            sig_t = torch.tensor(
+                [[float(psf_sigma[0]), float(psf_sigma[1])]],
+                device=x.device,
+                dtype=torch.float32,
+            ).expand(channels, -1)
+            if float(sig_t.max().item()) >= 0.25:
+                weight = _make_anisotropic_gaussian_kernels(
+                    sig_t, device=x.device, dtype=torch.float32
+                )
+                pad = weight.shape[-1] // 2
+                x_padded = F.pad(x, (pad, pad, pad, pad), mode="reflect")
+                x = F.conv2d(x_padded, weight, groups=channels)
+        else:
+            sigma = (
+                float(psf_sigma)
+                if psf_sigma is not None
+                else self.psf_sigma_ratio * 0.5 * (scale_h + scale_w)
+            )
+            if sigma >= 0.4:
+                kernel = _make_gaussian_kernel_2d(sigma, x.device, x.dtype)
+                pad = kernel.shape[-1] // 2
+                x_padded = F.pad(x, (pad, pad, pad, pad), mode="reflect")
+                weight = kernel.expand(channels, 1, -1, -1)
+                x = F.conv2d(x_padded, weight, groups=channels)
 
         pooled = F.adaptive_avg_pool2d(x, output_size=(h_lr, w_lr))
         return pooled.to(hr_map.dtype)
+
+    @torch.no_grad()
+    def diagnostics(
+        self, hr_hw: tuple[int, int], lr_hw: tuple[int, int]
+    ) -> dict[str, object]:
+        """Return effective PSF blur sigmas in HR pixels."""
+        scale_h = hr_hw[0] / max(lr_hw[0], 1)
+        scale_w = hr_hw[1] / max(lr_hw[1], 1)
+        if not self.learnable or self.log_sigma_ratio is None:
+            sig = round(self.psf_sigma_ratio * 0.5 * (scale_h + scale_w), 4)
+            return {"learnable_psf": False, "psf_sigma_hr_px": sig}
+        sig_yx = self._effective_sigma_yx(
+            self.n_channels, scale_h, scale_w, self.log_sigma_ratio.device
+        ).cpu()
+        return {
+            "learnable_psf": True,
+            "psf_sigma_yx_hr_px": [
+                [round(float(row[0].item()), 4), round(float(row[1].item()), 4)]
+                for row in sig_yx
+            ],
+        }
 
 
 class JointBilateralUpsampler(nn.Module):

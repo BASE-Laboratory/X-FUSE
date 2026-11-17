@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x-fuse"
-version = "0.2.0"
+version = "0.4.0"
 description = "Uncertainty-aware foundation-model fusion for 2D & 2.5D correlative materials imaging"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -51,6 +51,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/BASE-Laboratory/X-FUSE"
+Documentation = "https://base-laboratory.github.io/X-FUSE/"
 Repository = "https://github.com/BASE-Laboratory/X-FUSE"
 Issues = "https://github.com/BASE-Laboratory/X-FUSE/issues"
 Changelog = "https://github.com/BASE-Laboratory/X-FUSE/blob/main/CHANGELOG.md"
@@ -59,6 +60,16 @@ Changelog = "https://github.com/BASE-Laboratory/X-FUSE/blob/main/CHANGELOG.md"
 xfuse = "x_fuse.cli:main"
 
 [project.optional-dependencies]
+io = [
+    "rosettasciio>=0.5",
+    "tifffile>=2023.9",
+    "zarr>=2.16",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.26",
+]
 synthetic = [
     "porespy>=2.4",
 ]
@@ -86,6 +97,8 @@ dev = [
     "pytest-benchmark>=4.0",
     "pytest-cov>=5.0",
     "ruff>=0.7",
+    "tifffile>=2023.9",
+    "zarr>=2.16",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -97,6 +110,8 @@ include = [
     "/tests",
     "/benchmarks",
     "/notebooks",
+    "/docs",
+    "/mkdocs.yml",
     "/README.md",
     "/INSTALL.md",
     "/CHANGELOG.md",

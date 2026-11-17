@@ -41,7 +41,9 @@ pip install -e ".[dev,synthetic]"
 
 | Extra | Command (`uv sync ...`) | Included Packages / Purpose |
 | :--- | :--- | :--- |
-| `dev` | `--extra dev` | `pytest`, `pytest-cov`, `pytest-benchmark`, `black`, `flake8`, `pre-commit` |
+| `io` | `--extra io` | `tifffile`, `zarr`, `rosettasciio` for OME-TIFF/Zarr export & vendor `.emd`/`.dm4`/`.bcf`/`.hspy` readers |
+| `dev` | `--extra dev` | `pytest`, `pytest-cov`, `pytest-benchmark`, `ruff`, `mypy`, `nbformat`, `nbstripout`, `pre-commit` |
+| `docs` | `--extra docs` | `mkdocs`, `mkdocs-material`, `mkdocstrings[python]` for building documentation |
 | `synthetic` | `--extra synthetic` | `porespy` for classical PoreSpy blob/sphere generators |
 | `sam` | `--extra sam` | `sam2` for certainty-guided SAM2 boundary refinement (`refine_with_sam2`) |
 | `notebooks` | `--extra notebooks` | `jupyterlab`, `ipykernel`, `ipywidgets` for interactive notebooks |
@@ -56,13 +58,15 @@ pip install -e ".[dev,synthetic]"
 # 1. Verify package import & version
 uv run python -c "import x_fuse; print('x-fuse version:', x_fuse.__version__)"
 
-# 2. Run the unit test suite (CPU-safe)
-uv run pytest -m "not gpu" -v
+# 2. Run the CPU unit test suite with >=82% coverage gate
+uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=82 -v
 
-# 3. Run the quick synthetic + Zn13X sample benchmark
+# 3. Run the quick synthetic & paper ablation benchmarks
 uv run python -m benchmarks.run_synthetic_suite --quick
+uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir /tmp/xfuse_paper_quick
 
-# 4. Check code formatting & lint rules
-uv run black --check x_fuse/ tests/ benchmarks/
-uv run flake8 x_fuse/ tests/ benchmarks/
+# 4. Check Ruff formatting/lint, Mypy types, and strict MkDocs build
+uv run ruff check x_fuse tests benchmarks
+uv run mypy x_fuse
+NO_MKDOCS_2_WARNING=1 uv run mkdocs build --strict
 ```

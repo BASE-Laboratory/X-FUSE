@@ -2,7 +2,13 @@
 Segmentation for Correlative Multiscale Materials Imaging.
 """
 
-from .backbones import HighResBackbone, HighResDV2, load_backbone
+from .active import (
+    ActiveROI2D,
+    ActiveSliceRecommendation,
+    suggest_2d_rois,
+    suggest_next_slices,
+)
+from .backbones import HighResBackbone, HighResDV2, LayerSelection, load_backbone
 from .datasets import (
     OPEN_DATASETS,
     OpenCorrelativeDataset,
@@ -23,6 +29,11 @@ from .fusion import (
     XRDFusionMethod,
     compute_channel_correlation_gates,
 )
+from .io import (
+    load_microscopy_file,
+    load_uncertainty_report,
+    save_uncertainty_report,
+)
 from .loaders import (
     load_correlative_tiff_pair,
     load_diad_xrdct,
@@ -31,6 +42,7 @@ from .loaders import (
     load_xct,
     load_xrdct_phase,
 )
+from .registration import AlignMode, DifferentiableGuideAligner
 from .segment import (
     bicubic_upsample_baseline,
     compute_segmentation_metrics,
@@ -47,6 +59,7 @@ from .synthetic import (
     generate_correlative_phantom_2d,
     generate_correlative_phantom_3d,
 )
+from .tiling import generate_tile_boxes, hann_window_2d, run_tiled_2d
 from .transforms import (
     build_default_tta,
     combine_transforms,
@@ -75,13 +88,14 @@ from .upsamplers import (
 )
 from .utils import downsample_xrdct, get_multiphase, guide_to_tensor, xrd_to_tensor
 from .volumetric import (
+    VolumeSliceAccessor,
     VolumetricFuser,
     VolumetricUncertaintyReport,
     pack_25d_slice,
     z_slice_consistency_score,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
@@ -89,6 +103,7 @@ __all__ = [
     "XFuse",
     "HighResBackbone",
     "HighResDV2",
+    "LayerSelection",
     "load_backbone",
     "LearnedChannelGating",
     "XRDCrossAttention",
@@ -98,6 +113,11 @@ __all__ = [
     "FusionOptions",
     "LossOptions",
     "compute_channel_correlation_gates",
+    "AlignMode",
+    "DifferentiableGuideAligner",
+    "generate_tile_boxes",
+    "hann_window_2d",
+    "run_tiled_2d",
     "JointBilateralUpsampler",
     "ForwardPSFDownsampler",
     "joint_bilateral_upsample",
@@ -111,10 +131,18 @@ __all__ = [
     "expected_calibration_error",
     "brier_score",
     "sparsification_curve",
+    "VolumeSliceAccessor",
     "VolumetricFuser",
     "VolumetricUncertaintyReport",
     "pack_25d_slice",
     "z_slice_consistency_score",
+    "ActiveSliceRecommendation",
+    "ActiveROI2D",
+    "suggest_next_slices",
+    "suggest_2d_rois",
+    "save_uncertainty_report",
+    "load_uncertainty_report",
+    "load_microscopy_file",
     "pca_otsu_segment",
     "do_single_pca",
     "rescale_pca",

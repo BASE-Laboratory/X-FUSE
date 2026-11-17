@@ -3,6 +3,7 @@ extractor (replacing the external HR-Dv2 dependency and fixing double loading).
 """
 
 import re
+from collections.abc import Sequence
 from functools import partial
 from types import MethodType
 from typing import Any, Literal, TypeAlias
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 from timm import create_model
 from torch.nn.modules.utils import _pair
 
+from .tiling import run_tiled_2d
 from .transforms import iden_partial
 from .upsamplers import JointBilateralUpsampler
 from .utils import get_alibi_model, get_dv3_model
@@ -28,6 +30,7 @@ Interpolation: TypeAlias = Literal[
     "nearest-exact",
     "jbu",
 ]
+LayerSelection: TypeAlias = Literal["last", "multiscale"] | Sequence[int]
 
 
 def infer_vit_params(
@@ -146,6 +149,9 @@ class HighResBackbone(nn.Module):
         track_grad: bool = False,
         pretrained: bool = True,
         interpolation_mode: Interpolation = "nearest-exact",
+        layers: LayerSelection = "last",
+        tile_size: int | None = None,
+        tile_overlap: int = 64,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -167,9 +173,18 @@ class HighResBackbone(nn.Module):
 
         self.original_patch_size: int = patch
         self.original_stride = _pair(patch)
-        self.feat_dim: int = feat
+        self.base_feat_dim: int = feat
         self.n_heads: int = n_heads
         self.n_register_tokens: int = getattr(self.dinov2, "num_register_tokens", 0)
+        self.layers_spec: LayerSelection = layers
+        self._blocks_ref, self.layer_indices = self._resolve_layer_selection(
+            self.dinov2, layers
+        )
+        self.feat_dim: int = (
+            feat * len(self.layer_indices) if self.layer_indices is not None else feat
+        )
+        self.tile_size: int | None = tile_size
+        self.tile_overlap: int = int(tile_overlap)
 
         self.stride = _pair(stride)
         self.set_model_stride(self.dinov2, patch)
@@ -197,6 +212,46 @@ class HighResBackbone(nn.Module):
         self.track_grad = track_grad
         self.patch_last_block(self.dinov2, dino_name)
 
+    @staticmethod
+    def _resolve_layer_selection(
+        model: nn.Module, layers: LayerSelection
+    ) -> tuple[Any | None, list[int] | None]:
+        if layers == "last":
+            return None, None
+        blocks: Any = getattr(model, "blocks", None)
+        if blocks is None and hasattr(model, "model"):
+            blocks = getattr(model.model, "blocks", None)
+        if blocks is None or len(blocks) == 0:
+            return None, None
+        n_blocks = len(blocks)
+        if layers == "multiscale":
+            indices = sorted(
+                {
+                    max(0, min(n_blocks - 1, round((k + 1) * n_blocks / 4) - 1))
+                    for k in range(4)
+                }
+            )
+            return blocks, indices
+        if isinstance(layers, Sequence) and not isinstance(layers, str):
+            resolved: list[int] = []
+            for raw_idx in layers:
+                idx = int(raw_idx)
+                if idx < 0:
+                    idx += n_blocks
+                if not (0 <= idx < n_blocks):
+                    raise ValueError(
+                        f"Layer index {raw_idx} out of bounds for ViT "
+                        f"with {n_blocks} blocks."
+                    )
+                if idx not in resolved:
+                    resolved.append(idx)
+            if not resolved:
+                raise ValueError(
+                    "layers sequence must contain at least one block index."
+                )
+            return blocks, resolved
+        raise ValueError(f"Unsupported layers specification: {layers!r}")
+
     def get_model_params(self, dino_name: str) -> tuple[int, int, int]:
         return infer_vit_params(dino_name, getattr(self, "dinov2", None))
 
@@ -219,12 +274,24 @@ class HighResBackbone(nn.Module):
             dino_any.patch_embed.proj.stride = new_stride_pair
             if hasattr(dino_any.patch_embed, "strict_img_size"):
                 dino_any.patch_embed.strict_img_size = False
+            if self.dino_name.startswith("timm:"):
+                pe_mod = dino_any.patch_embed
+
+                def _subpatch_timm_pe_forward(
+                    self_pe: Any, inp: torch.Tensor
+                ) -> torch.Tensor:
+                    proj_out = self_pe.proj(inp)
+                    if getattr(self_pe, "flatten", True):
+                        proj_out = proj_out.flatten(2).transpose(1, 2)
+                    else:
+                        fmt = str(getattr(self_pe, "output_fmt", ""))
+                        if "NHWC" in fmt:
+                            proj_out = proj_out.permute(0, 2, 3, 1)
+                    return self_pe.norm(proj_out)
+
+                pe_mod.forward = MethodType(_subpatch_timm_pe_forward, pe_mod)
             # For non-timm DINO/DINOv2 models, patch interpolate_pos_encoding
-            if (
-                not self.dino_name.startswith("timm:")
-                and hasattr(dino_any, "pos_embed")
-                and dino_any.pos_embed is not None
-            ):
+            elif hasattr(dino_any, "pos_embed") and dino_any.pos_embed is not None:
                 patched_pos = MethodType(
                     Patch._fix_pos_enc(self.original_patch_size, new_stride_pair),
                     dino_any,
@@ -341,36 +408,76 @@ class HighResBackbone(nn.Module):
             img_batch = img_batch.to(self.dtype)
         return img_batch
 
+    def extract_patch_tokens(
+        self,
+        transformed_img: torch.Tensor,
+        attn_choice: AttentionOptions = "none",
+    ) -> torch.Tensor:
+        """Extract single-layer or multi-scale standardized patch tokens
+        ``(B, N_patches, feat_dim [+ n_heads])``.
+        """
+        if self._blocks_ref is None or self.layer_indices is None:
+            out_dict = self.dinov2.forward_feats_attn(  # type: ignore[operator]
+                transformed_img, None, attn_choice
+            )
+            if attn_choice != "none" and "x_patchattn" in out_dict:
+                return torch.cat(
+                    (out_dict["x_norm_patchtokens"], out_dict["x_patchattn"]), dim=-1
+                )
+            return out_dict["x_norm_patchtokens"]
+
+        captured: dict[int, torch.Tensor] = {}
+        handles = []
+
+        def _make_hook(b_idx: int):
+            def _hook(_mod: nn.Module, _inp: Any, out: Any) -> None:
+                tok = out[0] if isinstance(out, tuple) else out
+                captured[b_idx] = tok
+
+            return _hook
+
+        try:
+            for idx in self.layer_indices:
+                handles.append(
+                    self._blocks_ref[idx].register_forward_hook(_make_hook(idx))
+                )
+            out_dict = self.dinov2.forward_feats_attn(  # type: ignore[operator]
+                transformed_img, None, attn_choice
+            )
+        finally:
+            for h in handles:
+                h.remove()
+
+        n_patches = int(out_dict["x_norm_patchtokens"].shape[1])
+        layer_tensors: list[torch.Tensor] = []
+        for idx in self.layer_indices:
+            raw_tok = captured[idx][:, -n_patches:, : self.base_feat_dim]
+            norm_tok = F.layer_norm(raw_tok.float(), (self.base_feat_dim,)).to(
+                raw_tok.dtype
+            )
+            layer_tensors.append(norm_tok)
+
+        multi_feats = torch.cat(layer_tensors, dim=-1)
+        if attn_choice != "none" and "x_patchattn" in out_dict:
+            multi_feats = torch.cat((multi_feats, out_dict["x_patchattn"]), dim=-1)
+        return multi_feats
+
     @torch.no_grad()
-    def forward_sequential(
+    def _forward_single_tile(
         self, x: torch.Tensor, attn_choice: AttentionOptions = "none"
     ) -> torch.Tensor:
-        """Extract dense TTA-averaged high-resolution features ``(1, C, H, W)``."""
         if self.dtype != torch.float32:
             x = x.to(self.dtype)
         img_batch = self.get_transformed_input_batch(x, self.transforms)
         _, img_h, img_w = x.shape
-        channels = (
-            self.n_heads + self.feat_dim if attn_choice != "none" else self.feat_dim
-        )
         n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
 
-        out_feature_img = torch.zeros(
-            1, channels, img_h, img_w, device=x.device, dtype=self.dtype
-        )
+        out_feature_img: torch.Tensor | None = None
         n_transforms = len(self.transforms)
         for i in range(n_transforms):
             transformed_img = img_batch[i].unsqueeze(0)
-            out_dict = self.dinov2.forward_feats_attn(  # type: ignore[operator]
-                transformed_img, None, attn_choice
-            )
-            if attn_choice != "none":
-                feats = torch.cat(
-                    (out_dict["x_norm_patchtokens"], out_dict["x_patchattn"]), dim=-1
-                )
-            else:
-                feats = out_dict["x_norm_patchtokens"]
-
+            feats = self.extract_patch_tokens(transformed_img, attn_choice=attn_choice)
+            channels = int(feats.shape[-1])
             permuted = (
                 feats.squeeze(0)
                 .reshape(n_patch_h, n_patch_w, channels)
@@ -381,9 +488,33 @@ class HighResBackbone(nn.Module):
                 permuted, (img_h, img_w), guidance_img=transformed_img
             )
             inverted = self.inverse_transforms[i](full_size)
+            if out_feature_img is None:
+                out_feature_img = torch.zeros_like(inverted)
             out_feature_img = out_feature_img + inverted
 
+        assert out_feature_img is not None
         return out_feature_img / max(n_transforms, 1)
+
+    @torch.no_grad()
+    def forward_sequential(
+        self, x: torch.Tensor, attn_choice: AttentionOptions = "none"
+    ) -> torch.Tensor:
+        """Extract dense TTA-averaged high-resolution features ``(1, C, H, W)``,
+        automatically tiling when ``self.tile_size`` is set.
+        """
+        if (
+            self.tile_size is not None
+            and max(x.shape[-2], x.shape[-1]) > self.tile_size
+        ):
+            return run_tiled_2d(
+                lambda tile: self._forward_single_tile(tile, attn_choice=attn_choice),
+                x,
+                tile_size=self.tile_size,
+                overlap=self.tile_overlap,
+                patch_size=self.original_patch_size,
+                stride=self.stride[0],
+            )
+        return self._forward_single_tile(x, attn_choice=attn_choice)
 
     @torch.no_grad()
     def forward(

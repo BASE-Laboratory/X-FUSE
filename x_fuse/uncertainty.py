@@ -13,13 +13,14 @@ Provides three complementary uncertainty axes:
    chemical gradient.
 """
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .registration import DifferentiableGuideAligner
 from .upsamplers import ForwardPSFDownsampler
 
 
@@ -69,6 +70,21 @@ class UncertaintyReport:
     unresolved_mask: (
         torch.Tensor
     )  # (B, H, W) bool flag where HR lacks physical contrast
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def crop_spatial(self, height: int, width: int) -> "UncertaintyReport":
+        """Crop all spatial tensors back to unpadded ``(height, width)``."""
+        return UncertaintyReport(
+            probabilities=self.probabilities[:, :, :height, :width],
+            hard_mask=self.hard_mask[:, :height, :width],
+            aleatoric_entropy=self.aleatoric_entropy[:, :height, :width],
+            confidence_margin=self.confidence_margin[:, :height, :width],
+            epistemic_variance=self.epistemic_variance[:, :height, :width],
+            physical_residual=self.physical_residual[:, :height, :width],
+            combined_uncertainty=self.combined_uncertainty[:, :height, :width],
+            unresolved_mask=self.unresolved_mask[:, :height, :width],
+            diagnostics=dict(self.diagnostics),
+        )
 
 
 def compute_posterior_uncertainty(
@@ -136,13 +152,18 @@ def compute_bald_mutual_information(
 def compute_physical_residual(
     pred_probs_hr: torch.Tensor,
     guide_lr: torch.Tensor,
-    psf_sigma: float | None = None,
+    psf_sigma: float | tuple[float, float] | None = None,
+    downsampler: ForwardPSFDownsampler | None = None,
+    aligner: DifferentiableGuideAligner | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate forward physical consistency ``|D(P_HR) - G_LR|``.
+    """Evaluate forward physical consistency ``|D(W(P_HR)) - G_LR|``.
 
     Args:
         pred_probs_hr: ``(B, M, H, W)`` predicted foreground phase/element maps.
         guide_lr: ``(B, M, H_lr, W_lr)`` measured coarse guide maps in ``[0, 1]``.
+        psf_sigma: Optional fixed isotropic/anisotropic blur sigma override.
+        downsampler: Optional learned/configured ``ForwardPSFDownsampler``.
+        aligner: Optional ``DifferentiableGuideAligner`` mapping HR frame to LR frame.
 
     Returns:
         ``(residual_hr, residual_lr)`` where ``residual_hr`` has shape ``(B, H, W)``
@@ -153,9 +174,12 @@ def compute_physical_residual(
     elif guide_lr.ndim == 3:
         guide_lr = guide_lr.unsqueeze(0)
 
-    downsampler = ForwardPSFDownsampler()
-    h_lr, w_lr = guide_lr.shape[-2], guide_lr.shape[-1]
-    pred_lr = downsampler(pred_probs_hr.float(), (h_lr, w_lr), psf_sigma=psf_sigma)
+    ds = downsampler if downsampler is not None else ForwardPSFDownsampler()
+    h_lr, w_lr = int(guide_lr.shape[-2]), int(guide_lr.shape[-1])
+    src = pred_probs_hr.float()
+    if aligner is not None and aligner.mode != "none":
+        src = aligner(src, (h_lr, w_lr))
+    pred_lr = ds(src, (h_lr, w_lr), psf_sigma=psf_sigma)
     residual_lr = (pred_lr - guide_lr.float().to(pred_lr.device)).abs()
 
     residual_mean_lr = residual_lr.mean(dim=1, keepdim=True)
@@ -225,6 +249,9 @@ def build_uncertainty_report(
     mode: Literal["multiclass", "multilabel"] = "multiclass",
     abstain_threshold: float | None = None,
     unresolved_residual_cutoff: float = 0.30,
+    downsampler: ForwardPSFDownsampler | None = None,
+    aligner: DifferentiableGuideAligner | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> UncertaintyReport:
     """Assemble a complete ``UncertaintyReport`` from HR probabilities, coarse
     guide measurements, and optional TTA / 2.5D epistemic variance."""
@@ -241,7 +268,9 @@ def build_uncertainty_report(
     else:
         fg_probs = probs_hr[:, :n_guide]
 
-    phys_res, _ = compute_physical_residual(fg_probs, guide_lr)
+    phys_res, _ = compute_physical_residual(
+        fg_probs, guide_lr, downsampler=downsampler, aligner=aligner
+    )
 
     if epistemic_var is None:
         epi = torch.zeros_like(entropy)
@@ -276,6 +305,7 @@ def build_uncertainty_report(
         physical_residual=phys_res,
         combined_uncertainty=combined,
         unresolved_mask=unresolved,
+        diagnostics=dict(diagnostics) if diagnostics is not None else {},
     )
 
 
