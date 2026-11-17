@@ -125,7 +125,7 @@ def save_uncertainty_report(
             raise ImportError(
                 "Zarr export requires optional I/O extras: `pip install x-fuse[io]`."
             ) from exc
-        root = zarr.open_group(str(out_path), mode="w")
+        root: Any = zarr.open_group(str(out_path), mode="w")
         for k_name, arr in arrays.items():
             if hasattr(root, "create_array"):
                 root.create_array(k_name, data=arr)
@@ -230,9 +230,9 @@ def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
     if suffix == ".zarr":
         import zarr  # type: ignore[import-not-found]
 
-        root = zarr.open_group(str(in_path), mode="r")
-        out = {k: np.asarray(root[k]) for k in root.keys()}
-        out["metadata"] = json.loads(str(root.attrs.get("metadata_json", "{}")))
+        root_in: Any = zarr.open_group(str(in_path), mode="r")
+        out = {k: np.asarray(root_in[k]) for k in root_in.keys()}
+        out["metadata"] = json.loads(str(root_in.attrs.get("metadata_json", "{}")))
         return out
 
     if lower_name.endswith((".ome.tif", ".ome.tiff", ".tif", ".tiff")):
