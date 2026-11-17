@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2023 authors
+Copyright (c) 2025-2026 Calum Green and BASE Laboratory
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+Third-Party Attributions (MIT Licensed):
+- Portions of `x_fuse/transforms.py` and `x_fuse/vit_patch.py` are adapted from
+  HR-Dv2 (https://github.com/tldr-group/HR-Dv2, Copyright (c) 2023 TLDR Group).
+- Portions of `x_fuse/alibi.py` are adapted from dino-saw
+  (https://github.com/tldr-group/dino-saw) and Denoising-ViT
+  (https://github.com/Jiawei-Yang/Denoising-ViT).
+- Joint Bilateral Upsampling concepts in `x_fuse/upsamplers.py` and `TorchPCA`
+  are adapted from FeatUp (https://github.com/mhamilton723/FeatUp,
+  Copyright (c) Mark Hamilton).

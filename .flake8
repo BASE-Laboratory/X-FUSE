@@ -1,4 +1,4 @@
 [flake8]
 max-line-length = 88
-extend-exclude = FeatUp, HR-Dv2, .venv
-extend-ignore = E203
+extend-exclude = .venv, build, dist, data
+extend-ignore = E203, W503

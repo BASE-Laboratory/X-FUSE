@@ -1,13 +1,15 @@
-cache-dir
-*__pycache__*
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+coverage.xml
 *DS_Store*
-
-#CUDA Build Files
-FeatUp/featup.egg-info/*
-FeatUp/adaptive_conv_cpp_impl.cpython-311-x86_64-linux-gnu.so
-FeatUp/adaptive_conv_cuda_impl.cpython-311-x86_64-linux-gnu.so
-
-.claude
-.vscode
-
-docs
+.claude/
+.vscode/
+cache-dir/
+data/downloads/
+benchmarks/outputs/
