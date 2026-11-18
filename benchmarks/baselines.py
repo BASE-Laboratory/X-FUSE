@@ -84,6 +84,119 @@ def _probs_to_report(
 
 
 @torch.no_grad()
+def otsu_threshold_baseline(
+    hr_image: np.ndarray | torch.Tensor,
+    coarse_guide: np.ndarray | torch.Tensor,
+    mode: Literal["multiclass", "multilabel"] = "multiclass",
+    n_bins: int = 128,
+) -> UncertaintyReport:
+    """Multi-Otsu 1D structural intensity thresholding baseline matched to coarse
+    guide channels by spatial overlap (testing how much of a segmentation task can
+    be solved from raw grayscale attenuation/Z-contrast alone).
+    """
+    pan_t = _hr_to_pan_tensor(hr_image, device="cpu")
+    pan = pan_t.numpy()
+    h_hr, w_hr = pan.shape
+
+    g_t = guide_to_tensor(coarse_guide, normalize=True)  # (1, M, H_lr, W_lr)
+    m_ch = int(g_t.shape[1])
+    h_lr, w_lr = int(g_t.shape[2]), int(g_t.shape[3])
+    n_classes = m_ch + 1
+
+    hist, bin_edges = np.histogram(pan.ravel(), bins=n_bins, range=(0.0, 1.0))
+    prob_b = hist.astype(np.float64) / max(float(pan.size), 1.0)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    omega_cum = np.cumsum(prob_b)
+    mu_cum = np.cumsum(prob_b * centers)
+    mu_tot = float(mu_cum[-1])
+
+    if n_classes == 2:
+        denom = omega_cum * (1.0 - omega_cum)
+        numer = (mu_tot * omega_cum - mu_cum) ** 2
+        sigma_b2 = np.where(denom > 1e-12, numer / np.maximum(denom, 1e-12), -1.0)
+        t1 = int(np.argmax(sigma_b2[:-1]))
+        thresholds = [float(bin_edges[t1 + 1])]
+    elif n_classes == 3:
+        best_val = -1.0
+        best_t = (n_bins // 3, (2 * n_bins) // 3)
+        for i in range(1, n_bins - 2):
+            w0 = omega_cum[i]
+            if w0 < 1e-9:
+                continue
+            m0 = mu_cum[i] / w0
+            w1_vec = omega_cum[i + 1 : n_bins - 1] - w0
+            w2_vec = 1.0 - omega_cum[i + 1 : n_bins - 1]
+            valid = (w1_vec > 1e-9) & (w2_vec > 1e-9)
+            if not np.any(valid):
+                continue
+            m1_vec = (mu_cum[i + 1 : n_bins - 1] - mu_cum[i]) / np.maximum(w1_vec, 1e-9)
+            m2_vec = (mu_tot - mu_cum[i + 1 : n_bins - 1]) / np.maximum(w2_vec, 1e-9)
+            sb2 = (
+                w0 * (m0 - mu_tot) ** 2
+                + w1_vec * (m1_vec - mu_tot) ** 2
+                + w2_vec * (m2_vec - mu_tot) ** 2
+            )
+            sb2 = np.where(valid, sb2, -1.0)
+            j_rel = int(np.argmax(sb2))
+            if float(sb2[j_rel]) > best_val:
+                best_val = float(sb2[j_rel])
+                best_t = (i, i + 1 + j_rel)
+        thresholds = [
+            float(bin_edges[best_t[0] + 1]),
+            float(bin_edges[best_t[1] + 1]),
+        ]
+    else:
+        qs = np.linspace(0.0, 1.0, n_classes + 1)[1:-1]
+        thresholds = [float(q) for q in np.quantile(pan, qs)]
+
+    labels_1d = np.digitize(pan, thresholds)  # 0 .. K-1
+    cluster_means = np.array(
+        [
+            float(pan[labels_1d == k].mean())
+            if np.any(labels_1d == k)
+            else (k + 0.5) / n_classes
+            for k in range(n_classes)
+        ],
+        dtype=np.float32,
+    )
+    sigma_i = max(0.08, 0.5 / n_classes)
+    soft_k = np.exp(
+        -0.5 * ((pan[None, :, :] - cluster_means[:, None, None]) / sigma_i) ** 2
+    ).astype(np.float32)
+    soft_k /= np.maximum(soft_k.sum(axis=0, keepdims=True), 1e-6)
+    soft_t = torch.from_numpy(soft_k).unsqueeze(0)  # (1, K, H, W)
+    pooled_k = F.adaptive_avg_pool2d(soft_t, output_size=(h_lr, w_lr))[0]  # (K, h, w)
+
+    # Greedily assign distinct intensity clusters to coarse guide channels by cosine
+    g_flat = g_t[0].reshape(m_ch, -1)
+    p_flat = pooled_k.reshape(n_classes, -1)
+    g_norm = g_flat / g_flat.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    p_norm = p_flat / p_flat.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    sim = (g_norm @ p_norm.T).numpy()  # (M, K)
+
+    used_k: set[int] = set()
+    chosen = []
+    # Match strongest guide channels first so distinct clusters are claimed cleanly
+    order = np.argsort(-sim.max(axis=1))
+    assigned: dict[int, int] = {}
+    for m_idx in order:
+        m = int(m_idx)
+        ranked_k = np.argsort(-sim[m])
+        pick = int(ranked_k[0])
+        for cand in ranked_k:
+            if int(cand) not in used_k:
+                pick = int(cand)
+                break
+        used_k.add(pick)
+        assigned[m] = pick
+
+    for m in range(m_ch):
+        chosen.append(soft_t[:, assigned[m] : assigned[m] + 1])
+    probs_fg = torch.cat(chosen, dim=1)
+    return _probs_to_report(probs_fg, g_t, mode=mode, method_name="otsu_threshold")
+
+
+@torch.no_grad()
 def gram_schmidt_pansharpen_baseline(
     hr_image: np.ndarray | torch.Tensor,
     coarse_guide: np.ndarray | torch.Tensor,

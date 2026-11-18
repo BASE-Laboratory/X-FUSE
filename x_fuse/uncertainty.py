@@ -684,9 +684,12 @@ def match_coarse_priors(
     max_iters: int = 40,
     lr: float = 0.25,
 ) -> torch.Tensor:
-    """Calibrate per-channel logit biases so the spatial mean of HR probabilities
-    matches the measured coarse physical phase fractions ``mean(G_LR)`` without
-    needing HR ground-truth labels.
+    """Shift per-channel logit biases so the spatial mean of HR probabilities
+    matches the spatial mean of the normalized coarse guide ``mean(G_LR)``.
+
+    Note: This performs marginal prior-mean matching rather than ground-truth
+    temperature scaling; for distribution-free finite-sample coverage guarantees,
+    use ``ConformalCalibrator``.
     """
     logits = logits_hr.detach().float().clone()
     if guide_lr.ndim == 2:
@@ -733,6 +736,27 @@ def match_coarse_priors(
         return torch.sigmoid(shifted)
 
 
+def compute_hard_phase_mask(
+    probs: torch.Tensor,
+    mode: Literal["multiclass", "multilabel"],
+    channel_dim: int = 1,
+) -> torch.Tensor:
+    """Convert probabilities to integer phase IDs along ``channel_dim``.
+
+    - ``mode="multiclass"`` (``K >= 2``): ``argmax`` in ``0 .. K-1``.
+    - ``mode="multilabel"`` (``M == 1``): ``0`` (background) or ``1`` (``p >= 0.5``).
+    - ``mode="multilabel"`` (``M >= 2``): ``0`` when all channels ``< 0.5``, else
+      ``1 .. M`` for the dominant active channel ``argmax_m p_m + 1``.
+    """
+    n_ch = int(probs.shape[channel_dim])
+    if mode == "multiclass" and n_ch >= 2:
+        return probs.argmax(dim=channel_dim).long()
+    if n_ch == 1:
+        return (probs.select(channel_dim, 0) >= 0.5).long()
+    max_p, dom_idx = probs.max(dim=channel_dim)
+    return torch.where(max_p >= 0.5, dom_idx + 1, torch.zeros_like(dom_idx)).long()
+
+
 def build_uncertainty_report(
     probs_hr: torch.Tensor,
     guide_lr: torch.Tensor,
@@ -744,6 +768,7 @@ def build_uncertainty_report(
     aligner: DifferentiableGuideAligner | None = None,
     calibrator: ConformalCalibrator | None = None,
     diagnostics: dict[str, Any] | None = None,
+    uncertainty_weights: tuple[float, float, float] = (0.45, 0.25, 0.30),
 ) -> UncertaintyReport:
     """Assemble a complete ``UncertaintyReport`` (including optional Split
     Conformal prediction sets & intervals when ``calibrator`` is provided).
@@ -773,13 +798,10 @@ def build_uncertainty_report(
         p99 = _safe_quantile(epi, 0.99).clamp(min=1e-6)
         epi_norm = (epi / p99).clamp(0.0, 1.0)
 
-    combined = (0.45 * entropy + 0.25 * epi_norm + 0.30 * phys_res).clamp(0.0, 1.0)
+    w_ent, w_epi, w_res = uncertainty_weights
+    combined = (w_ent * entropy + w_epi * epi_norm + w_res * phys_res).clamp(0.0, 1.0)
     unresolved = phys_res > unresolved_residual_cutoff
-
-    if mode == "multiclass" and probs_hr.shape[1] >= 2:
-        hard = probs_hr.argmax(dim=1).long()
-    else:
-        hard = (probs_hr[:, 0] >= 0.5).long()
+    hard = compute_hard_phase_mask(probs_hr, mode=mode)
 
     if abstain_threshold is not None:
         hard = torch.where(
@@ -935,7 +957,9 @@ def sparsification_curve(
             ious.append(inter / union if union > 0 else 1.0)
         retained_iou[idx] = float(np.mean(ious))
 
-    ause = float(np.trapezoid(np.maximum(model_err - oracle_err, 0.0), fractions))
+    trapz_fn = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    assert trapz_fn is not None
+    ause = float(trapz_fn(np.maximum(model_err - oracle_err, 0.0), fractions))
     return {
         "abstain_fractions": fractions,
         "retained_accuracy": retained_acc,

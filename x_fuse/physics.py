@@ -262,7 +262,7 @@ class PhysicsForwardModel(nn.Module):
         n_channels: int = 1,
         loss_fn: LossOptions = "bce",
         learn_psf: bool = False,
-        psf_sigma_ratio: float = 0.35,
+        psf_sigma_ratio: float = 0.5,
         spectral_channels: int | None = None,
         simplex_include_background: bool | None = None,
     ) -> None:

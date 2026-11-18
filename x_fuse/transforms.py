@@ -159,12 +159,14 @@ def normalize_structural(
     clip_percentiles: tuple[float, float] | None = None,
     imagenet_norm: bool = True,
     device: str | torch.device = "cpu",
+    value_range: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """Convert any 2D grayscale or 3-channel scientific image into a ViT-ready
     ``(3, H, W)`` float32 tensor without 8-bit quantization loss.
 
-    Supports arbitrary dynamic ranges (e.g., 32-bit float XCT/neutron reconstructions,
-    16-bit BSE-SEM / HAADF-STEM micrographs, or 2.5D 3-slice ``(3, H, W)`` slabs).
+    When ``value_range=(vmin, vmax)`` is supplied (e.g. global 3D tomogram bounds),
+    intensities are linearly mapped from ``[vmin, vmax]`` to ``[0, 1]`` without
+    per-slice min-max contrast re-stretching.
     """
     if isinstance(img, torch.Tensor):
         arr = img.detach().cpu().float().numpy()
@@ -174,9 +176,10 @@ def normalize_structural(
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=0)
     elif arr.ndim == 3:
-        if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
-            if arr.shape[0] == 1:
-                arr = np.repeat(arr, 3, axis=0)
+        if arr.shape[0] == 3:
+            pass
+        elif arr.shape[0] == 1 and arr.shape[-1] != 3:
+            arr = np.repeat(arr, 3, axis=0)
         elif arr.shape[-1] in (1, 3):
             arr = np.transpose(arr, (2, 0, 1))
             if arr.shape[0] == 1:
@@ -198,18 +201,29 @@ def normalize_structural(
             stacklevel=2,
         )
         finite_vals = arr[np.isfinite(arr)]
-        fill_val = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
+        fill_val = (
+            float(np.median(finite_vals))
+            if finite_vals.size > 0
+            else (float(value_range[0]) if value_range is not None else 0.0)
+        )
         arr = np.nan_to_num(arr, nan=fill_val, posinf=fill_val, neginf=fill_val)
 
-    if clip_percentiles is not None:
-        lo, hi = np.percentile(arr, clip_percentiles)
-        arr = np.clip(arr, lo, hi)
-
-    mn, mx = float(np.min(arr)), float(np.max(arr))
-    if mx - mn > 1e-12:
-        arr = (arr - mn) / (mx - mn)
+    if value_range is not None:
+        v_lo, v_hi = float(value_range[0]), float(value_range[1])
+        if v_hi - v_lo > 1e-12:
+            arr = np.clip((arr - v_lo) / (v_hi - v_lo), 0.0, 1.0)
+        else:
+            arr = np.zeros_like(arr, dtype=np.float32)
     else:
-        arr = np.zeros_like(arr, dtype=np.float32)
+        if clip_percentiles is not None:
+            lo, hi = np.percentile(arr, clip_percentiles)
+            arr = np.clip(arr, lo, hi)
+
+        mn, mx = float(np.min(arr)), float(np.max(arr))
+        if mx - mn > 1e-12:
+            arr = (arr - mn) / (mx - mn)
+        else:
+            arr = np.zeros_like(arr, dtype=np.float32)
 
     t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
     if imagenet_norm:

@@ -6,6 +6,7 @@ notebook, and security edge cases uncovered during the v1.0 Red Team audit.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
@@ -19,6 +20,7 @@ import matplotlib
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from benchmarks.baselines import (
     cnmf_pansharpen_baseline,
@@ -194,6 +196,7 @@ def test_p0_stateful_spectral_unmix_and_unguided_transfer_isolation():
     """Verify fit(hr1, cube1) -> predict(hr2, cube2) projects cube2 rather than
     reusing cube1's cached abundances, and predict(hr2) runs unguided transfer.
     """
+    torch.manual_seed(42)
     ph1 = generate_spectral_cube_phantom_2d(
         size=48, downsample_factor=4, n_spectral_bins=8, mean_counts=80.0, seed=10
     )
@@ -203,17 +206,19 @@ def test_p0_stateful_spectral_unmix_and_unguided_transfer_isolation():
 
     model = XFuse(
         backbone=FAST_VIT,
+        fusion_method="attention",
         stride=8,
         loss_fn="forward_psf_poisson",
         spectral_channels=8,
         guide_channels=2,
         align_guide="translation",
+        lr=1e-2,
         pretrained=False,
     )
     model.fit(
         ph1.hr_image,
         ph1.spectral_cube_lr,
-        epochs=4,
+        epochs=10,
         tta_shifts=(),
         tta_flips=False,
         spectral_unmix=True,
@@ -668,3 +673,349 @@ def test_tutorial_notebooks_execute_cleanly(notebook_name: str):
                 )
                 exec(compile(code, f"{notebook_name}", "exec"), ns)
     plt.close("all")
+
+
+# ── 9. External Peer-Review Regression Suite (Pass 2) ────────────────────────
+
+
+def test_volumetric_global_contrast_preserved_and_attention_gating_3d_supported():
+    """Verify VolumetricFuser preserves global 3D intensity scaling across slices
+    (identical physical value 0.5 maps to identical normalized tensor values in
+    bright and dark slices) and supports 'attention' and 'gating' heads in 3D.
+    """
+    vol = np.zeros((6, 32, 32), dtype=np.float32)
+    vol[0] = 0.0
+    vol[5] = 1.0
+    vol[1] = 0.15
+    vol[1, 8, 8] = 0.50
+    vol[4] = 0.85
+    vol[4, 8, 8] = 0.50
+
+    base = XFuse(backbone=FAST_VIT, stride=8, guide_channels=2, pretrained=False)
+    vf = VolumetricFuser(base, tta_shifts=(), tta_flips=False)
+    acc = VolumeSliceAccessor(vol)
+    vmin, vmax = acc.estimate_robust_range(percentiles=(0.0, 100.0))
+    dev = torch.device("cpu")
+
+    t_slice1, _ = vf._prepare_slab_tensor(
+        acc, index=1, axis=0, delta=0, vmin=vmin, vmax=vmax, device=dev
+    )
+    t_slice4, _ = vf._prepare_slab_tensor(
+        acc, index=4, axis=0, delta=0, vmin=vmin, vmax=vmax, device=dev
+    )
+    assert torch.allclose(t_slice1[:, 8, 8], t_slice4[:, 8, 8], atol=1e-6), (
+        f"Per-slice contrast re-stretching distorted 0.5: "
+        f"{t_slice1[:, 8, 8]} vs {t_slice4[:, 8, 8]}"
+    )
+
+    # VolumetricFuser must work cleanly with 'attention' and 'gating' heads
+    rng = np.random.default_rng(11)
+    sparse_g = {
+        1: rng.random((2, 8, 8), dtype=np.float32),
+        4: rng.random((2, 8, 8), dtype=np.float32),
+    }
+    for method in ("attention", "gating"):
+        m3 = XFuse(
+            backbone=FAST_VIT,
+            fusion_method=method,
+            stride=8,
+            guide_channels=2,
+            pretrained=False,
+        )
+        vf_m = VolumetricFuser(m3, tta_shifts=(), tta_flips=False)
+        if method == "attention":
+            vf_m.fit_sparse_slices(vol, sparse_guides=sparse_g, epochs=2, delta=1)
+        rep3 = vf_m.predict_volume(
+            vol, mode="2.5d_slab", sparse_guides=sparse_g, pred_mode="multiclass"
+        )
+        assert rep3.probabilities.shape == (3, 6, 32, 32)
+        assert torch.isfinite(rep3.probabilities).all()
+
+
+def test_asymmetric_padding_with_tta_flips_has_zero_pad_shift_on_attention_and_gating():
+    """Verify odd (53, 61) HR input (which pads +11 bottom, +3 right to 64x64)
+    does not shift flipped TTA views by the pad width in 'attention' or 'gating'.
+    """
+    hr = np.zeros((53, 61), dtype=np.float32)
+    hr[:, 48:] = 1.0  # Sharp step strictly at x >= 48 (right edge)
+    guide = np.zeros((1, 13, 15), dtype=np.float32)
+    guide[0, :, 12:] = 1.0  # Coarse guide localized on right edge
+
+    for method in ("gating", "attention"):
+        torch.manual_seed(123)
+        m_noflip = XFuse(
+            backbone=FAST_VIT,
+            fusion_method=method,
+            stride=8,
+            pretrained=False,
+        )
+        if method == "attention":
+            m_noflip.fit(hr, guide, epochs=4, tta_shifts=(), tta_flips=False, tol=0.0)
+        else:
+            m_noflip.fit(hr, guide, tta_shifts=(), tta_flips=False)
+        p_noflip = m_noflip.predict(hr, guide, mode="multilabel").probabilities[0, 0]
+
+        torch.manual_seed(123)
+        m_flip = XFuse(
+            backbone=FAST_VIT,
+            fusion_method=method,
+            stride=8,
+            pretrained=False,
+        )
+        if method == "attention":
+            m_flip.fit(hr, guide, epochs=4, tta_shifts=(1,), tta_flips=True, tol=0.0)
+        else:
+            m_flip.fit(hr, guide, tta_shifts=(1,), tta_flips=True)
+        p_flip = m_flip.predict(hr, guide, mode="multilabel").probabilities[0, 0]
+
+        # Right-edge mean probability must remain higher than interior left-of-step band
+        assert float(p_flip[:, 50:].mean()) > float(p_flip[:, 35:45].mean()), (
+            f"Flipped TTA pad-offset corrupted right edge for {method}"
+        )
+        assert float(p_noflip[:, 50:].mean()) > float(p_noflip[:, 35:45].mean())
+
+
+def test_repeated_fit_resets_trainable_head_weights_by_default():
+    """Verify calling model.fit() a second time resets trainable head weights by
+    default (reset_weights=True), while reset_weights=False warm-starts.
+    """
+    rng = np.random.default_rng(21)
+    hr = rng.random((48, 48), dtype=np.float32)
+    g1 = rng.random((2, 12, 12), dtype=np.float32)
+    g2 = 1.0 - g1
+
+    model = XFuse(
+        backbone=FAST_VIT,
+        fusion_method="learned_gating",
+        stride=8,
+        pretrained=False,
+    )
+    torch.manual_seed(555)
+    losses_fresh = model.fit(hr, g2, epochs=4, tta_shifts=(), tta_flips=False, tol=0.0)
+    assert model.learned_gating is not None
+    w_fresh = model.learned_gating.pred_head.weight.detach().clone()
+
+    # Contaminate weights on g1, verify reset_weights=False warm-starts, then reset
+    model.fit(hr, g1, epochs=6, tta_shifts=(), tta_flips=False, tol=0.0)
+    torch.manual_seed(555)
+    model.fit(
+        hr, g2, epochs=4, tta_shifts=(), tta_flips=False, tol=0.0, reset_weights=False
+    )
+    w_warm = model.learned_gating.pred_head.weight.detach().clone()
+    assert not torch.allclose(w_fresh, w_warm, atol=1e-4)
+
+    torch.manual_seed(555)
+    losses_reset = model.fit(
+        hr, g2, epochs=4, tta_shifts=(), tta_flips=False, tol=0.0, reset_weights=True
+    )
+    w_reset = model.learned_gating.pred_head.weight.detach().clone()
+    assert torch.allclose(w_fresh, w_reset, atol=1e-6)
+    assert np.allclose(losses_fresh, losses_reset, atol=1e-6)
+
+
+def test_multichannel_multilabel_hard_mask_and_default_psf_sigma_ratio():
+    """Verify multilabel hard_mask inspects all M channels (returning 0 when all <0.5
+    and 1..M for the dominant active channel) and default PSF sigma ratio is 0.5.
+    """
+    from x_fuse.physics import PhysicsForwardModel
+    from x_fuse.uncertainty import build_uncertainty_report, compute_hard_phase_mask
+    from x_fuse.upsamplers import ForwardPSFDownsampler
+
+    assert np.isclose(ForwardPSFDownsampler().psf_sigma_ratio, 0.5)
+    assert np.isclose(PhysicsForwardModel().psf_downsampler.psf_sigma_ratio, 0.5)
+
+    probs_2d = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+    probs_2d[0, :, 0, :] = torch.tensor([0.1, 0.2, 0.3]).view(3, 1)  # none >= 0.5 -> 0
+    probs_2d[0, :, 1, :] = torch.tensor([0.8, 0.2, 0.1]).view(3, 1)  # ch 0 -> 1
+    probs_2d[0, :, 2, :] = torch.tensor([0.1, 0.85, 0.2]).view(3, 1)  # ch 1 -> 2
+    probs_2d[0, :, 3, :] = torch.tensor([0.6, 0.2, 0.92]).view(3, 1)  # ch 2 -> 3
+
+    hm = compute_hard_phase_mask(probs_2d, mode="multilabel", channel_dim=1)
+    assert hm[0, 0].tolist() == [0, 0, 0, 0]
+    assert hm[0, 1].tolist() == [1, 1, 1, 1]
+    assert hm[0, 2].tolist() == [2, 2, 2, 2]
+    assert hm[0, 3].tolist() == [3, 3, 3, 3]
+
+    rep = build_uncertainty_report(
+        probs_hr=probs_2d,
+        guide_lr=torch.full((1, 3, 2, 2), 0.5),
+        mode="multilabel",
+    )
+    assert torch.equal(rep.hard_mask, hm)
+
+
+def test_dinov2_vits14_offline_timm_backbone_and_vit_patch_dv2_helpers():
+    """Verify backbone='dinov2_vits14' runs 100% offline with pretrained=False via
+    timm, and cover Patch._add_new_forward_features_dv2 / _fix_block_forward_dv2.
+    """
+    from types import MethodType
+
+    from x_fuse.vit_patch import Patch
+
+    rng = np.random.default_rng(31)
+    hr = rng.random((42, 42), dtype=np.float32)
+    guide = rng.random((2, 6, 6), dtype=np.float32)
+
+    m_dv2 = XFuse(
+        backbone="dinov2_vits14",
+        stride=7,
+        pretrained=False,
+        fusion_method="learned_gating",
+    )
+    rep = m_dv2.fit_predict(hr, guide, epochs=2, tta_shifts=(), tta_flips=False)
+    assert rep.probabilities.shape == (1, 3, 42, 42)
+    assert torch.isfinite(rep.probabilities).all()
+
+    # Unit-test Patch._fix_block_forward_dv2 and Patch._add_new_forward_features_dv2
+    class _MockAttn(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.num_heads = 2
+
+        def forward(self, x: torch.Tensor, attn_choice: str = "none") -> torch.Tensor:
+            if attn_choice != "none":
+                b, n, _ = x.shape
+                attn = torch.full((b, n, self.num_heads), 1.0 / n, device=x.device)
+                return torch.cat([x, attn], dim=-1)
+            return x
+
+    class _MockBlock(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.norm1 = nn.LayerNorm(16)
+            self.attn = _MockAttn()
+            self.ls1 = nn.Identity()
+            self.drop_path1 = nn.Identity()
+            self.norm2 = nn.LayerNorm(16)
+            self.mlp = nn.Linear(16, 16)
+            self.ls2 = nn.Identity()
+            self.drop_path2 = nn.Identity()
+            self.sample_drop_ratio = 0.0
+
+        def forward(self, x: torch.Tensor, attn_choice: str = "none") -> torch.Tensor:
+            return x
+
+    class _MockDinoV2(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.num_heads = 2
+            self.num_register_tokens = 2
+            self.blocks = nn.ModuleList([_MockBlock(), _MockBlock()])
+            self.norm = nn.LayerNorm(16)
+
+        def prepare_tokens_with_masks(self, x: torch.Tensor, masks=None):
+            # 1 CLS + 2 register + 9 patch tokens = 12 tokens
+            return torch.randn(x.shape[0], 12, 16, device=x.device)
+
+    mock_dv2 = _MockDinoV2()
+    mock_dv2.eval()
+    mock_dv2.blocks[-1].forward = MethodType(  # type: ignore[method-assign]
+        Patch._fix_block_forward_dv2(), mock_dv2.blocks[-1]
+    )
+    mock_dv2.forward_feats_attn = MethodType(  # type: ignore[attr-defined]
+        Patch._add_new_forward_features_dv2(), mock_dv2
+    )
+    out = mock_dv2.forward_feats_attn(torch.zeros(1, 3, 28, 28), None, "cls")  # type: ignore[operator]
+    assert out["x_norm_patchtokens"].shape == (1, 9, 16)
+    assert out["x_norm_regtokens"].shape == (1, 2, 16)
+    assert out["x_patchattn"].shape == (1, 9, 2)
+    out_no_attn = mock_dv2.forward_feats_attn(torch.zeros(1, 3, 28, 28), None, "none")  # type: ignore[operator]
+    assert "x_patchattn" not in out_no_attn
+    assert out_no_attn["x_norm_patchtokens"].shape == (1, 9, 16)
+
+
+def test_zenodo_imat_doi_4273969_and_wheel_mode_user_cache_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Verify ISIS IMAT Bragg-Edge Zenodo ID is 4273969 and wheel/XFUSE_DATA_DIR
+    routes sample lookups & downloads to user cache instead of site-packages.
+    """
+    from x_fuse.datasets import (
+        OPEN_DATASETS,
+        fetch_open_dataset,
+        get_sample_dataset_path,
+    )
+
+    imat = OPEN_DATASETS["isis_imat_bragg_edge"]
+    assert imat.zenodo_record_id == "4273969"
+    assert imat.doi == "10.5281/zenodo.4273969"
+
+    # Simulate custom user data dir via XFUSE_DATA_DIR
+    user_cache = tmp_path / "xfuse_user_cache"
+    sample_dir = user_cache / "samples" / "CustomWheelSample"
+    sample_dir.mkdir(parents=True)
+    monkeypatch.setenv("XFUSE_DATA_DIR", str(user_cache))
+    assert get_sample_dataset_path("CustomWheelSample") == sample_dir.resolve()
+
+    payload = b"imat_test_bytes"
+    md5_hex = hashlib.md5(payload).hexdigest()
+    record_bytes = json.dumps(
+        {
+            "files": [
+                {
+                    "key": "rod.tif",
+                    "checksum": f"md5:{md5_hex}",
+                    "links": {
+                        "self": "https://zenodo.org/api/records/4273969/files/rod.tif"
+                    },
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    class _Resp:
+        def __init__(self, data: bytes) -> None:
+            self._buf = io.BytesIO(data)
+
+        def read(self, n: int = -1) -> bytes:
+            return self._buf.read(n)
+
+        def __enter__(self) -> _Resp:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def _fake_urlopen(url: str, timeout: float = 30.0) -> _Resp:
+        return _Resp(payload if url.endswith("rod.tif") else record_bytes)
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+        paths = fetch_open_dataset("isis_imat_bragg_edge", dest_root=None)
+    assert len(paths) == 1
+    assert paths[0].is_relative_to(user_cache.resolve())
+
+
+def test_otsu_threshold_baseline_solves_intensity_phantom_and_fails_isointensity():
+    """Verify otsu_threshold_baseline recovers intensity-separable phases cleanly
+    while failing on textured iso-intensity phases.
+    """
+    from benchmarks.baselines import otsu_threshold_baseline
+    from x_fuse import (
+        compute_segmentation_metrics,
+        generate_correlative_phantom_2d,
+        generate_textured_isointensity_phantom_2d,
+    )
+
+    ph_easy = generate_correlative_phantom_2d(
+        size=64, downsample_factor=4, phase_b_contrast=0.50, hr_noise_std=0.01, seed=42
+    )
+    rep_easy = otsu_threshold_baseline(
+        ph_easy.hr_image, ph_easy.coarse_guide, mode="multiclass"
+    )
+    iou_easy = compute_segmentation_metrics(rep_easy.hard_mask[0], ph_easy.gt_labels)[
+        "iou"
+    ]
+    assert iou_easy > 0.65, f"Expected multi-Otsu to solve easy phantom, got {iou_easy}"
+
+    ph_tex = generate_textured_isointensity_phantom_2d(
+        size=64, downsample_factor=8, seed=55
+    )
+    rep_tex = otsu_threshold_baseline(
+        ph_tex.hr_image, ph_tex.coarse_guide, mode="multiclass"
+    )
+    iou_tex = compute_segmentation_metrics(rep_tex.hard_mask[0], ph_tex.gt_labels)[
+        "iou"
+    ]
+    assert iou_tex < 0.50, (
+        f"Iso-intensity textured phantom should defeat intensity Otsu, got {iou_tex}"
+    )

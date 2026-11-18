@@ -24,6 +24,7 @@ from .transforms import (
 from .uncertainty import (
     WelfordAccumulator,
     _safe_quantile,
+    compute_hard_phase_mask,
     compute_posterior_uncertainty,
     match_coarse_priors,
 )
@@ -367,6 +368,7 @@ class VolumetricFuser:
             include_flips=tta_flips,
         )
         self._global_prior: torch.Tensor | None = None
+        self._sparse_guides_norm: dict[int, torch.Tensor] = {}
 
     def _can_tile_head(self) -> bool:
         return self.fuser.xrd_fuse_method in ("learned_gating", "spatial_mlp")
@@ -383,12 +385,12 @@ class VolumetricFuser:
     ) -> tuple[torch.Tensor, tuple[int, int]]:
         slab = pack_25d_slice(accessor, index=index, axis=axis, delta=delta)
         slab_clean = np.nan_to_num(slab, nan=vmin, posinf=vmax, neginf=vmin)
-        slab_clipped = np.clip(slab_clean, vmin, vmax)
-        if vmax - vmin > 1e-8:
-            slab_01 = (slab_clipped - vmin) / (vmax - vmin)
-        else:
-            slab_01 = np.zeros_like(slab_clipped)
-        t = normalize_structural(slab_01, imagenet_norm=True, device=device)
+        t = normalize_structural(
+            slab_clean,
+            imagenet_norm=True,
+            device=device,
+            value_range=(vmin, vmax),
+        )
         if (
             self.fuser.tile_size is not None
             and max(t.shape[-2], t.shape[-1]) > self.fuser.tile_size
@@ -407,23 +409,23 @@ class VolumetricFuser:
         epochs: int = 12,
         delta: int = 1,
         axis: int = 0,
+        reset_weights: bool = True,
     ) -> list[float]:
         """Train the ``CorrelativeFuser`` head on sparse 2D guided slices
         ``{slice_idx: guide_map}`` using 2.5D ``(z - delta, z, z + delta)`` slabs."""
         if not sparse_guides:
             raise ValueError("sparse_guides must contain at least one guided slice.")
+        if reset_weights:
+            self.fuser.reset_trainable_weights()
 
         accessor = VolumeSliceAccessor(hr_volume)
         vmin, vmax = accessor.estimate_robust_range()
         dev = next(self.fuser.dinov2.parameters()).device
         is_spectral = self.fuser.spectral_channels is not None
-        norm_spec: Any = getattr(
-            self.fuser,
-            "_default_guide_norm",
-            "preserve_counts" if self.fuser.loss_fn == "forward_psf_poisson" else True,
-        )
+        norm_mode = self.fuser._default_guide_norm(None)
 
         prepared_guides: dict[int, torch.Tensor] = {}
+        sparse_norm_cpu: dict[int, torch.Tensor] = {}
         prepared_slabs: dict[int, torch.Tensor] = {}
         orig_hws: dict[int, tuple[int, int]] = {}
         cal_masks: dict[int, torch.Tensor | None] = {}
@@ -431,7 +433,7 @@ class VolumetricFuser:
         prior_accum = []
         for idx, g_raw in sparse_guides.items():
             s_i = int(idx)
-            g_t = guide_to_tensor(g_raw, device=dev, normalize=norm_spec)
+            g_t = guide_to_tensor(g_raw, device=dev, normalization=norm_mode)
             prepared_guides[s_i] = g_t
             slab_t, orig_hw = self._prepare_slab_tensor(
                 accessor, s_i, axis=axis, delta=delta, vmin=vmin, vmax=vmax, device=dev
@@ -450,8 +452,10 @@ class VolumetricFuser:
                 train_masks[s_i] = None
             if not is_spectral:
                 g_unit = guide_to_tensor(g_raw, device=dev, normalize=True)
+                sparse_norm_cpu[s_i] = g_unit.detach().cpu()
                 prior_accum.append(g_unit.mean(dim=(-2, -1)))
 
+        self._sparse_guides_norm = sparse_norm_cpu
         if prior_accum:
             self._global_prior = torch.stack(prior_accum, dim=0).mean(dim=0)
         # Ensure all sparse slices fit in the TTA feature cache across epochs
@@ -510,6 +514,47 @@ class VolumetricFuser:
             )
         return epoch_losses
 
+    @staticmethod
+    def _resolve_slice_guide_2d(
+        idx: int,
+        depth: int,
+        axis: int,
+        coarse_guide_3d_norm: torch.Tensor | None,
+        sparse_guides_norm: dict[int, torch.Tensor] | None,
+        fallback_guide: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if coarse_guide_3d_norm is not None:
+            if axis == 0:
+                d_lr = int(coarse_guide_3d_norm.shape[1])
+                i_lr = min(d_lr - 1, round(idx * (d_lr - 1) / max(depth - 1, 1)))
+                return coarse_guide_3d_norm[:, i_lr, :, :].unsqueeze(0).to(device)
+            if axis == 1:
+                d_lr = int(coarse_guide_3d_norm.shape[2])
+                i_lr = min(d_lr - 1, round(idx * (d_lr - 1) / max(depth - 1, 1)))
+                return coarse_guide_3d_norm[:, :, i_lr, :].unsqueeze(0).to(device)
+            d_lr = int(coarse_guide_3d_norm.shape[3])
+            i_lr = min(d_lr - 1, round(idx * (d_lr - 1) / max(depth - 1, 1)))
+            return coarse_guide_3d_norm[:, :, :, i_lr].unsqueeze(0).to(device)
+
+        if axis == 0 and sparse_guides_norm:
+            zs = sorted(sparse_guides_norm.keys())
+            if idx <= zs[0]:
+                return sparse_guides_norm[zs[0]].to(device)
+            if idx >= zs[-1]:
+                return sparse_guides_norm[zs[-1]].to(device)
+            for k in range(len(zs) - 1):
+                z0, z1 = zs[k], zs[k + 1]
+                if z0 <= idx <= z1:
+                    if idx == z0 or z1 == z0:
+                        return sparse_guides_norm[z0].to(device)
+                    w = float(idx - z0) / float(z1 - z0)
+                    g0, g1 = sparse_guides_norm[z0], sparse_guides_norm[z1]
+                    if g0.shape == g1.shape:
+                        return ((1.0 - w) * g0 + w * g1).to(device)
+                    return (g0 if w < 0.5 else g1).to(device)
+        return fallback_guide
+
     def _predict_single_plane_stack(
         self,
         accessor: VolumeSliceAccessor,
@@ -518,12 +563,15 @@ class VolumetricFuser:
         vmin: float,
         vmax: float,
         device: torch.device,
+        coarse_guide_3d_norm: torch.Tensor | None = None,
+        sparse_guides_norm: dict[int, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run slice-by-slice 2.5D logit inference along ``axis``, returning
         ``(mean_logits_zyx, tta_prob_var_zyx)`` transposed back to ``(M, Z, Y, X)``."""
         depth = accessor.shape[axis]
         n_guides = self.fuser.guide_channels
         z_dim, y_dim, x_dim = accessor.shape
+        needs_spatial_guide = self.fuser.xrd_fuse_method in ("attention", "gating")
 
         plane_logits = []
         plane_vars = []
@@ -541,6 +589,18 @@ class VolumetricFuser:
         )
 
         for idx in range(depth):
+            slice_guide = self._resolve_slice_guide_2d(
+                idx=idx,
+                depth=depth,
+                axis=axis,
+                coarse_guide_3d_norm=coarse_guide_3d_norm,
+                sparse_guides_norm=sparse_guides_norm,
+                fallback_guide=dummy_guide,
+                device=device,
+            )
+            if needs_spatial_guide:
+                self.fuser._bind_guide_only(slice_guide)
+
             slab_t, (orig_h, orig_w) = self._prepare_slab_tensor(
                 accessor,
                 idx,
@@ -557,10 +617,10 @@ class VolumetricFuser:
             ):
                 from .tiling import run_tiled_2d
 
-                def _tile_fn(tile_chw: torch.Tensor) -> torch.Tensor:
-                    ml, vp = self.fuser._predict_logits_and_var_tile(
-                        tile_chw, dummy_guide
-                    )
+                def _tile_fn(
+                    tile_chw: torch.Tensor, _sg: torch.Tensor = slice_guide
+                ) -> torch.Tensor:
+                    ml, vp = self.fuser._predict_logits_and_var_tile(tile_chw, _sg)
                     return torch.cat([ml, vp], dim=1)
 
                 packed = run_tiled_2d(
@@ -574,8 +634,14 @@ class VolumetricFuser:
                 m_l = packed[:, :n_guides, :orig_h, :orig_w]
                 v_p = packed[:, n_guides:, :orig_h, :orig_w]
             else:
+                valid_hw = (
+                    (orig_h, orig_w)
+                    if (orig_h, orig_w)
+                    != (int(slab_t.shape[-2]), int(slab_t.shape[-1]))
+                    else None
+                )
                 m_l_pad, v_p_pad = self.fuser._predict_logits_and_var_tile(
-                    slab_t, dummy_guide
+                    slab_t, slice_guide, valid_hr_hw=valid_hw
                 )
                 m_l = m_l_pad[:, :, :orig_h, :orig_w]
                 v_p = v_p_pad[:, :, :orig_h, :orig_w]
@@ -631,6 +697,30 @@ class VolumetricFuser:
 
         eff_delta = 0 if mode == "2d" else max(1, delta)
         axes = (0, 1, 2) if mode == "triplane" else (0,)
+        if (
+            mode == "triplane"
+            and accessor._kind == "dir"
+            and (z_dim * y_dim * x_dim) <= 128 * 1024 * 1024
+        ):
+            # Read 2D slice directory once rather than (1 + Y + X) * Z times
+            vol_cached = np.stack(
+                [accessor.get_plane(0, z_i) for z_i in range(z_dim)], axis=0
+            )
+            accessor = VolumeSliceAccessor(vol_cached)
+
+        g3_norm: torch.Tensor | None = (
+            self._normalize_guide_3d(coarse_guide_3d)
+            if coarse_guide_3d is not None
+            else None
+        )
+        sparse_norm_map: dict[int, torch.Tensor] | None = (
+            {
+                int(k): guide_to_tensor(v, device="cpu", normalize=True)
+                for k, v in sparse_guides.items()
+            }
+            if sparse_guides
+            else (self._sparse_guides_norm or None)
+        )
 
         plane_welford = WelfordAccumulator()
         tta_var_accum = torch.zeros(
@@ -640,7 +730,14 @@ class VolumetricFuser:
 
         for ax in axes:
             l_zyx, v_zyx = self._predict_single_plane_stack(
-                accessor, axis=ax, delta=eff_delta, vmin=vmin, vmax=vmax, device=dev
+                accessor,
+                axis=ax,
+                delta=eff_delta,
+                vmin=vmin,
+                vmax=vmax,
+                device=dev,
+                coarse_guide_3d_norm=g3_norm,
+                sparse_guides_norm=sparse_norm_map,
             )
             mean_logits_sum += l_zyx
             tta_var_accum += v_zyx
@@ -653,9 +750,7 @@ class VolumetricFuser:
 
         n_guides = mean_logits.shape[0]
         flat_logits = mean_logits.reshape(1, n_guides, z_dim, y_dim * x_dim)
-        g3_norm: torch.Tensor | None = None
-        if coarse_guide_3d is not None:
-            g3_norm = self._normalize_guide_3d(coarse_guide_3d)
+        if g3_norm is not None:
             prior_ref: torch.Tensor | None = g3_norm.reshape(1, g3_norm.shape[0], -1, 1)
         elif sparse_guides:
             means = [
@@ -759,14 +854,14 @@ class VolumetricFuser:
 
         p99 = _safe_quantile(epi_var, 0.99).clamp(min=1e-6)
         epi_norm = (epi_var / p99).clamp(0.0, 1.0)
-        combined_3d = (0.45 * entropy_3d + 0.30 * epi_norm + 0.25 * phys_res_3d).clamp(
-            0.0, 1.0
-        )
+        has_guide_3d = (g3_norm is not None) or bool(sparse_guides)
+        combined_3d = (
+            (0.45 * entropy_3d + 0.25 * epi_norm + 0.30 * phys_res_3d)
+            if has_guide_3d
+            else (0.65 * entropy_3d + 0.35 * epi_norm)
+        ).clamp(0.0, 1.0)
 
-        if pred_mode == "multiclass" and probs_3d.shape[0] >= 2:
-            hard_3d = probs_3d.argmax(dim=0).long()
-        else:
-            hard_3d = (probs_3d[0] >= 0.5).long()
+        hard_3d = compute_hard_phase_mask(probs_3d, mode=pred_mode, channel_dim=0)
 
         pred_sets_3d: torch.Tensor | None = None
         conf_hw_3d: torch.Tensor | None = None

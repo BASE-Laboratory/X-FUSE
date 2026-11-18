@@ -56,7 +56,7 @@ class ForwardPSFDownsampler(nn.Module):
 
     def __init__(
         self,
-        psf_sigma_ratio: float = 0.35,
+        psf_sigma_ratio: float = 0.5,
         learnable: bool = False,
         n_channels: int = 1,
     ):

@@ -4,6 +4,7 @@ experimental hold-out downsampling utilities for quantitative benchmarking.
 
 import hashlib
 import json
+import os
 import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -61,7 +62,7 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
         doi="10.5281/zenodo.21770333",
         description=(
             "Nanoscale HAADF-STEM structural micrographs paired with Ti, Mo, Ta, "
-            "Cr, and Al STEM-EDS elemental TIFF maps (Radi et al., 2026)."
+            "Cr, and Al STEM-EDS elemental TIFF maps."
         ),
     ),
     "cuzn_stem_eels": OpenCorrelativeDataset(
@@ -78,16 +79,16 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
     ),
     "isis_imat_bragg_edge": OpenCorrelativeDataset(
         key="isis_imat_bragg_edge",
-        title="ISIS IMAT Multi-Metal Powder Phantom ToF Neutron Bragg-Edge CT",
+        title="ISIS IMAT Multi-Metal Rod Phantom ToF Neutron Bragg-Edge CT",
         hr_modality="White-Beam Neutron Attenuation CT",
         guide_modality=(
             "Wavelength-Resolved ToF Bragg-Edge Phase Maps (Al, Fe, Cu, Ni, Zn)"
         ),
-        zenodo_record_id="4646694",
-        doi="10.5281/zenodo.4646694",
+        zenodo_record_id="4273969",
+        doi="10.5281/zenodo.4273969",
         description=(
             "Time-of-flight neutron tomography of high-purity Al, Fe, Cu, Ni, and "
-            "Zn cylinders at ISIS IMAT (Ametova et al., J. Phys. D 2021)."
+            "Zn cylinders at ISIS IMAT (Jørgensen, Burca, Ametova et al., 2021)."
         ),
     ),
 }
@@ -108,25 +109,58 @@ def _stream_hash(path: Path, algorithm: str = "md5", chunk_size: int = 262_144) 
 
 
 def get_repo_root() -> Path:
-    """Return the root directory of the repository."""
+    """Return the root directory of the repository (or package parent if installed)."""
     return Path(__file__).resolve().parent.parent
 
 
+def _is_source_checkout() -> bool:
+    """Return True when running from a source repository checkout."""
+    root = get_repo_root()
+    return (root / "pyproject.toml").is_file() and "site-packages" not in root.parts
+
+
+def _user_data_root() -> Path:
+    """Return a writable user-space cache directory (``$XFUSE_DATA_DIR`` or
+    ``~/.cache/x_fuse``) used when ``x-fuse`` is installed from a wheel.
+    """
+    env_dir = os.environ.get("XFUSE_DATA_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
+    return Path.home() / ".cache" / "x_fuse"
+
+
 def get_sample_dataset_path(name: str = "Zn13X") -> Path:
-    """Locate bundled sample slices (``Zn13X`` or ``MOR-GIS``) in ``data/samples``."""
-    samples_root = (get_repo_root() / "data" / "samples").resolve()
+    """Locate sample slices (``Zn13X`` or ``MOR-GIS``) in ``data/samples`` or
+    ``$XFUSE_DATA_DIR/samples``.
+    """
     raw_name = str(name)
     if not raw_name or "/" in raw_name or "\\" in raw_name or ".." in raw_name:
         raise ValueError(f"Invalid sample dataset name '{name}'.")
-    candidate = (samples_root / raw_name).resolve()
-    if not candidate.is_relative_to(samples_root):
-        raise ValueError(f"Sample dataset '{name}' escapes {samples_root}.")
-    if not candidate.exists():
-        available = [p.name for p in samples_root.glob("*")]
-        raise FileNotFoundError(
-            f"Sample dataset '{name}' not found at {candidate}. Available: {available}"
-        )
-    return candidate
+
+    search_roots = []
+    if "XFUSE_DATA_DIR" in os.environ:
+        search_roots.append((_user_data_root() / "samples").resolve())
+    search_roots.append((get_repo_root() / "data" / "samples").resolve())
+    user_samples = (_user_data_root() / "samples").resolve()
+    if user_samples not in search_roots:
+        search_roots.append(user_samples)
+
+    available: list[str] = []
+    for root in search_roots:
+        cand = (root / raw_name).resolve()
+        if not cand.is_relative_to(root):
+            raise ValueError(f"Sample dataset '{name}' escapes {root}.")
+        if cand.exists():
+            return cand
+        if root.exists():
+            available.extend(p.name for p in root.glob("*"))
+
+    raise FileNotFoundError(
+        f"Sample dataset '{name}' not found in {[str(r) for r in search_roots]}. "
+        f"Available: {sorted(set(available))}. If installed from a wheel without "
+        "repository sample data, set XFUSE_DATA_DIR or generate synthetic phantoms "
+        "via x_fuse.generate_correlative_phantom_2d()."
+    )
 
 
 def list_open_datasets() -> dict[str, OpenCorrelativeDataset]:
@@ -148,11 +182,12 @@ def fetch_open_dataset(
             f"Unknown dataset '{dataset_key}'. Choose from {list(OPEN_DATASETS)}"
         )
     meta = OPEN_DATASETS[dataset_key]
-    target_dir = (
-        Path(dest_root) / dataset_key
-        if dest_root is not None
-        else get_repo_root() / "data" / "downloads" / dataset_key
-    )
+    if dest_root is not None:
+        target_dir = Path(dest_root) / dataset_key
+    elif _is_source_checkout() and "XFUSE_DATA_DIR" not in os.environ:
+        target_dir = get_repo_root() / "data" / "downloads" / dataset_key
+    else:
+        target_dir = _user_data_root() / "downloads" / dataset_key
     target_dir.mkdir(parents=True, exist_ok=True)
     target_dir_resolved = target_dir.resolve()
 

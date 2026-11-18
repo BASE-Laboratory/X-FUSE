@@ -56,6 +56,7 @@ from .baselines import (
     coordinate_inr_baseline,
     gram_schmidt_pansharpen_baseline,
     guided_variational_sr_baseline,
+    otsu_threshold_baseline,
 )
 from .dataset_adapters import (
     load_bundled_morgis_samples,
@@ -131,6 +132,7 @@ def run_paper_benchmarks(
             seed=42,
         )
         gt = ph.gt_labels
+        otsu = otsu_threshold_baseline(ph.hr_image, ph.coarse_guide, mode="multiclass")
         bic = bicubic_upsample_baseline(
             ph.coarse_guide, (img_size, img_size), mode="multiclass"
         )
@@ -206,6 +208,7 @@ def run_paper_benchmarks(
             tta_shifts=tta_shifts,
         )
 
+        met_otsu = compute_segmentation_metrics(otsu.hard_mask[0], gt)
         met_bic = compute_segmentation_metrics(bic.hard_mask[0], gt)
         met_jbu = compute_segmentation_metrics(jbu.hard_mask[0], gt)
         met_gs = compute_segmentation_metrics(gs.hard_mask[0], gt)
@@ -222,6 +225,7 @@ def run_paper_benchmarks(
         results["ablation_resolution_sweep"].append(
             {
                 "downsample_factor": factor,
+                "otsu_miou": round(met_otsu["iou"], 4),
                 "bicubic_miou": round(met_bic["iou"], 4),
                 "bicubic_bf1": round(met_bic["boundary_f1"], 4),
                 "jbu_miou": round(met_jbu["iou"], 4),
@@ -415,6 +419,9 @@ def run_paper_benchmarks(
     ph_tex = generate_textured_isointensity_phantom_2d(
         size=max(img_size, 64), downsample_factor=8, seed=55
     )
+    otsu_tex = otsu_threshold_baseline(
+        ph_tex.hr_image, ph_tex.coarse_guide, mode="multiclass"
+    )
     jbu_tex = jbu_guided_baseline(
         ph_tex.hr_image, ph_tex.coarse_guide, mode="multiclass"
     )
@@ -518,6 +525,12 @@ def run_paper_benchmarks(
 
     results["v1_stress_tests"] = {
         "textured_isointensity": {
+            "otsu_miou": round(
+                compute_segmentation_metrics(otsu_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
             "jbu_miou": round(
                 compute_segmentation_metrics(jbu_tex.hard_mask[0], ph_tex.gt_labels)[
                     "iou"

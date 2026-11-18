@@ -54,10 +54,11 @@ from .uncertainty import (
     WelfordAccumulator,
     _safe_quantile,
     build_uncertainty_report,
+    compute_hard_phase_mask,
     compute_posterior_uncertainty,
     match_coarse_priors,
 )
-from .upsamplers import ForwardPSFDownsampler
+from .upsamplers import CrossAttentionFeatureUpsampler, ForwardPSFDownsampler
 from .utils import guide_to_tensor
 from .vit_patch import AttentionOptions
 
@@ -645,6 +646,38 @@ class CorrelativeFuser(nn.Module):
             else None
         )
 
+    def reset_trainable_weights(self) -> None:
+        """Reset all specimen-specific trainable head, upsampler, aligner, and
+        physics parameters (plus Adam momentum state) before fitting a new sample.
+        """
+        dev = next(self.dinov2.parameters()).device
+        if self.learned_upsampler and self.interpolation_mode == "cross_attn":
+            self.backbone_extractor.cross_attn_upsampler = (
+                CrossAttentionFeatureUpsampler(
+                    feat_dim=self.feat_dim,
+                    key_dim=16,
+                    radius=2,
+                    learned=True,
+                ).to(dev)
+            )
+        self._init_fusion_heads(
+            self.guide_channels,
+            device=dev,
+            spectral_channels=self.spectral_channels,
+        )
+        self.guide_aligner.reset_parameters()
+        align_params = list(self.guide_aligner.parameters())
+        self.align_optimizer = (
+            torch.optim.Adam(align_params, lr=max(self.lr * 2.0, 2e-2))
+            if align_params
+            else None
+        )
+        phys = self._active_physics()
+        if phys is not None:
+            phys.reset_specimen_state()
+        if self.xrd_fusion_module is not None:
+            self._bind_guide_only(self.xrd_fusion_module.xrd_image)
+
     def _bind_guide_only(self, guide_tensor: torch.Tensor) -> None:
         """Update the bound guide tensor in ``xrd_fusion_module`` without
         re-initializing trained head parameters (used during multi-image inference).
@@ -1062,9 +1095,6 @@ class CorrelativeFuser(nn.Module):
                     params.extend(list(head_mod.parameters()))
             else:
                 assert self.spatial_attention is not None and tr_guides is not None
-                tr_guide_coarse = tr_guides[i]
-                if tr_guide_coarse.dim() == 3:
-                    tr_guide_coarse = tr_guide_coarse.unsqueeze(0)
                 feat_in = (
                     self._upsample_patch_map(
                         cached_views[i].float(),
@@ -1074,25 +1104,50 @@ class CorrelativeFuser(nn.Module):
                     if (want_hr and kind == "patch" and tr_guidance_img is not None)
                     else cached_views[i]
                 )
-                logits_tr = self.spatial_attention.predict_logits(
-                    feat_in, tr_guide_coarse
-                )
-                if logits_tr.shape[-2:] != (img_h, img_w):
-                    logits_tr = F.interpolate(
-                        logits_tr,
-                        size=(img_h, img_w),
-                        mode="bilinear",
-                        align_corners=False,
+                if valid_hr_hw is not None and valid_hr_hw != (img_h, img_w):
+                    oh, ow = valid_hr_hw
+                    if feat_in.shape[-2:] != (img_h, img_w):
+                        feat_in = F.interpolate(
+                            feat_in.float(),
+                            size=(img_h, img_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    feat_canon = self.inverse_transforms[i](feat_in)[:, :, :oh, :ow]
+                    logits_canon = self.spatial_attention.predict_logits(
+                        feat_canon, canon_guide
                     )
-                logits_canon = self.inverse_transforms[i](logits_tr)
-                loss = self.spatial_attention.compute_loss_from_logits(
-                    logits_canon,
-                    guide_map=canon_guide,
-                    coarse_target=canon_guide,
-                    aligner=aligner_arg,
-                    valid_hr_hw=valid_hr_hw,
-                    loss_mask_lr=loss_mask_lr,
-                )
+                    loss = self.spatial_attention.compute_loss_from_logits(
+                        logits_canon,
+                        guide_map=canon_guide,
+                        coarse_target=canon_guide,
+                        aligner=aligner_arg,
+                        valid_hr_hw=None,
+                        loss_mask_lr=loss_mask_lr,
+                    )
+                else:
+                    tr_guide_coarse = tr_guides[i]
+                    if tr_guide_coarse.dim() == 3:
+                        tr_guide_coarse = tr_guide_coarse.unsqueeze(0)
+                    logits_tr = self.spatial_attention.predict_logits(
+                        feat_in, tr_guide_coarse
+                    )
+                    if logits_tr.shape[-2:] != (img_h, img_w):
+                        logits_tr = F.interpolate(
+                            logits_tr,
+                            size=(img_h, img_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    logits_canon = self.inverse_transforms[i](logits_tr)
+                    loss = self.spatial_attention.compute_loss_from_logits(
+                        logits_canon,
+                        guide_map=canon_guide,
+                        coarse_target=canon_guide,
+                        aligner=aligner_arg,
+                        valid_hr_hw=valid_hr_hw,
+                        loss_mask_lr=loss_mask_lr,
+                    )
                 if i == 0:
                     params.extend(list(self.spatial_attention.parameters()))
 
@@ -1181,10 +1236,16 @@ class CorrelativeFuser(nn.Module):
         *,
         _allow_cache: bool = True,
         _override_tr_guide: torch.Tensor | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self.eval()
         _, img_h, img_w = x_tile.shape
         n_transforms = len(self.transforms)
+        canon_unpad = (
+            valid_hr_hw is not None
+            and valid_hr_hw != (img_h, img_w)
+            and self.xrd_fuse_method in ("attention", "gating")
+        )
 
         logit_welford = WelfordAccumulator()
         prob_welford = WelfordAccumulator()
@@ -1215,7 +1276,11 @@ class CorrelativeFuser(nn.Module):
 
         tr_guides = (
             self.xrd_fusion_module.get_tr(hr_hw=(img_h, img_w))
-            if (_override_tr_guide is None and self.xrd_fusion_module is not None)
+            if (
+                not canon_unpad
+                and _override_tr_guide is None
+                and self.xrd_fusion_module is not None
+            )
             else None
         )
 
@@ -1251,19 +1316,36 @@ class CorrelativeFuser(nn.Module):
                     patch_debiased, (img_h, img_w), guidance_img=transformed_img
                 )
 
-            tr_g = (
-                _override_tr_guide
-                if _override_tr_guide is not None
-                else (tr_guides[i] if tr_guides is not None else guide_lr)
-            )
-            logits_view = self._logits_from_hr_view(
-                hr_feats,
-                transformed_img=transformed_img,
-                tr_guide=tr_g,
-                patch_debiased=patch_debiased,
-                top_k=top_k,
-            )
-            inv_logits = self.inverse_transforms[i](logits_view)
+            if canon_unpad and valid_hr_hw is not None:
+                oh, ow = valid_hr_hw
+                feat_canon = self.inverse_transforms[i](hr_feats)[:, :, :oh, :ow]
+                canon_g = (
+                    _override_tr_guide if _override_tr_guide is not None else guide_lr
+                )
+                logits_valid = self._logits_from_hr_view(
+                    feat_canon,
+                    transformed_img=None,
+                    tr_guide=canon_g,
+                    patch_debiased=None,
+                    top_k=top_k,
+                )
+                inv_logits = F.pad(
+                    logits_valid, (0, img_w - ow, 0, img_h - oh), mode="replicate"
+                )
+            else:
+                tr_g = (
+                    _override_tr_guide
+                    if _override_tr_guide is not None
+                    else (tr_guides[i] if tr_guides is not None else guide_lr)
+                )
+                logits_view = self._logits_from_hr_view(
+                    hr_feats,
+                    transformed_img=transformed_img,
+                    tr_guide=tr_g,
+                    patch_debiased=patch_debiased,
+                    top_k=top_k,
+                )
+                inv_logits = self.inverse_transforms[i](logits_view)
             logit_welford.update(inv_logits)
             prob_welford.update(torch.sigmoid(inv_logits))
 
@@ -1279,6 +1361,7 @@ class CorrelativeFuser(nn.Module):
         top_k: int | None = None,
         *,
         override_tr_guide: torch.Tensor | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self.eval()
         _, img_h, img_w = x.shape
@@ -1289,6 +1372,7 @@ class CorrelativeFuser(nn.Module):
                 top_k=top_k,
                 _allow_cache=True,
                 _override_tr_guide=override_tr_guide,
+                valid_hr_hw=valid_hr_hw,
             )
 
         # Seam-free full-FOV debiasing + TTA Welford loop ('attention' & 'gating' safe)
@@ -1297,6 +1381,11 @@ class CorrelativeFuser(nn.Module):
             or self.debias_positional
             or self.xrd_fuse_method in ("attention", "gating")
         ):
+            canon_unpad = (
+                valid_hr_hw is not None
+                and valid_hr_hw != (img_h, img_w)
+                and self.xrd_fuse_method in ("attention", "gating")
+            )
             cached_views: list[torch.Tensor] | None = None
             if self.cache_features and (img_h * img_w <= 512 * 512):
                 _, cached_views = self._extract_tta_views(x, want_hr=True)
@@ -1304,7 +1393,11 @@ class CorrelativeFuser(nn.Module):
             x_in = x.to(self.dtype) if self.dtype != torch.float32 else x.clone()
             tr_guides = (
                 self.xrd_fusion_module.get_tr(hr_hw=(img_h, img_w))
-                if (override_tr_guide is None and self.xrd_fusion_module is not None)
+                if (
+                    not canon_unpad
+                    and override_tr_guide is None
+                    and self.xrd_fusion_module is not None
+                )
                 else None
             )
             logit_welford = WelfordAccumulator()
@@ -1341,18 +1434,34 @@ class CorrelativeFuser(nn.Module):
                     )
                     hr_feats = self.backbone_extractor.debiaser(hr_v)
 
-                tr_g = (
-                    override_tr_guide
-                    if override_tr_guide is not None
-                    else (tr_guides[i] if tr_guides is not None else guide_lr)
-                )
-                logits_view = self._logits_from_hr_view(
-                    hr_feats,
-                    transformed_img=tr_img.unsqueeze(0),
-                    tr_guide=tr_g,
-                    top_k=top_k,
-                )
-                inv_logits = self.inverse_transforms[i](logits_view)
+                if canon_unpad and valid_hr_hw is not None:
+                    oh, ow = valid_hr_hw
+                    feat_canon = self.inverse_transforms[i](hr_feats)[:, :, :oh, :ow]
+                    canon_g = (
+                        override_tr_guide if override_tr_guide is not None else guide_lr
+                    )
+                    logits_valid = self._logits_from_hr_view(
+                        feat_canon,
+                        transformed_img=None,
+                        tr_guide=canon_g,
+                        top_k=top_k,
+                    )
+                    inv_logits = F.pad(
+                        logits_valid, (0, img_w - ow, 0, img_h - oh), mode="replicate"
+                    )
+                else:
+                    tr_g = (
+                        override_tr_guide
+                        if override_tr_guide is not None
+                        else (tr_guides[i] if tr_guides is not None else guide_lr)
+                    )
+                    logits_view = self._logits_from_hr_view(
+                        hr_feats,
+                        transformed_img=tr_img.unsqueeze(0),
+                        tr_guide=tr_g,
+                        top_k=top_k,
+                    )
+                    inv_logits = self.inverse_transforms[i](logits_view)
                 logit_welford.update(inv_logits)
                 prob_welford.update(torch.sigmoid(inv_logits))
 
@@ -1431,6 +1540,7 @@ class CorrelativeFuser(nn.Module):
         *,
         unguided_transfer: bool = False,
         use_aligner: bool = True,
+        valid_hr_hw: tuple[int, int] | None = None,
     ) -> UncertaintyReport:
         """Produce calibrated high-resolution phase/element probabilities, tri-part
         pixel certainty, and optional Split Conformal ``prediction_sets``.
@@ -1449,7 +1559,11 @@ class CorrelativeFuser(nn.Module):
                 train_ref
             )
             mean_logits, epistemic_prob_var = self._predict_logits_and_var_maybe_tiled(
-                x, prior_query, top_k=top_k, override_tr_guide=prior_query
+                x,
+                prior_query,
+                top_k=top_k,
+                override_tr_guide=prior_query,
+                valid_hr_hw=valid_hr_hw,
             )
             phys = self._active_physics()
             if self.loss_fn == "compositional_kl" and phys is not None:
@@ -1482,11 +1596,7 @@ class CorrelativeFuser(nn.Module):
             phys_res = torch.zeros_like(entropy)
             combined = (0.65 * entropy + 0.35 * epi_norm).clamp(0.0, 1.0)
             unresolved = torch.zeros_like(entropy, dtype=torch.bool)
-            hard = (
-                probs.argmax(dim=1).long()
-                if (eff_mode == "multiclass" and probs.shape[1] >= 2)
-                else (probs[:, 0] >= 0.5).long()
-            )
+            hard = compute_hard_phase_mask(probs, mode=eff_mode, channel_dim=1)
             if abstain_threshold is not None:
                 hard = torch.where(
                     combined > abstain_threshold, torch.full_like(hard, -1), hard
@@ -1529,7 +1639,7 @@ class CorrelativeFuser(nn.Module):
 
         ref_guide = self._effective_reference_guide(guide_lr)
         mean_logits, epistemic_prob_var = self._predict_logits_and_var_maybe_tiled(
-            x, guide_lr, top_k=top_k
+            x, guide_lr, top_k=top_k, valid_hr_hw=valid_hr_hw
         )
 
         phys = self._active_physics()
@@ -1649,6 +1759,10 @@ class CorrelativeFuser(nn.Module):
         guide_normalization: GuideNormalization | None = None,
         n_components: int | None = None,
         spectral_unmix: bool = False,
+        *,
+        max_steps: int | None = None,
+        tol: float = 1e-6,
+        reset_weights: bool = True,
     ) -> list[float]:
         """High-level training entrypoint: normalizes and pads ``hr_image`` and
         ``coarse_guide`` (or raw 3D spectral cube when ``spectral_unmix=True``),
@@ -1659,11 +1773,6 @@ class CorrelativeFuser(nn.Module):
         dev = next(self.dinov2.parameters()).device
         hr_prepared, (orig_h, orig_w) = self._prepare_high_level_hr(hr_image)
         self._fit_hr_sig = _tensor_content_digest(hr_prepared[:, :orig_h, :orig_w])
-
-        self.guide_aligner.reset_parameters()
-        phys_pre = self._active_physics()
-        if phys_pre is not None:
-            phys_pre.reset_specimen_state()
 
         norm_mode = (
             "preserve_counts"
@@ -1676,6 +1785,20 @@ class CorrelativeFuser(nn.Module):
         )
         guide_t = guide_to_tensor(coarse_guide, device=dev, normalization=norm_mode)
         lr_hw = (int(guide_t.shape[-2]), int(guide_t.shape[-1]))
+
+        if reset_weights:
+            if spectral_unmix:
+                self.guide_channels = int(n_components or self.guide_channels)
+                self.spectral_channels = int(guide_t.shape[1])
+            else:
+                self.guide_channels = int(guide_t.shape[1])
+                self.spectral_channels = None
+            self.reset_trainable_weights()
+        else:
+            self.guide_aligner.reset_parameters()
+            phys_pre = self._active_physics()
+            if phys_pre is not None:
+                phys_pre.reset_specimen_state()
 
         cal_mask_lr: torch.Tensor | None = None
         train_mask_lr: torch.Tensor | None = None
@@ -1724,7 +1847,7 @@ class CorrelativeFuser(nn.Module):
             != (int(hr_prepared.shape[-2]), int(hr_prepared.shape[-1]))
             else None
         )
-        n_epochs = max(1, int(epochs))
+        n_epochs = max(1, int(max_steps if max_steps is not None else epochs))
         warmup_steps = (
             int(round(warmup_fraction * n_epochs)) if self.align_guide != "none" else 0
         )
@@ -1736,7 +1859,15 @@ class CorrelativeFuser(nn.Module):
                 valid_hr_hw=valid_hw,
                 loss_mask_lr=train_mask_lr,
             )
+            prev_loss = losses[-1] if losses else None
             losses.append(loss_val)
+            if (
+                tol > 0.0
+                and prev_loss is not None
+                and ep >= max(warmup_steps + 3, 5)
+                and abs(prev_loss - loss_val) < tol
+            ):
+                break
         self._last_loss_history = losses
 
         # Bind full un-inpainted guide after training for holdout calibration
@@ -1761,7 +1892,7 @@ class CorrelativeFuser(nn.Module):
                     lr_hw, holdout_fraction=0.25
                 ).to(dev)
             mean_logits, epi_var = self._predict_logits_and_var_maybe_tiled(
-                hr_prepared, bound_g
+                hr_prepared, bound_g, valid_hr_hw=valid_hw
             )
             mean_logits = mean_logits[:, :, :orig_h, :orig_w]
             epi_var = epi_var[:, :, :orig_h, :orig_w]
@@ -1814,6 +1945,12 @@ class CorrelativeFuser(nn.Module):
         """
         dev = next(self.dinov2.parameters()).device
         hr_prepared, (orig_h, orig_w) = self._prepare_high_level_hr(hr_image)
+        valid_hw = (
+            (orig_h, orig_w)
+            if (orig_h, orig_w)
+            != (int(hr_prepared.shape[-2]), int(hr_prepared.shape[-1]))
+            else None
+        )
         cur_hr_sig = _tensor_content_digest(hr_prepared[:, :orig_h, :orig_w])
         same_specimen = self._fit_hr_sig is not None and cur_hr_sig == self._fit_hr_sig
 
@@ -1873,6 +2010,7 @@ class CorrelativeFuser(nn.Module):
             top_k=top_k,
             unguided_transfer=unguided_transfer,
             use_aligner=(same_specimen or self._fit_hr_sig is None),
+            valid_hr_hw=valid_hw,
         )
         cropped = report.crop_spatial(orig_h, orig_w)
         if ref_g is not None:
@@ -1893,6 +2031,10 @@ class CorrelativeFuser(nn.Module):
         guide_normalization: GuideNormalization | None = None,
         n_components: int | None = None,
         spectral_unmix: bool = False,
+        *,
+        max_steps: int | None = None,
+        tol: float = 1e-6,
+        reset_weights: bool = True,
     ) -> UncertaintyReport:
         """Fit the fusion model on ``(hr_image, coarse_guide)`` and return the
         calibrated, un-cropped ``UncertaintyReport`` in a single call.
@@ -1906,6 +2048,9 @@ class CorrelativeFuser(nn.Module):
             guide_normalization=guide_normalization,
             n_components=n_components,
             spectral_unmix=spectral_unmix,
+            max_steps=max_steps,
+            tol=tol,
+            reset_weights=reset_weights,
         )
         return self.predict(
             hr_image,

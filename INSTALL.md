@@ -1,6 +1,6 @@
 # Installation Guide
 
-`x-fuse` (`v1.0.0+`) is a **100% self-contained pure-PyTorch package** with no external sub-repositories or custom C++/CUDA extensions to compile. It runs cleanly on Linux, macOS (Intel & Apple Silicon), and Windows.
+`x-fuse` (`v1.0.0+`) is a **pure-PyTorch package** with no vendored sub-repositories or custom C++/CUDA extensions to compile (pretrained DINOv2/ViT weights are resolved via `timm` on first use or bypassed offline with `pretrained=False`). It runs cleanly on Linux, macOS (Intel & Apple Silicon), and Windows.
 
 ## Prerequisites
 

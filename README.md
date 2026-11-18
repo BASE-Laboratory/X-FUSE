@@ -8,7 +8,7 @@
 
 **X-FUSE** bridges the ubiquitous resolution-vs.-specificity trade-off in materials characterization. Across electron, X-ray, and neutron imaging, researchers routinely acquire a **high-resolution structural image** ($I_{\text{HR}}$, fast & sharp, but chemically ambiguous) alongside a **coarser or sparse physical/chemical guide modality** ($G_{\text{LR}}$, chemically or crystallographically specific, but 4×–32× coarser or restricted to sparse 2D slices).
 
-Unlike purely geometric foundation models (such as SAM/SAM2) that segment contrast boundaries without knowing chemical identity—or naive interpolation of coarse chemical maps—**X-FUSE** extracts dense sub-patch Vision Transformer features from $I_{\text{HR}}$, fuses $M$ physical guide channels simultaneously via a differentiable forward point-spread-function (PSF) operator, and outputs **calibrated high-resolution phase segmentations paired with pixel/voxel-level certainty maps**.
+Unlike purely geometric foundation models (such as SAM/SAM2) that segment contrast boundaries without knowing chemical identity—or naive interpolation of coarse chemical maps—**X-FUSE** extracts dense sub-patch Vision Transformer features from $I_{\text{HR}}$, fuses $M$ physical guide channels simultaneously via a differentiable forward point-spread-function (PSF) operator, and outputs **prior-matched high-resolution phase segmentations paired with pixel/voxel-level certainty maps and optional Split Conformal prediction sets**.
 
 ---
 
@@ -29,7 +29,7 @@ Unlike purely geometric foundation models (such as SAM/SAM2) that segment contra
 2. **Texture-Aware Cross-Attention Upsampling & Apositional Feature Debiasing**: Separate iso-intensity textured phases (e.g., lamellar precipitates vs. homogeneous matrix) with `CrossAttentionFeatureUpsampler` (`interpolation_mode="cross_attn"`) + `SpatialConvMLPHead` (`fusion_method="spatial_mlp"`), and eliminate ViT coordinate-ramp shortcut learning on macroscopic chemical gradients via `ApositionalFeatureDebiaser` (`debias_positional=True`).
 3. **Finite-Sample Split Conformal Prediction & Tri-Part Certainty**: Pair **aleatoric entropy**, **online $O(1)$-memory Welford TTA / tri-plane epistemic variance**, and **forward physical PSF residual** with distribution-free $(1 - \alpha)$ Split Conformal phase prediction sets (`conformal_alpha=0.10`, `ConformalCalibrator`) and active beamtime steering (`suggest_next_slices`, `suggest_2d_rois`).
 4. **Differentiable Rigid, Affine & Cubic B-Spline Registration**: Jointly compensate rigid stage drift or nonlinear SEM/STEM charging scan-distortion (`align_guide="translation" | "rigid" | "affine" | "bspline"`) with thin-plate bending energy regularization and Jacobian diffeomorphism diagnostics, alongside learnable per-channel PSF widths (`learn_psf=True`).
-5. **Megapixel Tiling, Out-of-Core SuRVoS 2.5D Mode & Scientific I/O**: Frozen TTA caching (`~10x–20x` speedup), Hann-windowed 2D tiling (`tile_size=...`), lazy HDF5 / Zarr / TIFF-stack 2.5D streaming (`VolumeSliceAccessor`, `VolumetricFuser`), OME-TIFF / HDF5 / Zarr report export, and RosettaSciIO vendor readers (`.emd`, `.dm3`/`.dm4`, `.bcf`, `.hspy`).
+5. **Megapixel Tiling, Lazy 2.5D Slice Streaming & Scientific I/O**: Pure-PyTorch package (pretrained DINOv2/ViT weights resolved reproducibly via `timm` or offline with `pretrained=False`), content-hashed frozen TTA feature caching across optimization steps, Hann-windowed 2D tiling (`tile_size=...`), lazy HDF5 / Zarr / TIFF-stack 2.5D input slice streaming (`VolumeSliceAccessor`, `VolumetricFuser`), OME-TIFF / HDF5 / Zarr report export, and RosettaSciIO vendor readers (`.emd`, `.dm3`/`.dm4`, `.bcf`, `.hspy`).
 
 ---
 
@@ -91,11 +91,11 @@ from x_fuse import XFuse, VolumetricFuser, generate_correlative_phantom_3d, sugg
 phantom_3d = generate_correlative_phantom_3d(shape=(32, 64, 64), downsample_factor=4)
 vol_fuser = VolumetricFuser(XFuse(backbone="dinov2_vits14", stride=4))
 
-# Train on just 3 sparse 2D chemical/diffraction slices out of Z=32 (supports lazy HDF5/Zarr!)
+# Train on just 3 sparse 2D chemical/diffraction slices out of Z=32 (streams 2D slabs lazily from HDF5/Zarr!)
 sparse_slices = {4: phantom_3d.coarse_guide_3d[:, 1], 16: phantom_3d.coarse_guide_3d[:, 4], 28: phantom_3d.coarse_guide_3d[:, 7]}
 vol_fuser.fit_sparse_slices(phantom_3d.hr_volume, sparse_guides=sparse_slices, epochs=15, delta=1)
 
-# Propagate across the entire 3D volume via orthogonal XY + XZ + YZ tri-planes
+# Propagate across the 3D volume via 2.5D slabs or orthogonal XY + XZ + YZ tri-planes
 vol_report = vol_fuser.predict_volume(phantom_3d.hr_volume, mode="triplane", pred_mode="multiclass")
 plan = suggest_next_slices(vol_report, acquired_indices=list(sparse_slices), k=3, min_spacing=4)
 print("Next optimal z-slices to scan:", plan.recommended_indices)
@@ -103,11 +103,13 @@ print("Next optimal z-slices to scan:", plan.recommended_indices)
 
 ### 3. Reproducible Paper Benchmarks, Competing Baselines & Open Datasets
 
+*(Note: `--quick` runs a fast offline CPU smoke check with unpretrained `timm:vit_tiny_patch16_224`; pass `--backbone dinov2_vitb14_reg --pretrained --device cuda` for full pretrained evaluations.)*
+
 ```bash
-# Run synthetic super-resolution, invisible-phase residual, sparsification & 2.5D suite
+# Run synthetic super-resolution, invisible-phase residual, sparsification & 2.5D smoke suite
 uv run python -m benchmarks.run_synthetic_suite --quick
 
-# Run v1.0 paper benchmark + competing field baselines (CNMF, Gram-Schmidt, Guided TV, SIREN INR) + PDF figures
+# Run v1.0 paper benchmark + competing field baselines (Multi-Otsu, CNMF, Gram-Schmidt, Guided TV, SIREN INR) + PDF figures
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir benchmarks/outputs/paper_quick
 
 # Run full unit test suite (>=85% coverage gate)

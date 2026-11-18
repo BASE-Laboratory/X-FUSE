@@ -85,6 +85,31 @@ def infer_vit_params(
     return 384, 16, 6
 
 
+_DINOV2_TIMM_MAP: dict[str, str] = {
+    "dinov2_vits14": "vit_small_patch14_dinov2",
+    "dinov2_vitb14": "vit_base_patch14_dinov2",
+    "dinov2_vitl14": "vit_large_patch14_dinov2",
+    "dinov2_vitg14": "vit_giant_patch14_dinov2",
+    "dinov2_vits14_reg": "vit_small_patch14_reg4_dinov2",
+    "dinov2_vits14_reg4": "vit_small_patch14_reg4_dinov2",
+    "dinov2_vitb14_reg": "vit_base_patch14_reg4_dinov2",
+    "dinov2_vitb14_reg4": "vit_base_patch14_reg4_dinov2",
+    "dinov2_vitl14_reg": "vit_large_patch14_reg4_dinov2",
+    "dinov2_vitl14_reg4": "vit_large_patch14_reg4_dinov2",
+    "dinov2_vitg14_reg": "vit_giant_patch14_reg4_dinov2",
+    "dinov2_vitg14_reg4": "vit_giant_patch14_reg4_dinov2",
+}
+_DINOV2_PINNED_HUB_REPO = (
+    "facebookresearch/dinov2:e1277af2ba9496fbadf7aec6eba56e8d882d1e35"
+)
+_DINO_PINNED_HUB_REPO = "facebookresearch/dino:cb711401860da580817918b9167ed73e3eef3dcf"
+
+
+def _is_timm_vit(model: nn.Module) -> bool:
+    """Return True when ``model`` is a ``timm`` VisionTransformer instance."""
+    return type(model).__module__.startswith("timm.")
+
+
 def load_backbone(
     dino_name: str,
     stride: int,
@@ -123,8 +148,14 @@ def load_backbone(
         timm_id = dino_name.split("timm:", 1)[1]
         return create_model(timm_id, pretrained=pretrained, dynamic_img_size=True)
 
+    use_torch_hub = bool(kwargs.get("use_torch_hub", False))
+    if not use_torch_hub and dino_name in _DINOV2_TIMM_MAP:
+        return create_model(
+            _DINOV2_TIMM_MAP[dino_name], pretrained=pretrained, dynamic_img_size=True
+        )
+
     if "dinov2" in dino_name:
-        return torch.hub.load("facebookresearch/dinov2", dino_name)
+        return torch.hub.load(_DINOV2_PINNED_HUB_REPO, dino_name, pretrained=pretrained)
 
     if "dinov3" in dino_name:
         lib_path = kwargs.get("lib_path")
@@ -135,7 +166,7 @@ def load_backbone(
         return torch.hub.load(lib_path, dino_name, source="local", weights=chk_path)
 
     if "dino" in dino_name:
-        return torch.hub.load("facebookresearch/dino:main", dino_name)
+        return torch.hub.load(_DINO_PINNED_HUB_REPO, dino_name, pretrained=pretrained)
 
     if "deit" in dino_name:
         return create_model(
@@ -182,18 +213,24 @@ class HighResBackbone(nn.Module):
         self.dinov2.eval()
 
         feat, patch, n_heads = infer_vit_params(dino_name, self.dinov2)
-        if "dinov2" not in dino_name:
+        if "dinov2" not in dino_name or _is_timm_vit(self.dinov2):
             dino_any: Any = self.dinov2
             if not hasattr(dino_any, "num_heads"):
                 dino_any.num_heads = n_heads
             if not hasattr(dino_any, "num_register_tokens"):
-                dino_any.num_register_tokens = 0
+                dino_any.num_register_tokens = int(
+                    getattr(dino_any, "num_reg_tokens", 0)
+                )
 
         self.original_patch_size: int = patch
         self.original_stride = _pair(patch)
         self.base_feat_dim: int = feat
         self.n_heads: int = n_heads
-        self.n_register_tokens: int = getattr(self.dinov2, "num_register_tokens", 0)
+        self.n_register_tokens: int = getattr(
+            self.dinov2,
+            "num_register_tokens",
+            getattr(self.dinov2, "num_reg_tokens", 0),
+        )
         self.layers_spec: LayerSelection = layers
         self._blocks_ref, self.layer_indices = self._resolve_layer_selection(
             self.dinov2, layers
@@ -303,7 +340,7 @@ class HighResBackbone(nn.Module):
             dino_any.patch_embed.proj.stride = new_stride_pair
             if hasattr(dino_any.patch_embed, "strict_img_size"):
                 dino_any.patch_embed.strict_img_size = False
-            if self.dino_name.startswith("timm:"):
+            if self.dino_name.startswith("timm:") or _is_timm_vit(dino_model):
                 pe_mod = dino_any.patch_embed
 
                 def _subpatch_timm_pe_forward(
@@ -344,7 +381,7 @@ class HighResBackbone(nn.Module):
             dino_any.forward_feats_attn = MethodType(forward_feats_attn, dino_any)
             return
 
-        if dino_name.startswith("timm:"):
+        if dino_name.startswith("timm:") or _is_timm_vit(dino_model):
 
             def forward_feats_timm(self_model, x, masks=None, attn_choice="none"):
                 feats = self_model.forward_features(x)
