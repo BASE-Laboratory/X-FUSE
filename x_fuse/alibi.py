@@ -1,16 +1,16 @@
+"""ALiBi (Attention with Linear Biases) Vision Transformer wrapper supporting
+sub-patch stride and 2D cylindrical relative distance offsets to suppress ViT
+positional ramp bias on homogeneous micrographs.
+
+Attribution & License (MIT):
+- Adapted from ``tldr-group/dino-saw`` (R. Docherty et al., "What DINO saw:
+  ALiBi positional encoding reduces positional bias in Vision Transformers",
+  arXiv:2603.16840, https://github.com/tldr-group/dino-saw, MIT License).
+- Original ViT wrapper adapted from ``Jiawei-Yang/Denoising-ViT``
+  (https://github.com/Jiawei-Yang/Denoising-ViT, MIT License).
 """
-A simple wrapper around timm vision transformers that allow for adjusting the
-model stride and has a helper to get patch features out.
 
-Adpated from:
-https://github.com/Jiawei-Yang/Denoising-ViT/blob/main/dvt/models/vit_wrapper.py
-
-This file was copied directly from:
-https://github.com/tldr-group/dino-saw/blob/main/all_in_one_alibi_vit.py
-
-
-"""
-
+import logging
 import re
 from collections.abc import Callable
 from types import MethodType
@@ -27,11 +27,13 @@ from timm.models.vision_transformer import Block, VisionTransformer
 from torch import nn
 from torchvision import transforms
 
+_logger = logging.getLogger(__name__)
+
 FLASH_ATTN_INSTALLED = False
 try:
     from flash_attn import flash_attn_qkvpacked_func
 
-    print("flash attention installed")
+    _logger.debug("flash_attn available for ALiBi ViT wrapper.")
     FLASH_ATTN_INSTALLED = True
 except ImportError:
     pass
@@ -45,7 +47,6 @@ MODEL_LIST = [
     "fit3D_vit_small_patch14_reg4_dinov2.lvd142m",
     "vit_base_patch14_reg4_dinov2.lvd142m",
     # DINOv3
-    # "vit_small_plus_patch16_dinov3.lvd1689m",
     "dinov3_vits_patch16_plus_reg4",
     "vit_small_patch16_224.dino",
     "vit_base_patch16_224.mae",
@@ -53,7 +54,6 @@ MODEL_LIST = [
     "eva02_base_patch14_224.mim_in22k",
     "samvit_base_patch16.sa1b",
     "convnextv2_tiny.fcmae",
-    # "vit_base_patch16_224.augreg2_in21k_ft_in1k",
     "vit_base_patch16_clip_224.laion2b_ft_in12k_in1k",
     "deit3_small_patch16_224.fb_in1k",
     "tiny_vit_5m_224.dist_in22k_ft_in1k",
@@ -100,7 +100,7 @@ class Patch:
 
 def add_flash_attention(model: VisionTransformer) -> VisionTransformer:
     if FLASH_ATTN_INSTALLED is False:
-        print("Warning: no flash attn available")
+        _logger.debug("flash_attn not installed; keeping standard attention.")
         return model
     blk: Block
     for blk in model.blocks:  # type: ignore
@@ -120,9 +120,11 @@ class PretrainedViTWrapper(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        assert model_identifier in MODEL_LIST, (
-            f"Model type {model_identifier} not tested yet."
-        )
+        if model_identifier not in MODEL_LIST:
+            _logger.info(
+                "Loading custom timm VisionTransformer %r with ALiBi wrapper.",
+                model_identifier,
+            )
         self.model_identifier = model_identifier
 
         self.stride = stride
@@ -543,17 +545,23 @@ class AlibiVitWrapper(PretrainedViTWrapper):
         dynamic_img_pad: bool = False,
         device: str = "cpu",
         slope_type: AlibiSlopeType = "constant",
-        n_reg_tokens: int = 4,
+        n_reg_tokens: int | None = None,
         metric: str = "euclidean",
         normalize: bool = True,
         wrap: bool = True,
         add_cls: bool = True,
         **kwargs,
     ):
+        if n_reg_tokens is None:
+            reg_match = re.search(r"reg(\d+)", model_identifier)
+            inferred_reg = 0 if reg_match is None else int(reg_match.group(1))
+        else:
+            inferred_reg = int(n_reg_tokens)
+
         distance_matrix = DistanceMatrixWrapper(
             n_tokens_h=16,
             n_tokens_w=16,
-            n_reg_tokens=n_reg_tokens,
+            n_reg_tokens=inferred_reg,
             metric=metric,
             normalize=normalize,
             wrap=wrap,
@@ -581,12 +589,18 @@ class AlibiVitWrapper(PretrainedViTWrapper):
             **kwargs,
         )
         self.n_cls_tokens = 0 if not add_cls else 1
-        self.n_reg_tokens = n_reg_tokens
+        actual_reg = (
+            int(getattr(self.model, "num_reg_tokens", inferred_reg))
+            if n_reg_tokens is None
+            else inferred_reg
+        )
+        self.n_reg_tokens = actual_reg
+        distance_matrix.n_reg_tokens = actual_reg
 
         if self.n_cls_tokens == 0:
             self.model.cls_token = None
 
-        if self.n_reg_tokens == 0:
+        if self.n_reg_tokens == 0 and hasattr(self.model, "reg_token"):
             self.model.reg_token = None
 
         self.distance_matrix = distance_matrix
@@ -623,10 +637,3 @@ class AlibiVitWrapper(PretrainedViTWrapper):
         return super().get_intermediate_layers(
             x, n, reshape, return_prefix_tokens, norm
         )
-
-
-if __name__ == "__main__":
-    dv2 = AlibiVitWrapper()
-    x = torch.zeros((1, 3, 14 * 4, 14 * 4))
-    o = dv2.forward_features(x, True, False, abs_pos_enc_drop_prob=0.5)
-    print(o.shape)

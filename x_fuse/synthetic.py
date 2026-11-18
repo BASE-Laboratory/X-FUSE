@@ -136,11 +136,15 @@ def generate_correlative_phantom_3d(
     hr_noise_std: float = 0.06,
     poisson_counts: float | None = 150.0,
     seed: int = 123,
+    shape_zyx: tuple[int, int, int] | None = None,
 ) -> CorrelativePhantom3D:
     """Synthesize a 3D multi-phase porous/composite volume ``(Z, Y, X)`` with
     anisotropic or isotropic 3D correlation lengths for benchmarking 2D slice-by-slice
     vs. SuRVoS 2.5D slab & orthogonal tri-plane fusion."""
-    z_dim, y_dim, x_dim = ((d // downsample_factor) * downsample_factor for d in shape)
+    eff_shape = shape_zyx if shape_zyx is not None else shape
+    z_dim, y_dim, x_dim = (
+        (d // downsample_factor) * downsample_factor for d in eff_shape
+    )
     rng = np.random.default_rng(seed)
 
     field_a = gaussian_filter(
@@ -189,4 +193,217 @@ def generate_correlative_phantom_3d(
         coarse_guide_3d=coarse_3d,
         gt_labels_3d=gt_labels,
         gt_phase_channels_3d=gt_channels,
+    )
+
+
+@dataclass
+class SpectralCubePhantom2D:
+    """Paired 2D structural micrograph + coarse 3D Poisson spectral/diffraction cube."""
+
+    hr_image: np.ndarray  # (H, W) float32 in [0, 1]
+    spectral_cube_lr: np.ndarray  # (E, H_lr, W_lr) float32 raw photon/X-ray counts
+    gt_spectra: np.ndarray  # (2, E) float32 unit-sum endmember spectra
+    gt_labels: np.ndarray  # (H, W) int64 in {0, 1, 2}
+    gt_phase_channels: np.ndarray  # (2, H, W) float32
+
+
+def generate_textured_isointensity_phantom_2d(
+    size: int = 128,
+    downsample_factor: int = 8,
+    texture_amplitude: float = 0.28,
+    hr_noise_std: float = 0.015,
+    seed: int = 42,
+) -> CorrelativePhantom2D:
+    """Synthesize an iso-intensity textured correlative phantom where Phase A (1)
+    and Phase B (2) share the **exact same mean grayscale intensity** (``0.55``),
+    differing solely by fine high-frequency precipitate/lamellar texture in Phase B.
+
+    Classical intensity-only pan-sharpening (Gram-Schmidt, CNMF, grayscale JBU)
+    cannot separate Phase A from Phase B at sub-coarse boundaries, whereas
+    texture-aware cross-attention upsampling + ``SpatialConvMLPHead`` resolves them.
+    """
+    if size % downsample_factor != 0:
+        size = (size // downsample_factor) * downsample_factor
+    rng = np.random.default_rng(seed)
+
+    pore_field = gaussian_filter(
+        rng.standard_normal((size, size)).astype(np.float32),
+        sigma=max(2.5, size / 22.0),
+        mode="wrap",
+    )
+    phase_field = gaussian_filter(
+        rng.standard_normal((size, size)).astype(np.float32),
+        sigma=max(2.2, size / 24.0),
+        mode="wrap",
+    )
+    pores = pore_field <= float(np.quantile(pore_field, 0.14))
+    mask_a = (~pores) & (phase_field <= 0.0)
+    mask_b = (~pores) & (phase_field > 0.0)
+
+    gt_labels = np.zeros((size, size), dtype=np.int64)
+    gt_labels[mask_a] = 1
+    gt_labels[mask_b] = 2
+    gt_channels = np.stack(
+        [mask_a.astype(np.float32), mask_b.astype(np.float32)], axis=0
+    )
+
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing="ij")
+    # Zero-mean high-frequency checkerboard/lamellar precipitate texture
+    checker = np.sign(np.sin(np.pi * (yy + 0.5)) * np.sin(np.pi * (xx + 0.5))).astype(
+        np.float32
+    )
+
+    hr = np.full((size, size), 0.10, dtype=np.float32)
+    hr[mask_a] = 0.55  # Smooth homogeneous phase
+    hr[mask_b] = 0.55 + float(texture_amplitude) * checker[mask_b]  # Iso-mean textured!
+    hr = np.clip(
+        hr + rng.normal(0.0, hr_noise_std, size=(size, size)).astype(np.float32),
+        0.0,
+        1.0,
+    )
+
+    h_lr = size // downsample_factor
+    coarse = np.zeros((2, h_lr, h_lr), dtype=np.float32)
+    for m in range(2):
+        blurred = gaussian_filter(
+            gt_channels[m], sigma=0.4 * downsample_factor, mode="nearest"
+        )
+        coarse[m] = blurred.reshape(
+            h_lr, downsample_factor, h_lr, downsample_factor
+        ).mean(axis=(1, 3))
+
+    return CorrelativePhantom2D(
+        hr_image=hr,
+        coarse_guide=coarse,
+        gt_labels=gt_labels,
+        gt_phase_channels=gt_channels,
+    )
+
+
+def generate_macroscopic_gradient_phantom_2d(
+    size: int = 128,
+    downsample_factor: int = 8,
+    hr_noise_std: float = 0.02,
+    seed: int = 77,
+) -> CorrelativePhantom2D:
+    """Synthesize a diffusion-couple / electrode-gradient phantom where discrete
+    Phase A grains follow a strong left-to-right spatial concentration gradient,
+    testing resistance to ViT coordinate-ramp shortcut learning.
+    """
+    if size % downsample_factor != 0:
+        size = (size // downsample_factor) * downsample_factor
+    rng = np.random.default_rng(seed)
+
+    base = gaussian_filter(
+        rng.standard_normal((size, size)).astype(np.float32),
+        sigma=max(2.5, size / 24.0),
+        mode="nearest",
+    )
+    base = (base - base.mean()) / (base.std() + 1e-6)
+    ramp_x = np.linspace(1.1, -1.1, size, dtype=np.float32)[None, :]
+    mask_a = (base + 0.85 * ramp_x) > 0.45
+    mask_b = ((base - 0.85 * ramp_x) > 0.65) & (~mask_a)
+
+    gt_labels = np.zeros((size, size), dtype=np.int64)
+    gt_labels[mask_a] = 1
+    gt_labels[mask_b] = 2
+    gt_channels = np.stack(
+        [mask_a.astype(np.float32), mask_b.astype(np.float32)], axis=0
+    )
+
+    hr = np.full((size, size), 0.18, dtype=np.float32)
+    hr[mask_a] = 0.85
+    hr[mask_b] = 0.50
+    hr = np.clip(
+        hr + rng.normal(0.0, hr_noise_std, size=(size, size)).astype(np.float32),
+        0.0,
+        1.0,
+    )
+
+    h_lr = size // downsample_factor
+    coarse = np.zeros((2, h_lr, h_lr), dtype=np.float32)
+    for m in range(2):
+        blurred = gaussian_filter(
+            gt_channels[m], sigma=0.4 * downsample_factor, mode="nearest"
+        )
+        coarse[m] = blurred.reshape(
+            h_lr, downsample_factor, h_lr, downsample_factor
+        ).mean(axis=(1, 3))
+
+    return CorrelativePhantom2D(
+        hr_image=hr,
+        coarse_guide=coarse,
+        gt_labels=gt_labels,
+        gt_phase_channels=gt_channels,
+    )
+
+
+def generate_spectral_cube_phantom_2d(
+    size: int = 96,
+    downsample_factor: int = 6,
+    n_spectral_bins: int = 24,
+    mean_counts: float = 40.0,
+    background_counts: float = 0.5,
+    bspline_warp_px: float = 0.0,
+    seed: int = 99,
+) -> SpectralCubePhantom2D:
+    """Synthesize a low-dose Poisson 3D hyperspectral/diffraction cube
+    ``(E, H_lr, W_lr)`` paired with an ``(H, W)`` structural micrograph and
+    optional nonlinear scan-charging distortion ``bspline_warp_px``.
+    """
+    from scipy.ndimage import map_coordinates
+
+    base = generate_correlative_phantom_2d(
+        size=size,
+        downsample_factor=downsample_factor,
+        phase_b_contrast=0.35,
+        hr_noise_std=0.02,
+        poisson_counts=None,
+        seed=seed,
+    )
+    rng = np.random.default_rng(seed + 10)
+    e_grid = np.linspace(0.0, 1.0, n_spectral_bins, dtype=np.float32)
+    # Two distinct multi-peak characteristic X-ray / Bragg spectra
+    spec_a = np.exp(-((e_grid - 0.25) ** 2) / (2 * 0.06**2)) + 0.45 * np.exp(
+        -((e_grid - 0.60) ** 2) / (2 * 0.05**2)
+    )
+    spec_b = np.exp(-((e_grid - 0.75) ** 2) / (2 * 0.06**2)) + 0.35 * np.exp(
+        -((e_grid - 0.42) ** 2) / (2 * 0.05**2)
+    )
+    gt_spectra = np.stack([spec_a, spec_b], axis=0).astype(np.float32)
+    gt_spectra /= gt_spectra.sum(axis=-1, keepdims=True)
+
+    h_lr = size // downsample_factor
+    abund_lr = np.zeros((2, h_lr, h_lr), dtype=np.float32)
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing="ij")
+    if abs(bspline_warp_px) > 1e-5:
+        # Smooth nonlinear charging bow along Y/X
+        dy = bspline_warp_px * np.sin(np.pi * yy / size) * np.sin(np.pi * xx / size)
+        dx = bspline_warp_px * np.sin(np.pi * yy / size)
+    else:
+        dy = np.zeros_like(yy, dtype=np.float32)
+        dx = np.zeros_like(xx, dtype=np.float32)
+
+    for m in range(2):
+        src = base.gt_phase_channels[m]
+        if abs(bspline_warp_px) > 1e-5:
+            src = map_coordinates(
+                src, [yy - dy, xx - dx], order=1, mode="nearest"
+            ).astype(np.float32)
+        blurred = gaussian_filter(src, sigma=0.4 * downsample_factor, mode="nearest")
+        abund_lr[m] = blurred.reshape(
+            h_lr, downsample_factor, h_lr, downsample_factor
+        ).mean(axis=(1, 3))
+
+    noiseless_cube = float(mean_counts) * np.einsum(
+        "mhw,me->ehw", abund_lr, gt_spectra
+    ) + float(background_counts)
+    noisy_cube = rng.poisson(np.clip(noiseless_cube, 0.0, None)).astype(np.float32)
+
+    return SpectralCubePhantom2D(
+        hr_image=base.hr_image,
+        spectral_cube_lr=noisy_cube,
+        gt_spectra=gt_spectra,
+        gt_labels=base.gt_labels,
+        gt_phase_channels=base.gt_phase_channels,
     )

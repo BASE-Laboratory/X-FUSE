@@ -8,7 +8,13 @@ from .active import (
     suggest_2d_rois,
     suggest_next_slices,
 )
-from .backbones import HighResBackbone, HighResDV2, LayerSelection, load_backbone
+from .backbones import (
+    HighResBackbone,
+    HighResDV2,
+    Interpolation,
+    LayerSelection,
+    load_backbone,
+)
 from .datasets import (
     OPEN_DATASETS,
     OpenCorrelativeDataset,
@@ -17,17 +23,27 @@ from .datasets import (
     list_open_datasets,
     make_experimental_holdout,
 )
+from .debias import (
+    ApositionalFeatureDebiaser,
+    build_orthonormal_spatial_basis,
+    measure_positional_r2,
+)
 from .fusion import (
     CorrelativeFuser,
-    FusionOptions,
     GuideFusionMethod,
-    LearnedChannelGating,
-    LossOptions,
-    SpatialCrossAttention,
     XFuse,
-    XRDCrossAttention,
     XRDFusionMethod,
     compute_channel_correlation_gates,
+)
+from .heads import (
+    FusionOptions,
+    LearnedChannelGating,
+    LinearProbeHead,
+    SpatialConvMLPHead,
+    SpatialCrossAttention,
+    WindowedGuideCrossAttentionHead,
+    XRDCrossAttention,
+    edge_aware_tv_loss,
 )
 from .io import (
     load_microscopy_file,
@@ -41,6 +57,13 @@ from .loaders import (
     load_image_array,
     load_xct,
     load_xrdct_phase,
+)
+from .physics import (
+    GuideNormalization,
+    LossOptions,
+    PhysicsForwardModel,
+    SpectralUnmixingDictionary,
+    poisson_deviance_loss,
 )
 from .registration import AlignMode, DifferentiableGuideAligner
 from .segment import (
@@ -56,8 +79,12 @@ from .segment import (
 from .synthetic import (
     CorrelativePhantom2D,
     CorrelativePhantom3D,
+    SpectralCubePhantom2D,
     generate_correlative_phantom_2d,
     generate_correlative_phantom_3d,
+    generate_macroscopic_gradient_phantom_2d,
+    generate_spectral_cube_phantom_2d,
+    generate_textured_isointensity_phantom_2d,
 )
 from .tiling import generate_tile_boxes, hann_window_2d, run_tiled_2d
 from .transforms import (
@@ -70,6 +97,7 @@ from .transforms import (
     normalize_structural,
 )
 from .uncertainty import (
+    ConformalCalibrator,
     UncertaintyReport,
     WelfordAccumulator,
     brier_score,
@@ -77,13 +105,16 @@ from .uncertainty import (
     compute_bald_mutual_information,
     compute_physical_residual,
     compute_posterior_uncertainty,
+    empirical_conformal_coverage,
     expected_calibration_error,
     match_coarse_priors,
     sparsification_curve,
 )
 from .upsamplers import (
+    CrossAttentionFeatureUpsampler,
     ForwardPSFDownsampler,
     JointBilateralUpsampler,
+    extract_multiscale_texture_descriptors,
     joint_bilateral_upsample,
 )
 from .utils import downsample_xrdct, get_multiphase, guide_to_tensor, xrd_to_tensor
@@ -95,7 +126,7 @@ from .volumetric import (
     z_slice_consistency_score,
 )
 
-__version__ = "0.4.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "__version__",
@@ -103,24 +134,39 @@ __all__ = [
     "XFuse",
     "HighResBackbone",
     "HighResDV2",
+    "Interpolation",
     "LayerSelection",
     "load_backbone",
+    "ApositionalFeatureDebiaser",
+    "build_orthonormal_spatial_basis",
+    "measure_positional_r2",
+    "LinearProbeHead",
     "LearnedChannelGating",
+    "SpatialConvMLPHead",
+    "WindowedGuideCrossAttentionHead",
     "XRDCrossAttention",
     "SpatialCrossAttention",
+    "edge_aware_tv_loss",
     "XRDFusionMethod",
     "GuideFusionMethod",
     "FusionOptions",
     "LossOptions",
+    "GuideNormalization",
+    "PhysicsForwardModel",
+    "SpectralUnmixingDictionary",
+    "poisson_deviance_loss",
     "compute_channel_correlation_gates",
     "AlignMode",
     "DifferentiableGuideAligner",
     "generate_tile_boxes",
     "hann_window_2d",
     "run_tiled_2d",
+    "CrossAttentionFeatureUpsampler",
     "JointBilateralUpsampler",
     "ForwardPSFDownsampler",
+    "extract_multiscale_texture_descriptors",
     "joint_bilateral_upsample",
+    "ConformalCalibrator",
     "UncertaintyReport",
     "WelfordAccumulator",
     "compute_posterior_uncertainty",
@@ -128,6 +174,7 @@ __all__ = [
     "compute_physical_residual",
     "match_coarse_priors",
     "build_uncertainty_report",
+    "empirical_conformal_coverage",
     "expected_calibration_error",
     "brier_score",
     "sparsification_curve",
@@ -153,8 +200,12 @@ __all__ = [
     "refine_with_sam2",
     "CorrelativePhantom2D",
     "CorrelativePhantom3D",
+    "SpectralCubePhantom2D",
     "generate_correlative_phantom_2d",
     "generate_correlative_phantom_3d",
+    "generate_textured_isointensity_phantom_2d",
+    "generate_macroscopic_gradient_phantom_2d",
+    "generate_spectral_cube_phantom_2d",
     "OPEN_DATASETS",
     "OpenCorrelativeDataset",
     "list_open_datasets",

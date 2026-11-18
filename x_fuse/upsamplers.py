@@ -56,7 +56,7 @@ class ForwardPSFDownsampler(nn.Module):
 
     def __init__(
         self,
-        psf_sigma_ratio: float = 0.35,
+        psf_sigma_ratio: float = 0.5,
         learnable: bool = False,
         n_channels: int = 1,
     ):
@@ -336,3 +336,246 @@ def joint_bilateral_upsample(
         for _ in range(n_iters - 1):
             out = jbu_fine(out, hr_guidance)
     return out
+
+
+def extract_multiscale_texture_descriptors(guidance: torch.Tensor) -> torch.Tensor:
+    """Extract 8 ``D4``-equivariant HR structural & local-texture descriptor
+    channels ``(B, 8, H, W)`` from ``guidance`` ``(B, C_g, H, W)``:
+    ``[norm_intensity, grad_mag, grad_energy_3x3, lap_energy_3x3, mean_3x3,
+    std_3x3, mean_7x7, std_7x7]``.
+
+    Crucially, ``grad_energy_3x3``, ``lap_energy_3x3``, ``std_3x3``, and ``std_7x7``
+    are invariant to both ``90 deg`` TTA rotations/flips and sub-pixel precipitate
+    phase shifts, cleanly resolving boundaries between **iso-intensity textured
+    phases** where classical grayscale bilateral kernels are completely blind!
+    """
+    if guidance.ndim == 3:
+        guidance = guidance.unsqueeze(0)
+    bsz, _, height, width = guidance.shape
+    gray = guidance.float().mean(dim=1, keepdim=True)
+    g_min = gray.flatten(1).min(dim=1).values.view(bsz, 1, 1, 1)
+    g_max = gray.flatten(1).max(dim=1).values.view(bsz, 1, 1, 1)
+    norm_g = (gray - g_min) / (g_max - g_min).clamp(min=1e-6)
+
+    # Sobel gradient magnitude & pooled high-frequency texture energies
+    mode1 = "reflect" if min(height, width) > 1 else "replicate"
+    p1 = F.pad(norm_g, (1, 1, 1, 1), mode=mode1)
+    ky = (
+        torch.tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+            device=norm_g.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        / 4.0
+    )
+    kx = ky.transpose(-1, -2)
+    klap = (
+        torch.tensor(
+            [[[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]],
+            device=norm_g.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        / 4.0
+    )
+    grad_y = F.conv2d(p1, ky)
+    grad_x = F.conv2d(p1, kx)
+    grad_mag = (grad_y.square() + grad_x.square() + 1e-8).sqrt()
+    grad_energy3 = F.avg_pool2d(
+        F.pad(grad_mag, (1, 1, 1, 1), mode=mode1), kernel_size=3, stride=1
+    )
+    lap_abs = F.conv2d(p1, klap).abs()
+    lap_energy3 = F.avg_pool2d(
+        F.pad(lap_abs, (1, 1, 1, 1), mode=mode1), kernel_size=3, stride=1
+    )
+
+    # Local 3x3 and 7x7 mean & texture energy (standard deviation)
+    mean3 = F.avg_pool2d(p1, kernel_size=3, stride=1)
+    sq3 = F.avg_pool2d(F.pad(norm_g.square(), (1, 1, 1, 1), mode=mode1), 3, 1)
+    std3 = (sq3 - mean3.square()).clamp(min=0.0).sqrt()
+
+    pad7 = 3 if min(height, width) > 3 else 1
+    mode7 = "reflect" if min(height, width) > pad7 else "replicate"
+    k7 = 2 * pad7 + 1
+    mean7 = F.avg_pool2d(F.pad(norm_g, [pad7] * 4, mode=mode7), k7, 1)
+    sq7 = F.avg_pool2d(F.pad(norm_g.square(), [pad7] * 4, mode=mode7), k7, 1)
+    std7 = (sq7 - mean7.square()).clamp(min=0.0).sqrt()
+
+    desc = torch.cat(
+        [norm_g, grad_mag, grad_energy3, lap_energy3, mean3, std3, mean7, std7], dim=1
+    )
+    return desc
+
+
+class CrossAttentionFeatureUpsampler(nn.Module):
+    """``JAFAR``/``AnyUp``-inspired local HR-query cross-attention upsampler running
+    in ``O(H * W * K^2)`` memory without custom CUDA kernels.
+
+    Why this improves over classical ``JointBilateralUpsampler``:
+    1. Queries ``Q_HR(y, x)`` are formed from multi-scale HR structural + local
+       **texture energy** descriptors (``std_3x3``, ``std_7x7``, ``Laplacian``),
+       cleanly separating textured vs. smooth phases even when their mean
+       grayscale intensities are identical!
+    2. Works both **zero-shot (``learned=False``)** via scale-adaptive texture-aware
+       local attention and **end-to-end trainable (``learned=True``)** where HR
+       query/key projections and ViT token key adapters refine attention weights
+       under the physical forward-PSF loss—allowing native ViT stride (``14/16``)
+       without ``O((p/s)^4)`` sub-patch stride blowup.
+    """
+
+    def __init__(
+        self,
+        feat_dim: int | None = None,
+        key_dim: int = 16,
+        radius: int = 2,
+        sigma_spatial: float = 2.0,
+        temperature: float = 0.08,
+        learned: bool = False,
+    ) -> None:
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.key_dim = int(key_dim)
+        self.radius = int(radius)
+        self.diameter = 2 * self.radius + 1
+        self.learned = bool(learned)
+
+        if learned:
+            self.sigma_spatial = nn.Parameter(torch.tensor(float(sigma_spatial)))
+            self.log_inv_temp = nn.Parameter(
+                torch.tensor(math.log(1.0 / max(temperature, 1e-3)))
+            )
+            self.hr_query_stem: nn.Sequential | None = nn.Sequential(
+                nn.Conv2d(8, self.key_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(self.key_dim, self.key_dim, kernel_size=1),
+            )
+            self.vit_key_proj: nn.Conv2d | None = (
+                nn.Conv2d(feat_dim, self.key_dim, kernel_size=1)
+                if feat_dim is not None
+                else None
+            )
+            # Zero-init vit_key_proj so training starts from texture-guided keys
+            if self.vit_key_proj is not None:
+                nn.init.zeros_(self.vit_key_proj.weight)
+                if self.vit_key_proj.bias is not None:
+                    nn.init.zeros_(self.vit_key_proj.bias)
+        else:
+            self.register_buffer("sigma_spatial", torch.tensor(float(sigma_spatial)))
+            self.register_buffer(
+                "log_inv_temp",
+                torch.tensor(math.log(1.0 / max(temperature, 1e-3))),
+            )
+            self.hr_query_stem = None
+            self.vit_key_proj = None
+
+    def _spatial_log_prior(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        coords = torch.arange(-self.radius, self.radius + 1, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        dist2 = yy.square() + xx.square()
+        sig = self.sigma_spatial.to(device=device, dtype=dtype).abs().clamp(min=0.2)
+        return (-dist2 / (2.0 * sig.square())).reshape(
+            1, self.diameter * self.diameter, 1, 1
+        )
+
+    def _compute_attention_weights(
+        self,
+        hr_desc: torch.Tensor,
+        source_hr: torch.Tensor,
+        dilation: int,
+    ) -> torch.Tensor:
+        bsz, _, height, width = hr_desc.shape
+        if self.learned and self.hr_query_stem is not None:
+            q_map = F.normalize(self.hr_query_stem(hr_desc), dim=1)
+            k_map = q_map
+            if (
+                self.vit_key_proj is not None
+                and source_hr.shape[1] == self.vit_key_proj.in_channels
+            ):
+                k_map = F.normalize(q_map + self.vit_key_proj(source_hr), dim=1)
+        else:
+            # Weight local mean + multi-scale texture energies higher than raw speckles
+            ch_weights = torch.tensor(
+                [0.45, 0.35, 1.8, 1.8, 1.5, 2.5, 1.2, 2.5],
+                device=hr_desc.device,
+                dtype=torch.float32,
+            ).view(1, 8, 1, 1)
+            q_map = hr_desc * ch_weights
+            k_map = q_map
+
+        pad = self.radius * dilation
+        k_pad = F.pad(k_map, [pad] * 4, mode="reflect")
+        k_patches = F.unfold(
+            k_pad, kernel_size=self.diameter, dilation=dilation
+        ).reshape(bsz, q_map.shape[1], self.diameter * self.diameter, height, width)
+
+        inv_temp = (
+            self.log_inv_temp.to(device=hr_desc.device, dtype=torch.float32)
+            .exp()
+            .clamp(0.5, 500.0)
+        )
+        if self.learned and self.hr_query_stem is not None:
+            sim = (k_patches * q_map.unsqueeze(2)).sum(dim=1) * inv_temp
+        else:
+            diff2 = (k_patches - q_map.unsqueeze(2)).square().mean(dim=1)
+            sim = -inv_temp * diff2
+
+        logits = sim + self._spatial_log_prior(hr_desc.device, torch.float32)
+        return torch.softmax(logits, dim=1)  # (B, K*K, H, W)
+
+    def forward(
+        self,
+        source: torch.Tensor,
+        guidance: torch.Tensor,
+        output_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Upsample ``source`` ``(B, C, H_s, W_s)`` to ``guidance`` ``(B, C_g, H, W)``
+        (or optional ``output_size``) via multi-scale texture-aware cross-attention.
+        """
+        if guidance.ndim == 3:
+            guidance = guidance.unsqueeze(0)
+        if source.ndim == 3:
+            source = source.unsqueeze(0)
+        if output_size is not None and guidance.shape[-2:] != tuple(output_size):
+            guidance = F.interpolate(
+                guidance.float(),
+                size=output_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        bsz, src_ch, h_s, w_s = source.shape
+        _, _, target_h, target_w = guidance.shape
+        if guidance.shape[0] == 1 and bsz > 1:
+            guidance = guidance.expand(bsz, -1, -1, -1)
+
+        hr_desc = extract_multiscale_texture_descriptors(guidance)
+        hr_init = F.interpolate(
+            source.float(),
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        scale = max(target_h / max(h_s, 1), target_w / max(w_s, 1))
+        wide_dilation = max(1, int(round(0.55 * scale / max(self.radius, 1))))
+
+        def _apply_pass(inp: torch.Tensor, dil: int) -> torch.Tensor:
+            attn = self._compute_attention_weights(hr_desc, inp, dilation=dil)
+            pad = self.radius * dil
+            padded = F.pad(inp, [pad] * 4, mode="reflect")
+            chunk_sz = 64
+            chunks = []
+            for c0 in range(0, src_ch, chunk_sz):
+                c1 = min(c0 + chunk_sz, src_ch)
+                c_len = c1 - c0
+                unf = F.unfold(
+                    padded[:, c0:c1], kernel_size=self.diameter, dilation=dil
+                ).reshape(bsz, c_len, self.diameter * self.diameter, target_h, target_w)
+                chunks.append((unf * attn.unsqueeze(1)).sum(dim=2))
+            return torch.cat(chunks, dim=1)
+
+        out = _apply_pass(hr_init, wide_dilation)
+        if wide_dilation > 1:
+            out = _apply_pass(out, 1)
+        return out.to(source.dtype)

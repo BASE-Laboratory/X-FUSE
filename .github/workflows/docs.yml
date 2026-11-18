@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: docs-${{ github.ref }}
@@ -16,6 +16,8 @@ jobs:
   deploy:
     name: Build & Deploy MkDocs Site
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       NO_MKDOCS_2_WARNING: "1"
     steps:

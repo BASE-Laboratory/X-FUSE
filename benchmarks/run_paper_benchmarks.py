@@ -32,21 +32,32 @@ from scipy.ndimage import shift as nd_shift
 
 from x_fuse import (
     OPEN_DATASETS,
+    ConformalCalibrator,
     VolumetricFuser,
     XFuse,
     bicubic_upsample_baseline,
     brier_score,
     compute_segmentation_metrics,
     dino_kmeans_baseline,
+    empirical_conformal_coverage,
     expected_calibration_error,
     generate_correlative_phantom_2d,
     generate_correlative_phantom_3d,
+    generate_spectral_cube_phantom_2d,
+    generate_textured_isointensity_phantom_2d,
     jbu_guided_baseline,
     make_experimental_holdout,
     sparsification_curve,
     suggest_next_slices,
 )
 
+from .baselines import (
+    cnmf_pansharpen_baseline,
+    coordinate_inr_baseline,
+    gram_schmidt_pansharpen_baseline,
+    guided_variational_sr_baseline,
+    otsu_threshold_baseline,
+)
 from .dataset_adapters import (
     load_bundled_morgis_samples,
     load_bundled_zn13x_pairs,
@@ -105,11 +116,12 @@ def run_paper_benchmarks(
         "ablation_resolution_sweep": [],
         "drift_and_psf_ablation": [],
         "active_slice_tomography": {},
+        "v1_stress_tests": {},
         "synchrotron_samples": {},
         "zenodo_holdouts": {},
     }
 
-    # 1. Resolution-Gap & Multi-Scale Layer Ablation
+    # 1. Resolution-Gap, Competing Field Baselines & Multi-Scale Layer Ablation
     for factor in factors:
         ph = generate_correlative_phantom_2d(
             size=img_size,
@@ -120,10 +132,35 @@ def run_paper_benchmarks(
             seed=42,
         )
         gt = ph.gt_labels
+        otsu = otsu_threshold_baseline(ph.hr_image, ph.coarse_guide, mode="multiclass")
         bic = bicubic_upsample_baseline(
             ph.coarse_guide, (img_size, img_size), mode="multiclass"
         )
         jbu = jbu_guided_baseline(ph.hr_image, ph.coarse_guide, mode="multiclass")
+        gs = gram_schmidt_pansharpen_baseline(
+            ph.hr_image, ph.coarse_guide, mode="multiclass"
+        )
+        cnmf = cnmf_pansharpen_baseline(
+            ph.hr_image,
+            ph.coarse_guide,
+            mode="multiclass",
+            n_iters=15 if quick else 35,
+        )
+        gtv = guided_variational_sr_baseline(
+            ph.hr_image,
+            ph.coarse_guide,
+            mode="multiclass",
+            n_steps=20 if quick else 70,
+            device=device,
+        )
+        inr = coordinate_inr_baseline(
+            ph.hr_image,
+            ph.coarse_guide,
+            mode="multiclass",
+            hidden_dim=32 if quick else 64,
+            epochs=20 if quick else 80,
+            device=device,
+        )
 
         m_last = XFuse(
             backbone=backbone,
@@ -144,9 +181,11 @@ def run_paper_benchmarks(
             tta_shifts=tta_shifts,
         )
 
-        # Extract raw ViT features for unsupervised K-Means baseline
+        # Extract raw ViT features via compositional backbone_extractor for K-Means
         hr_prep, (oh, ow) = m_last._prepare_high_level_hr(ph.hr_image)
-        raw_feats = super(XFuse, m_last).forward_sequential(hr_prep)[:, :, :oh, :ow]
+        raw_feats = m_last.backbone_extractor.forward_sequential(hr_prep)[
+            :, :, :oh, :ow
+        ]
         km = dino_kmeans_baseline(raw_feats, ph.coarse_guide, n_clusters=3)
 
         m_multi = XFuse(
@@ -154,7 +193,8 @@ def run_paper_benchmarks(
             stride=stride,
             dtype=torch.float32,
             loss_fn="forward_psf_bce",
-            interpolation_mode="jbu",
+            interpolation_mode="cross_attn",
+            fusion_method="spatial_mlp",
             layers="multiscale",
             pretrained=pretrained,
             lr=1e-2,
@@ -168,8 +208,13 @@ def run_paper_benchmarks(
             tta_shifts=tta_shifts,
         )
 
+        met_otsu = compute_segmentation_metrics(otsu.hard_mask[0], gt)
         met_bic = compute_segmentation_metrics(bic.hard_mask[0], gt)
         met_jbu = compute_segmentation_metrics(jbu.hard_mask[0], gt)
+        met_gs = compute_segmentation_metrics(gs.hard_mask[0], gt)
+        met_cnmf = compute_segmentation_metrics(cnmf.hard_mask[0], gt)
+        met_gtv = compute_segmentation_metrics(gtv.hard_mask[0], gt)
+        met_inr = compute_segmentation_metrics(inr.hard_mask[0], gt)
         met_km = compute_segmentation_metrics(km.hard_mask[0], gt)
         met_last = compute_segmentation_metrics(rep_last.hard_mask[0], gt)
         met_multi = compute_segmentation_metrics(rep_multi.hard_mask[0], gt)
@@ -180,10 +225,16 @@ def run_paper_benchmarks(
         results["ablation_resolution_sweep"].append(
             {
                 "downsample_factor": factor,
+                "otsu_miou": round(met_otsu["iou"], 4),
                 "bicubic_miou": round(met_bic["iou"], 4),
                 "bicubic_bf1": round(met_bic["boundary_f1"], 4),
                 "jbu_miou": round(met_jbu["iou"], 4),
                 "jbu_bf1": round(met_jbu["boundary_f1"], 4),
+                "gram_schmidt_miou": round(met_gs["iou"], 4),
+                "cnmf_miou": round(met_cnmf["iou"], 4),
+                "guided_tv_miou": round(met_gtv["iou"], 4),
+                "guided_tv_bf1": round(met_gtv["boundary_f1"], 4),
+                "siren_inr_miou": round(met_inr["iou"], 4),
                 "vit_kmeans_miou": round(met_km["iou"], 4),
                 "xfuse_last_miou": round(met_last["iou"], 4),
                 "xfuse_last_bf1": round(met_last["boundary_f1"], 4),
@@ -332,6 +383,7 @@ def run_paper_benchmarks(
 
     # Active schedule starts from 2 boundary seed slices and greedily adds slices
     active_chosen = [1, vol_shape[0] - 2]
+    prev_active_rep: Any = None
     for b_idx, budget in enumerate(budgets):
         rand_idxs = sorted(
             rng.choice(vol_shape[0], size=budget, replace=False).tolist()
@@ -346,12 +398,13 @@ def run_paper_benchmarks(
 
         if b_idx > 0 and len(active_chosen) < budget:
             need = budget - len(active_chosen)
-            _, prev_rep = _eval_3d_schedule(active_chosen)
+            if prev_active_rep is None:
+                _, prev_active_rep = _eval_3d_schedule(active_chosen)
             rec = suggest_next_slices(
-                prev_rep, acquired_indices=active_chosen, k=need, min_spacing=2
+                prev_active_rep, acquired_indices=active_chosen, k=need, min_spacing=2
             )
             active_chosen = sorted(set(active_chosen + rec.recommended_indices))
-        a_iou, _ = _eval_3d_schedule(active_chosen[:budget])
+        a_iou, prev_active_rep = _eval_3d_schedule(active_chosen[:budget])
         active_mious.append(a_iou)
 
     results["active_slice_tomography"] = {
@@ -360,6 +413,153 @@ def run_paper_benchmarks(
         "uniform_miou": uniform_mious,
         "active_xfuse_miou": active_mious,
         "final_active_slices": active_chosen,
+    }
+
+    # 3b. v1.0 Stress Tests (Textured Iso-Intensity, 3D Spectral Cube, Conformal Sets)
+    ph_tex = generate_textured_isointensity_phantom_2d(
+        size=max(img_size, 64), downsample_factor=8, seed=55
+    )
+    otsu_tex = otsu_threshold_baseline(
+        ph_tex.hr_image, ph_tex.coarse_guide, mode="multiclass"
+    )
+    jbu_tex = jbu_guided_baseline(
+        ph_tex.hr_image, ph_tex.coarse_guide, mode="multiclass"
+    )
+    cnmf_tex = cnmf_pansharpen_baseline(
+        ph_tex.hr_image,
+        ph_tex.coarse_guide,
+        mode="multiclass",
+        n_iters=15 if quick else 35,
+    )
+    gtv_tex = guided_variational_sr_baseline(
+        ph_tex.hr_image,
+        ph_tex.coarse_guide,
+        mode="multiclass",
+        n_steps=20 if quick else 70,
+        device=device,
+    )
+    m_tex = XFuse(
+        backbone=backbone,
+        stride=stride,
+        dtype=torch.float32,
+        loss_fn="forward_psf_bce",
+        interpolation_mode="cross_attn",
+        learned_upsampler=True,
+        fusion_method="spatial_mlp",
+        debias_positional=True,
+        pretrained=pretrained,
+        lr=1.5e-2,
+        device=device,
+    )
+    rep_tex = m_tex.fit_predict(
+        ph_tex.hr_image,
+        ph_tex.coarse_guide,
+        epochs=max(epochs + 8, 20),
+        mode="multiclass",
+        tta_shifts=tta_shifts,
+    )
+
+    ph_spec = generate_spectral_cube_phantom_2d(
+        size=img_size,
+        downsample_factor=4,
+        n_spectral_bins=16,
+        mean_counts=45.0,
+        seed=99,
+    )
+    m_spec = XFuse(
+        backbone=backbone,
+        stride=stride,
+        dtype=torch.float32,
+        loss_fn="forward_psf_poisson",
+        interpolation_mode="cross_attn",
+        fusion_method="spatial_mlp",
+        spectral_channels=ph_spec.spectral_cube_lr.shape[0],
+        guide_channels=2,
+        pretrained=pretrained,
+        lr=1e-2,
+        device=device,
+    )
+    rep_spec = m_spec.fit_predict(
+        ph_spec.hr_image,
+        ph_spec.spectral_cube_lr,
+        epochs=epochs + 6,
+        mode="multiclass",
+        tta_shifts=tta_shifts,
+        spectral_unmix=True,
+        n_components=2,
+    )
+    pred_spec_np = rep_spec.hard_mask[0].cpu().numpy()
+    # Evaluate permutation-invariant foreground IoU for unsupervised NMF components
+    pred_swapped = pred_spec_np.copy()
+    pred_swapped[pred_spec_np == 1] = 2
+    pred_swapped[pred_spec_np == 2] = 1
+    spec_iou = max(
+        compute_segmentation_metrics(pred_spec_np, ph_spec.gt_labels)["iou"],
+        compute_segmentation_metrics(pred_swapped, ph_spec.gt_labels)["iou"],
+    )
+
+    # Split Conformal Coverage Curve across nominal miscoverage alpha
+    cal_split = np.zeros_like(ph_base.gt_labels, dtype=bool)
+    cal_split[:, : img_size // 2] = True
+    test_split = ~cal_split
+    conformal_curve: list[dict[str, float]] = []
+    probs_ref = rep_al.probabilities
+    gt_t = torch.from_numpy(ph_base.gt_labels).unsqueeze(0)
+    for alpha in (0.05, 0.10, 0.20):
+        cal = ConformalCalibrator(alpha=alpha, method="aps")
+        cal.calibrate_labels(
+            probs_ref, gt_t, cal_mask=torch.from_numpy(cal_split).unsqueeze(0)
+        )
+        p_sets, _ = cal.predict_sets_and_intervals(probs_ref)
+        cov_stats = empirical_conformal_coverage(
+            p_sets[:, :, test_split], gt_t[:, test_split]
+        )
+        conformal_curve.append(
+            {
+                "alpha": alpha,
+                "nominal_coverage": round(1.0 - alpha, 4),
+                "empirical_coverage": round(cov_stats["empirical_coverage"], 4),
+                "mean_set_size": round(cov_stats["mean_set_size"], 4),
+            }
+        )
+
+    results["v1_stress_tests"] = {
+        "textured_isointensity": {
+            "otsu_miou": round(
+                compute_segmentation_metrics(otsu_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
+            "jbu_miou": round(
+                compute_segmentation_metrics(jbu_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
+            "cnmf_miou": round(
+                compute_segmentation_metrics(cnmf_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
+            "guided_tv_miou": round(
+                compute_segmentation_metrics(gtv_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
+            "xfuse_cross_attn_miou": round(
+                compute_segmentation_metrics(rep_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
+        },
+        "spectral_cube_poisson": {
+            "unmixed_poisson_miou": round(spec_iou, 4),
+        },
+        "conformal_coverage": conformal_curve,
     }
 
     # 4. Bundled Synchrotron Samples (Zn13X Slices 4 & 9 + Tiled MOR-GIS Hold-Out)
@@ -444,11 +644,26 @@ def run_paper_benchmarks(
         for ds_key in OPEN_DATASETS:
             try:
                 sample = load_zenodo_correlative_sample(ds_key, auto_download=True)
-                hr_h, coarse_h, gt_h = make_experimental_holdout(
-                    sample.hr_image[:256, :256],
-                    sample.guide_map[:, :256, :256],
-                    factor=8,
-                )
+                h_tot, w_tot = sample.hr_image.shape[-2:]
+                gh_tot, gw_tot = sample.guide_map.shape[-2:]
+                crop_h = min(256, h_tot)
+                crop_w = min(256, w_tot)
+                if sample.is_full_res_ground_truth and (gh_tot, gw_tot) == (
+                    h_tot,
+                    w_tot,
+                ):
+                    hr_h, coarse_h, gt_h = make_experimental_holdout(
+                        sample.hr_image[:crop_h, :crop_w],
+                        sample.guide_map[:, :crop_h, :crop_w],
+                        factor=8,
+                    )
+                else:
+                    gc_h = max(4, int(round(crop_h * gh_tot / max(h_tot, 1))))
+                    gc_w = max(4, int(round(crop_w * gw_tot / max(w_tot, 1))))
+                    hr_h = sample.hr_image[:crop_h, :crop_w]
+                    coarse_h = sample.guide_map[:, :gc_h, :gc_w]
+                    gt_h = None
+
                 z_mod = XFuse(
                     backbone=backbone,
                     stride=stride,
@@ -464,13 +679,19 @@ def run_paper_benchmarks(
                 z_rep = z_mod.fit_predict(
                     hr_h, coarse_h, epochs=epochs, mode="multilabel"
                 )
-                pred_np = z_rep.probabilities[0].cpu().numpy()
-                mse_val = float(np.mean((pred_np - gt_h) ** 2))
-                results["zenodo_holdouts"][ds_key] = {
+                entry: dict[str, Any] = {
                     "channels": sample.channel_names,
-                    "holdout_8x_mse": round(mse_val, 5),
+                    "mean_physical_residual": round(
+                        float(z_rep.physical_residual.mean().item()), 5
+                    ),
                     "diagnostics": z_rep.diagnostics,
                 }
+                if gt_h is not None:
+                    pred_np = z_rep.probabilities[0].cpu().numpy()
+                    entry["holdout_8x_mse"] = round(
+                        float(np.mean((pred_np - gt_h) ** 2)), 5
+                    )
+                results["zenodo_holdouts"][ds_key] = entry
             except Exception as exc:  # pragma: no cover
                 results["zenodo_holdouts"][ds_key] = {"error": str(exc)}
 

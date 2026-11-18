@@ -10,8 +10,44 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    name: Verify Quality Gates & Version Match
+    runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: >-
+          uv sync --extra cpu --extra io --extra dev --extra docs
+          --index-strategy unsafe-best-match
+          --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Check tag matches x_fuse.__version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(uv run python -c 'import x_fuse; print(x_fuse.__version__)')"
+          echo "Tag version: ${TAG_VER}, Package version: ${PKG_VER}"
+          test "${TAG_VER}" = "${PKG_VER}"
+
+      - name: Run Ruff, Mypy, Docs & Coverage Test Gates
+        run: |
+          uv run ruff check x_fuse tests benchmarks
+          uv run ruff format --check x_fuse tests benchmarks
+          uv run mypy x_fuse
+          NO_MKDOCS_2_WARNING=1 uv run mkdocs build --strict -d /tmp/xfuse-rel-docs
+          uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=85 -q
+
   build:
     name: Build Distributions
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,3 +103,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
+

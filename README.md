@@ -8,7 +8,7 @@
 
 **X-FUSE** bridges the ubiquitous resolution-vs.-specificity trade-off in materials characterization. Across electron, X-ray, and neutron imaging, researchers routinely acquire a **high-resolution structural image** ($I_{\text{HR}}$, fast & sharp, but chemically ambiguous) alongside a **coarser or sparse physical/chemical guide modality** ($G_{\text{LR}}$, chemically or crystallographically specific, but 4×–32× coarser or restricted to sparse 2D slices).
 
-Unlike purely geometric foundation models (such as SAM/SAM2) that segment contrast boundaries without knowing chemical identity—or naive interpolation of coarse chemical maps—**X-FUSE** extracts dense sub-patch Vision Transformer features from $I_{\text{HR}}$, fuses $M$ physical guide channels simultaneously via a differentiable forward point-spread-function (PSF) operator, and outputs **calibrated high-resolution phase segmentations paired with pixel/voxel-level certainty maps**.
+Unlike purely geometric foundation models (such as SAM/SAM2) that segment contrast boundaries without knowing chemical identity—or naive interpolation of coarse chemical maps—**X-FUSE** extracts dense sub-patch Vision Transformer features from $I_{\text{HR}}$, fuses $M$ physical guide channels simultaneously via a differentiable forward point-spread-function (PSF) operator, and outputs **prior-matched high-resolution phase segmentations paired with pixel/voxel-level certainty maps and optional Split Conformal prediction sets**.
 
 ---
 
@@ -23,16 +23,13 @@ Unlike purely geometric foundation models (such as SAM/SAM2) that segment contra
 
 ---
 
-## Key Capabilities (v0.4.0)
+## Key Capabilities (v1.0.0)
 
-1. **100% Self-Contained Pure-PyTorch Package & 3-Line API**: Zero vendored external sub-repos or custom C++/CUDA compilation required. Run end-to-end normalized, padded, and calibrated correlative fusion in three lines via `XFuse(...).fit_predict(hr_image, coarse_guide)`.
-2. **Multi-Scale ViT Pyramid, Megapixel Tiling & TTA Caching**: Concatenate shallow boundary tokens with deep semantic tokens (`layers="multiscale"`), cache frozen TTA features across training epochs (`~10x–20x` speedup), and tile megapixel micrographs seamlessly via raised-cosine Hann blending (`tile_size=...`).
-3. **Differentiable Sub-Pixel Drift & Anisotropic PSF Learning**: Jointly compensate sample stage/beam drift (`align_guide="translation" | "rigid" | "affine"`) in the canonical HR frame while learning per-channel Gaussian interaction-volume PSF widths (`learn_psf=True`).
-4. **Tri-Part Certainty & Active Beamtime Steering**:
-   - **Chemical / Aleatoric Ambiguity**: Prior-calibrated posterior entropy and top-1 vs. top-2 probability margin.
-   - **Spatial / Epistemic Variance**: Online Welford variance across TTA views and orthogonal 2.5D planes in $O(1)$ extra memory.
-   - **Physical Forward-Model Residual**: $|\mathcal{D}(\hat{P}_{\text{HR}}) - G_{\text{LR}}|$, flagging contrast-invisible phases, paired with `suggest_next_slices` and `suggest_2d_rois` for live experiment steering.
-5. **Out-of-Core SuRVoS 2.5D Mode & Scientific I/O**: Lazy HDF5 / Zarr / TIFF-stack slice streaming (`VolumeSliceAccessor`), sparse-slice 2D → 3D propagation (`VolumetricFuser`), OME-TIFF / HDF5 / Zarr report export (`save_uncertainty_report`), and RosettaSciIO vendor microscopy readers (`.emd`, `.dm3`/`.dm4`, `.bcf`, `.hspy`).
+1. **Quantitative Physics Forward Model & Raw 3D Spectral Cube Unmixing**: Train directly against low-dose counting statistics via Poisson shot-noise deviance NLL (`loss_fn="forward_psf_poisson"`), enforce exact simplex conservation $\sum_k P_k = 1$ (`loss_fn="compositional_kl"`), or pass raw 3D `(E, H_lr, W_lr)` EDS / EELS / XRD spectral cubes directly (`spectral_unmix=True`) via differentiable SPA-seeded NMF (`SpectralUnmixingDictionary`).
+2. **Texture-Aware Cross-Attention Upsampling & Apositional Feature Debiasing**: Separate iso-intensity textured phases (e.g., lamellar precipitates vs. homogeneous matrix) with `CrossAttentionFeatureUpsampler` (`interpolation_mode="cross_attn"`) + `SpatialConvMLPHead` (`fusion_method="spatial_mlp"`), and eliminate ViT coordinate-ramp shortcut learning on macroscopic chemical gradients via `ApositionalFeatureDebiaser` (`debias_positional=True`).
+3. **Finite-Sample Split Conformal Prediction & Tri-Part Certainty**: Pair **aleatoric entropy**, **online $O(1)$-memory Welford TTA / tri-plane epistemic variance**, and **forward physical PSF residual** with distribution-free $(1 - \alpha)$ Split Conformal phase prediction sets (`conformal_alpha=0.10`, `ConformalCalibrator`) and active beamtime steering (`suggest_next_slices`, `suggest_2d_rois`).
+4. **Differentiable Rigid, Affine & Cubic B-Spline Registration**: Jointly compensate rigid stage drift or nonlinear SEM/STEM charging scan-distortion (`align_guide="translation" | "rigid" | "affine" | "bspline"`) with thin-plate bending energy regularization and Jacobian diffeomorphism diagnostics, alongside learnable per-channel PSF widths (`learn_psf=True`).
+5. **Megapixel Tiling, Lazy 2.5D Slice Streaming & Scientific I/O**: Pure-PyTorch package (pretrained DINOv2/ViT weights resolved reproducibly via `timm` or offline with `pretrained=False`), content-hashed frozen TTA feature caching across optimization steps, Hann-windowed 2D tiling (`tile_size=...`), lazy HDF5 / Zarr / TIFF-stack 2.5D input slice streaming (`VolumeSliceAccessor`, `VolumetricFuser`), OME-TIFF / HDF5 / Zarr report export, and RosettaSciIO vendor readers (`.emd`, `.dm3`/`.dm4`, `.bcf`, `.hspy`).
 
 ---
 
@@ -58,7 +55,7 @@ See [INSTALL.md](INSTALL.md) for optional extras (`io`, `docs`, `synthetic`, `sa
 
 ## Quickstart
 
-### 1. 3-Line 2D Multi-Channel Correlative Fusion + Drift/PSF Recovery
+### 1. 3-Line 2D Multi-Channel Correlative Fusion + Conformal Prediction Sets
 
 ```python
 from x_fuse import XFuse, generate_correlative_phantom_2d, save_uncertainty_report, suggest_2d_rois
@@ -66,17 +63,22 @@ from x_fuse import XFuse, generate_correlative_phantom_2d, save_uncertainty_repo
 phantom = generate_correlative_phantom_2d(size=128, downsample_factor=8)
 model = XFuse(
     backbone="dinov2_vits14",
+    interpolation_mode="cross_attn",
+    fusion_method="spatial_mlp",
+    debias_positional=True,
     layers="multiscale",
     align_guide="translation",
     learn_psf=True,
+    conformal_alpha=0.10,
     stride=4,
 )
 report = model.fit_predict(phantom.hr_image, phantom.coarse_guide, epochs=25, mode="multiclass")
 
 phase_mask = report.hard_mask[0]                             # (H, W) int64 phase IDs
+phase_sets_90 = report.prediction_sets[0]                    # (K, H, W) 90% conformal phase sets
 certainty = 1.0 - report.combined_uncertainty[0]             # (H, W) pixel certainty in [0, 1]
 rois = suggest_2d_rois(report, roi_size=(32, 32), k=2)       # Targeted re-acquisition windows
-save_uncertainty_report(report, "fused_report.ome.tif", pixel_size_um=0.05)
+save_uncertainty_report(report, "fused_report.h5", pixel_size_um=0.05)
 ```
 
 *(Low-level hooks `fuser.set_guide_transforms(...)`, `fuser.train_fusion_step(...)`, and `fuser.predict_with_uncertainty(...)` remain 100% supported for custom research loops.)*
@@ -89,27 +91,29 @@ from x_fuse import XFuse, VolumetricFuser, generate_correlative_phantom_3d, sugg
 phantom_3d = generate_correlative_phantom_3d(shape=(32, 64, 64), downsample_factor=4)
 vol_fuser = VolumetricFuser(XFuse(backbone="dinov2_vits14", stride=4))
 
-# Train on just 3 sparse 2D chemical/diffraction slices out of Z=32 (supports lazy HDF5/Zarr!)
+# Train on just 3 sparse 2D chemical/diffraction slices out of Z=32 (streams 2D slabs lazily from HDF5/Zarr!)
 sparse_slices = {4: phantom_3d.coarse_guide_3d[:, 1], 16: phantom_3d.coarse_guide_3d[:, 4], 28: phantom_3d.coarse_guide_3d[:, 7]}
 vol_fuser.fit_sparse_slices(phantom_3d.hr_volume, sparse_guides=sparse_slices, epochs=15, delta=1)
 
-# Propagate across the entire 3D volume via orthogonal XY + XZ + YZ tri-planes
+# Propagate across the 3D volume via 2.5D slabs or orthogonal XY + XZ + YZ tri-planes
 vol_report = vol_fuser.predict_volume(phantom_3d.hr_volume, mode="triplane", pred_mode="multiclass")
 plan = suggest_next_slices(vol_report, acquired_indices=list(sparse_slices), k=3, min_spacing=4)
 print("Next optimal z-slices to scan:", plan.recommended_indices)
 ```
 
-### 3. Reproducible Paper Benchmarks, Figures & Open Datasets
+### 3. Reproducible Paper Benchmarks, Competing Baselines & Open Datasets
+
+*(Note: `--quick` runs a fast offline CPU smoke check with unpretrained `timm:vit_tiny_patch16_224`; pass `--backbone dinov2_vitb14_reg --pretrained --device cuda` for full pretrained evaluations.)*
 
 ```bash
-# Run synthetic super-resolution, invisible-phase residual, sparsification & 2.5D suite
+# Run synthetic super-resolution, invisible-phase residual, sparsification & 2.5D smoke suite
 uv run python -m benchmarks.run_synthetic_suite --quick
 
-# Run paper ablation suite + vector PDF/PNG figure generation (multi-scale, drift/PSF, active 3D, Zn13X/MOR-GIS)
-uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir benchmarks/outputs/paper_quick
+# Run v1.0 paper benchmark + competing field baselines (Multi-Otsu, CNMF, Gram-Schmidt, Guided TV, SIREN INR) + PDF figures
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir benchmarks/outputs/paper_quick
 
-# Run full unit test suite (>=82% coverage gate)
-uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=82 -v
+# Run full unit test suite (>=85% coverage gate)
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=85 -v
 ```
 
 Fetch registered open correlative datasets from Zenodo (`edxia` SEM-EDS, HAADF-STEM-EDS/EELS, ISIS IMAT Bragg-Edge):
@@ -131,7 +135,8 @@ Once installed, the `xfuse` CLI provides environment diagnostics, Zenodo dataset
 xfuse info
 xfuse datasets
 xfuse demo --epochs 15
-xfuse fuse --hr data/samples/Zn13X/high_4.tiff --guide data/samples/Zn13X/low_4.tiff --output zn13x.ome.tif
+xfuse fuse --hr data/samples/Zn13X/high_4.tiff --guide data/samples/Zn13X/low_4.tiff \
+  --upsampler cross_attn --fusion-method spatial_mlp --conformal-alpha 0.10 --output zn13x.h5
 ```
 
 Interactive step-by-step notebooks (stored with outputs stripped) are available in [`notebooks/`](notebooks/):
@@ -146,30 +151,33 @@ Interactive step-by-step notebooks (stored with outputs stripped) are available 
 ```text
 X-FUSE/
 ├── x_fuse/
-│   ├── backbones.py      # Multi-layer ViT loader, sub-patch TTA & tiled extractor
-│   ├── fusion.py         # XFuse / CorrelativeFuser, 3-line API, TTA cache & gating
-│   ├── registration.py   # Differentiable sub-pixel translation/rigid/affine aligner
+│   ├── backbones.py      # Multi-layer ViT loader, ALiBi/NoPE support, TTA & tiled extractor
+│   ├── debias.py         # Apositional polynomial feature debiaser (`ApositionalFeatureDebiaser`)
+│   ├── heads.py          # LinearProbeHead, SpatialConvMLPHead & O(HW) WindowedGuideCrossAttention
+│   ├── physics.py        # Poisson NLL, simplex KL & 3D spectral cube NMF (`PhysicsForwardModel`)
+│   ├── fusion.py         # Compositional CorrelativeFuser (`XFuse`), 3-line API & TTA cache
+│   ├── registration.py   # Differentiable translation/rigid/affine & cubic B-spline aligner
 │   ├── tiling.py         # Hann-windowed overlapping 2D tile inference engine
-│   ├── upsamplers.py     # Scale-dilated JBU & learnable anisotropic ForwardPSFDownsampler
-│   ├── uncertainty.py    # Online Welford TTA variance, entropy, physical residual, ECE, AUSE
+│   ├── upsamplers.py     # CrossAttentionFeatureUpsampler, scale-dilated JBU & ForwardPSFDownsampler
+│   ├── uncertainty.py    # Split ConformalCalibrator, Welford TTA variance, entropy, residual, ECE
 │   ├── volumetric.py     # Lazy HDF5/Zarr 2.5D slice streaming, sparse 2D->3D & tri-plane
 │   ├── active.py         # Active sparse-slice (`suggest_next_slices`) & 2D ROI steering
 │   ├── io.py             # OME-TIFF / HDF5 / Zarr report I/O & RosettaSciIO vendor readers
 │   ├── segment.py        # Sign-aligned PCA+Otsu, JBU/bicubic/KMeans baselines, BF1, SAM2
-│   ├── synthetic.py      # Controlled 2D & 3D multi-phase correlative phantom generators
+│   ├── synthetic.py      # 2D/3D multiphase, textured iso-intensity, gradient & spectral phantoms
 │   ├── datasets.py       # Bundled sample locator, Zenodo fetcher & experimental hold-out tool
 │   ├── loaders.py        # XCT/XRD-CT HDF5/NeXus, SEM-EDS hypermaps & generic TIFF pairs
 │   ├── transforms.py     # Invertible sub-patch TTA & float32-native structural normalization
 │   ├── vit_patch.py      # ViT stride / pos-embed patching & TorchPCA
 │   └── cli.py            # `xfuse` CLI (`info`, `datasets`, `demo`, `fuse`)
 ├── docs/                 # MkDocs Material documentation (theory, modality recipes, API)
-├── benchmarks/           # Synthetic & paper ablation runners, Zenodo adapters & PDF plotters
+├── benchmarks/           # Paper benchmarks, CNMF/GS/TV/INR field baselines & PDF plotters
 ├── notebooks/            # Clean, output-stripped tutorial notebooks (01, 02, 03)
 ├── data/samples/         # Bundled Zn13X & MOR-GIS sample correlative slices
-├── tests/                # Comprehensive CPU & CUDA GPU pytest suite (>=82% coverage gate)
+├── tests/                # Comprehensive CPU & CUDA GPU pytest suite (>=85% coverage gate)
 └── Makefile              # Developer shortcuts: sync, format, lint, typecheck, docs-check, test
 ```
 
 ## Contributing, Citation & License
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for developer setup (`make lint`, `make typecheck`, `make test`) and [`CITATION.cff`](CITATION.cff) for software citation metadata. Released under the [MIT License](LICENSE) by the **BASE Laboratory**. Self-contained ViT patching, ALiBi attention, and JBU modules acknowledge inspiration and adapted components from [`HR-Dv2`](https://github.com/tldr-group/HR-Dv2), [`dino-saw`](https://github.com/tldr-group/dino-saw), and [`FeatUp`](https://github.com/mhamilton723/FeatUp).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for developer setup (`make lint`, `make typecheck`, `make test`) and [`CITATION.cff`](CITATION.cff) for software citation metadata. Released under the [MIT License](LICENSE) by the **BASE Laboratory**. Self-contained ViT patching, ALiBi attention, and feature upsampling modules acknowledge inspiration and adapted components from [`HR-Dv2`](https://github.com/tldr-group/HR-Dv2), [`dino-saw`](https://github.com/tldr-group/dino-saw), [`FeatUp`](https://github.com/mhamilton723/FeatUp), and [`JAFAR`](https://github.com/PaulCouairon/JAFAR).

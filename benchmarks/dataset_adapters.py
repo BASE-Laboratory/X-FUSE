@@ -90,6 +90,27 @@ def load_bundled_morgis_samples() -> list[CorrelativeSample]:
     return samples
 
 
+def _safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
+    """Extract ``zip_path`` into ``extract_dir`` while rejecting Zip-Slip path
+    traversal (``..`` or absolute paths) and symbolic link entries.
+    """
+    dest_root = extract_dir.resolve()
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == 0o120000:
+                raise ValueError(
+                    f"Refusing to extract symlink archive entry '{info.filename}'."
+                )
+            member_target = (dest_root / info.filename).resolve()
+            if not member_target.is_relative_to(dest_root):
+                raise ValueError(
+                    f"Unsafe Zip-Slip path '{info.filename}' escapes {dest_root}."
+                )
+        zf.extractall(dest_root)
+
+
 def _ensure_extracted(paths: list[Path]) -> Path:
     if not paths:
         raise FileNotFoundError("No files found in dataset directory.")
@@ -98,8 +119,7 @@ def _ensure_extracted(paths: list[Path]) -> Path:
         if p.suffix.lower() == ".zip":
             extract_dir = root / p.stem
             if not extract_dir.exists():
-                with zipfile.ZipFile(p, "r") as zf:
-                    zf.extractall(extract_dir)
+                _safe_extract_zip(p, extract_dir)
     return root
 
 

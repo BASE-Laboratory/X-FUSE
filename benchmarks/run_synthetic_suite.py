@@ -94,9 +94,7 @@ def _train_and_predict_xfuse_2d(
     rep = fuser.predict_with_uncertainty(
         hr_pad, guide_lr=guide_t, mode=mode, calibrate_to_guide=True
     )
-    raw_feats = super(CorrelativeFuser, fuser).forward_sequential(hr_pad)[
-        :, :, :orig_h, :orig_w
-    ]
+    raw_feats = fuser.forward_raw_features(hr_pad)[:, :, :orig_h, :orig_w]
     if fuser.learned_gating is not None:
         fuser.learned_gating.select_top_k(max(8, fuser.feat_dim // 4))
     gated_feats = fuser.forward_sequential(hr_pad)[:, :, :orig_h, :orig_w]

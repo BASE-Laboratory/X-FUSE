@@ -1,15 +1,32 @@
 # API Reference
 
-## High-Level & Core 2D Fusion (`x_fuse.fusion`)
+## High-Level & Compositional 2D Fusion (`x_fuse.fusion`, `x_fuse.heads`)
 
 ::: x_fuse.fusion
     options:
       members:
         - CorrelativeFuser
         - XFuse
-        - LearnedChannelGating
-        - SpatialCrossAttention
         - compute_channel_correlation_gates
+
+::: x_fuse.heads
+    options:
+      members:
+        - LinearProbeHead
+        - SpatialConvMLPHead
+        - WindowedGuideCrossAttentionHead
+        - edge_aware_tv_loss
+
+---
+
+## Quantitative Forward Physics & Spectral Unmixing (`x_fuse.physics`)
+
+::: x_fuse.physics
+    options:
+      members:
+        - PhysicsForwardModel
+        - SpectralUnmixingDictionary
+        - poisson_deviance_loss
 
 ---
 
@@ -26,13 +43,20 @@
 
 ---
 
-## Multi-Layer Backbones & Tiling (`x_fuse.backbones`, `x_fuse.tiling`)
+## Multi-Layer Backbones, Positional Debiasing & Tiling (`x_fuse.backbones`, `x_fuse.debias`, `x_fuse.tiling`)
 
 ::: x_fuse.backbones
     options:
       members:
         - HighResBackbone
         - load_backbone
+
+::: x_fuse.debias
+    options:
+      members:
+        - ApositionalFeatureDebiaser
+        - build_orthonormal_spatial_basis
+        - measure_positional_r2
 
 ::: x_fuse.tiling
     options:
@@ -43,7 +67,7 @@
 
 ---
 
-## Differentiable Co-Registration & Forward PSF (`x_fuse.registration`, `x_fuse.upsamplers`)
+## Differentiable Co-Registration & Feature Upsamplers (`x_fuse.registration`, `x_fuse.upsamplers`)
 
 ::: x_fuse.registration
     options:
@@ -53,17 +77,20 @@
 ::: x_fuse.upsamplers
     options:
       members:
+        - CrossAttentionFeatureUpsampler
         - ForwardPSFDownsampler
         - JointBilateralUpsampler
+        - extract_multiscale_texture_descriptors
         - joint_bilateral_upsample
 
 ---
 
-## Uncertainty Calibration & Active Acquisition (`x_fuse.uncertainty`, `x_fuse.active`)
+## Conformal Calibration, Uncertainty & Active Acquisition (`x_fuse.uncertainty`, `x_fuse.active`)
 
 ::: x_fuse.uncertainty
     options:
       members:
+        - ConformalCalibrator
         - UncertaintyReport
         - WelfordAccumulator
         - match_coarse_priors
@@ -71,6 +98,7 @@
         - compute_bald_mutual_information
         - compute_physical_residual
         - build_uncertainty_report
+        - empirical_conformal_coverage
         - expected_calibration_error
         - brier_score
         - sparsification_curve

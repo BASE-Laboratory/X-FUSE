@@ -14,9 +14,10 @@ import torch.nn.functional as F
 from timm import create_model
 from torch.nn.modules.utils import _pair
 
+from .debias import ApositionalFeatureDebiaser
 from .tiling import run_tiled_2d
 from .transforms import iden_partial
-from .upsamplers import JointBilateralUpsampler
+from .upsamplers import CrossAttentionFeatureUpsampler, JointBilateralUpsampler
 from .utils import get_alibi_model, get_dv3_model
 from .vit_patch import AttentionOptions, Patch
 
@@ -29,6 +30,7 @@ Interpolation: TypeAlias = Literal[
     "area",
     "nearest-exact",
     "jbu",
+    "cross_attn",
 ]
 LayerSelection: TypeAlias = Literal["last", "multiscale"] | Sequence[int]
 
@@ -83,6 +85,31 @@ def infer_vit_params(
     return 384, 16, 6
 
 
+_DINOV2_TIMM_MAP: dict[str, str] = {
+    "dinov2_vits14": "vit_small_patch14_dinov2",
+    "dinov2_vitb14": "vit_base_patch14_dinov2",
+    "dinov2_vitl14": "vit_large_patch14_dinov2",
+    "dinov2_vitg14": "vit_giant_patch14_dinov2",
+    "dinov2_vits14_reg": "vit_small_patch14_reg4_dinov2",
+    "dinov2_vits14_reg4": "vit_small_patch14_reg4_dinov2",
+    "dinov2_vitb14_reg": "vit_base_patch14_reg4_dinov2",
+    "dinov2_vitb14_reg4": "vit_base_patch14_reg4_dinov2",
+    "dinov2_vitl14_reg": "vit_large_patch14_reg4_dinov2",
+    "dinov2_vitl14_reg4": "vit_large_patch14_reg4_dinov2",
+    "dinov2_vitg14_reg": "vit_giant_patch14_reg4_dinov2",
+    "dinov2_vitg14_reg4": "vit_giant_patch14_reg4_dinov2",
+}
+_DINOV2_PINNED_HUB_REPO = (
+    "facebookresearch/dinov2:e1277af2ba9496fbadf7aec6eba56e8d882d1e35"
+)
+_DINO_PINNED_HUB_REPO = "facebookresearch/dino:cb711401860da580817918b9167ed73e3eef3dcf"
+
+
+def _is_timm_vit(model: nn.Module) -> bool:
+    """Return True when ``model`` is a ``timm`` VisionTransformer instance."""
+    return type(model).__module__.startswith("timm.")
+
+
 def load_backbone(
     dino_name: str,
     stride: int,
@@ -95,6 +122,18 @@ def load_backbone(
         return kwargs["backbone"]
 
     dev_str = str(device) if device is not None else "cpu"
+
+    if dino_name.startswith("alibi:") and "model_path" not in kwargs:
+        # Instantiate an un-checkpointed ALiBi-wrapped timm ViT directly!
+        from .alibi import MODEL_LIST, AlibiVitWrapper
+
+        spec = dino_name.split("alibi:", 1)[1] or MODEL_LIST[1]
+        return AlibiVitWrapper(
+            model_identifier=spec,
+            stride=stride,
+            device=dev_str,
+            pretrained=pretrained,
+        )
 
     if "alibi" in dino_name or "nope" in dino_name:
         model_path = kwargs["model_path"]
@@ -109,8 +148,14 @@ def load_backbone(
         timm_id = dino_name.split("timm:", 1)[1]
         return create_model(timm_id, pretrained=pretrained, dynamic_img_size=True)
 
+    use_torch_hub = bool(kwargs.get("use_torch_hub", False))
+    if not use_torch_hub and dino_name in _DINOV2_TIMM_MAP:
+        return create_model(
+            _DINOV2_TIMM_MAP[dino_name], pretrained=pretrained, dynamic_img_size=True
+        )
+
     if "dinov2" in dino_name:
-        return torch.hub.load("facebookresearch/dinov2", dino_name)
+        return torch.hub.load(_DINOV2_PINNED_HUB_REPO, dino_name, pretrained=pretrained)
 
     if "dinov3" in dino_name:
         lib_path = kwargs.get("lib_path")
@@ -121,7 +166,7 @@ def load_backbone(
         return torch.hub.load(lib_path, dino_name, source="local", weights=chk_path)
 
     if "dino" in dino_name:
-        return torch.hub.load("facebookresearch/dino:main", dino_name)
+        return torch.hub.load(_DINO_PINNED_HUB_REPO, dino_name, pretrained=pretrained)
 
     if "deit" in dino_name:
         return create_model(
@@ -137,8 +182,9 @@ def load_backbone(
 
 
 class HighResBackbone(nn.Module):
-    """Self-contained dense ViT feature extractor using sub-patch stride,
-    invertible TTA ensembles, and optional Joint Bilateral Upsampling (JBU)."""
+    """Self-contained dense ViT feature extractor supporting sub-patch stride,
+    invertible TTA ensembles, JBU or ``AnyUp``/``JAFAR``-style cross-attention
+    upsampling, and apositional coordinate-ramp debiasing."""
 
     def __init__(
         self,
@@ -152,6 +198,9 @@ class HighResBackbone(nn.Module):
         layers: LayerSelection = "last",
         tile_size: int | None = None,
         tile_overlap: int = 64,
+        debias_positional: bool = False,
+        debias_degree: int = 2,
+        learned_upsampler: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -164,18 +213,24 @@ class HighResBackbone(nn.Module):
         self.dinov2.eval()
 
         feat, patch, n_heads = infer_vit_params(dino_name, self.dinov2)
-        if "dinov2" not in dino_name:
+        if "dinov2" not in dino_name or _is_timm_vit(self.dinov2):
             dino_any: Any = self.dinov2
             if not hasattr(dino_any, "num_heads"):
                 dino_any.num_heads = n_heads
             if not hasattr(dino_any, "num_register_tokens"):
-                dino_any.num_register_tokens = 0
+                dino_any.num_register_tokens = int(
+                    getattr(dino_any, "num_reg_tokens", 0)
+                )
 
         self.original_patch_size: int = patch
         self.original_stride = _pair(patch)
         self.base_feat_dim: int = feat
         self.n_heads: int = n_heads
-        self.n_register_tokens: int = getattr(self.dinov2, "num_register_tokens", 0)
+        self.n_register_tokens: int = getattr(
+            self.dinov2,
+            "num_register_tokens",
+            getattr(self.dinov2, "num_reg_tokens", 0),
+        )
         self.layers_spec: LayerSelection = layers
         self._blocks_ref, self.layer_indices = self._resolve_layer_selection(
             self.dinov2, layers
@@ -196,6 +251,15 @@ class HighResBackbone(nn.Module):
         self.jbu_upsampler = JointBilateralUpsampler(
             guidance_dim=3, radius=2, sigma_spatial=1.5, sigma_range=0.15, learned=False
         )
+        self.cross_attn_upsampler = CrossAttentionFeatureUpsampler(
+            feat_dim=self.feat_dim,
+            key_dim=16,
+            radius=2,
+            learned=learned_upsampler,
+        )
+        self.debiaser = ApositionalFeatureDebiaser(
+            enabled=debias_positional, degree=debias_degree
+        )
         self.pca_dim = pca_dim
         self.do_pca = pca_dim > 3
 
@@ -208,6 +272,8 @@ class HighResBackbone(nn.Module):
         if device is not None:
             self.dinov2 = self.dinov2.to(device)
             self.jbu_upsampler = self.jbu_upsampler.to(device)
+            self.cross_attn_upsampler = self.cross_attn_upsampler.to(device)
+            self.debiaser = self.debiaser.to(device)
 
         self.track_grad = track_grad
         self.patch_last_block(self.dinov2, dino_name)
@@ -274,7 +340,7 @@ class HighResBackbone(nn.Module):
             dino_any.patch_embed.proj.stride = new_stride_pair
             if hasattr(dino_any.patch_embed, "strict_img_size"):
                 dino_any.patch_embed.strict_img_size = False
-            if self.dino_name.startswith("timm:"):
+            if self.dino_name.startswith("timm:") or _is_timm_vit(dino_model):
                 pe_mod = dino_any.patch_embed
 
                 def _subpatch_timm_pe_forward(
@@ -315,7 +381,7 @@ class HighResBackbone(nn.Module):
             dino_any.forward_feats_attn = MethodType(forward_feats_attn, dino_any)
             return
 
-        if dino_name.startswith("timm:"):
+        if dino_name.startswith("timm:") or _is_timm_vit(dino_model):
 
             def forward_feats_timm(self_model, x, masks=None, attn_choice="none"):
                 feats = self_model.forward_features(x)
@@ -381,10 +447,14 @@ class HighResBackbone(nn.Module):
         target_hw: tuple[int, int],
         guidance_img: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.interpolation_mode == "cross_attn" and guidance_img is not None:
+            return self.cross_attn_upsampler(patch_map, guidance_img)
         if self.interpolation_mode == "jbu" and guidance_img is not None:
             return self.jbu_upsampler(patch_map, guidance_img)
         mode = (
-            "bilinear" if self.interpolation_mode == "jbu" else self.interpolation_mode
+            "bilinear"
+            if self.interpolation_mode in ("jbu", "cross_attn")
+            else self.interpolation_mode
         )
         kwargs = {"align_corners": False} if mode in ("bilinear", "bicubic") else {}
         return F.interpolate(patch_map, size=target_hw, mode=mode, **kwargs)
@@ -497,16 +567,20 @@ class HighResBackbone(nn.Module):
 
     @torch.no_grad()
     def forward_sequential(
-        self, x: torch.Tensor, attn_choice: AttentionOptions = "none"
+        self,
+        x: torch.Tensor,
+        attn_choice: AttentionOptions = "none",
+        apply_debias: bool = True,
     ) -> torch.Tensor:
         """Extract dense TTA-averaged high-resolution features ``(1, C, H, W)``,
-        automatically tiling when ``self.tile_size`` is set.
+        automatically tiling when ``self.tile_size`` is set and applying full-FOV
+        apositional debiasing once after stitching (avoiding tile-boundary seams).
         """
         if (
             self.tile_size is not None
             and max(x.shape[-2], x.shape[-1]) > self.tile_size
         ):
-            return run_tiled_2d(
+            out = run_tiled_2d(
                 lambda tile: self._forward_single_tile(tile, attn_choice=attn_choice),
                 x,
                 tile_size=self.tile_size,
@@ -514,7 +588,9 @@ class HighResBackbone(nn.Module):
                 patch_size=self.original_patch_size,
                 stride=self.stride[0],
             )
-        return self._forward_single_tile(x, attn_choice=attn_choice)
+        else:
+            out = self._forward_single_tile(x, attn_choice=attn_choice)
+        return self.debiaser(out) if apply_debias else out
 
     @torch.no_grad()
     def forward(

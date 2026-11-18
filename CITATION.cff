@@ -1,8 +1,8 @@
 cff-version: 1.2.0
-title: "X-FUSE: Uncertainty-Aware Foundation-Model Fusion for 2D & 2.5D Correlative Materials Imaging"
+title: "X-FUSE: Physics-Guided Foundation-Model Feature Fusion & Conformal Uncertainty Quantification for Correlative Materials Imaging"
 message: "If you use X-FUSE in your research, please cite this software."
 type: software
-version: 0.2.0
+version: 1.0.0
 license: MIT
 repository-code: "https://github.com/BASE-Laboratory/X-FUSE"
 url: "https://github.com/BASE-Laboratory/X-FUSE"
@@ -15,6 +15,7 @@ keywords:
   - correlative microscopy
   - multimodal fusion
   - uncertainty quantification
+  - conformal prediction
   - vision transformers
   - X-ray tomography
   - XRD-CT

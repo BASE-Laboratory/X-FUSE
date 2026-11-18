@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x-fuse"
-version = "0.4.0"
-description = "Uncertainty-aware foundation-model fusion for 2D & 2.5D correlative materials imaging"
+version = "1.0.0"
+description = "Physics-guided foundation-model feature fusion and conformal uncertainty quantification for correlative materials imaging"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -18,11 +18,12 @@ keywords = [
     "correlative-microscopy",
     "tomography",
     "uncertainty-quantification",
+    "conformal-prediction",
     "vision-transformer",
     "multimodal-fusion",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",

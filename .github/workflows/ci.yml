@@ -75,7 +75,7 @@ jobs:
           --cov=x_fuse
           --cov-report=term-missing
           --cov-report=xml
-          --cov-fail-under=82
+          --cov-fail-under=85
           -v
 
       - name: Upload coverage report
