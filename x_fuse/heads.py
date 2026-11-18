@@ -32,12 +32,17 @@ def edge_aware_tv_loss(
     logits: torch.Tensor,
     guidance_hr: torch.Tensor | None = None,
     edge_beta: float = 10.0,
+    simplex: bool = False,
 ) -> torch.Tensor:
     """Anisotropic edge-aware Total Variation prior on HR ``logits`` ``(B, M, H, W)``.
     Smooths noisy sub-patch predictions inside homogeneous grains while relaxing
     smoothing across strong structural intensity or texture boundaries in ``I_HR``.
     """
-    probs = torch.sigmoid(logits.float())
+    if simplex:
+        bg = torch.zeros_like(logits[:, :1], dtype=torch.float32)
+        probs = F.softmax(torch.cat([bg, logits.float()], dim=1), dim=1)
+    else:
+        probs = torch.sigmoid(logits.float())
     dy = (probs[:, :, 1:, :] - probs[:, :, :-1, :]).abs()
     dx = (probs[:, :, :, 1:] - probs[:, :, :, :-1]).abs()
 
@@ -183,6 +188,7 @@ class SpatialConvMLPHead(nn.Module):
         learn_psf: bool = False,
         spectral_channels: int | None = None,
         tv_weight: float = 1e-3,
+        guide_residual: bool = False,
     ) -> None:
         super().__init__()
         self.feat_dim = int(feat_dim)
@@ -190,6 +196,7 @@ class SpatialConvMLPHead(nn.Module):
         self.out_channels = max(1, int(out_channels))
         self.loss_fn: LossOptions = loss_fn
         self.tv_weight = float(tv_weight)
+        self.guide_residual = bool(guide_residual)
 
         n_groups = 8 if (self.hidden_dim > 8 and self.hidden_dim % 8 == 0) else 1
         self.feat_norm = nn.GroupNorm(1, self.feat_dim)
@@ -211,6 +218,16 @@ class SpatialConvMLPHead(nn.Module):
         self.pw_conv = nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1)
         self.norm2 = nn.GroupNorm(n_groups, self.hidden_dim)
         self.out_proj = nn.Conv2d(self.hidden_dim * 2, self.out_channels, kernel_size=1)
+        self.pixel_proj = nn.Conv2d(8, self.out_channels, kernel_size=1)
+        nn.init.zeros_(self.pixel_proj.weight)
+        if self.pixel_proj.bias is not None:
+            nn.init.zeros_(self.pixel_proj.bias)
+        self.guide_alpha: nn.Parameter | None = None
+        if self.guide_residual:
+            self.guide_alpha = nn.Parameter(torch.ones(1, self.out_channels, 1, 1))
+            nn.init.zeros_(self.out_proj.weight)
+            if self.out_proj.bias is not None:
+                nn.init.zeros_(self.out_proj.bias)
 
         self.physics = PhysicsForwardModel(
             n_channels=self.out_channels,
@@ -225,9 +242,10 @@ class SpatialConvMLPHead(nn.Module):
 
     def _encode_hidden(
         self, features: torch.Tensor, guidance_hr: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         bsz, _, height, width = features.shape
         f_h = self.in_proj(self.feat_norm(features.float()))
+        tex_n: torch.Tensor | None = None
         if guidance_hr is not None:
             if guidance_hr.ndim == 3:
                 guidance_hr = guidance_hr.unsqueeze(0)
@@ -254,13 +272,56 @@ class SpatialConvMLPHead(nn.Module):
 
         h = F.gelu(self.norm1(f_h + t_h))
         res = self.pw_conv(F.gelu(self.dw_conv(h)))
-        return F.gelu(self.norm2(h + res)), t_h
+        return F.gelu(self.norm2(h + res)), t_h, tex_n
 
     def predict_logits(
         self, features: torch.Tensor, guidance_hr: torch.Tensor | None = None
     ) -> torch.Tensor:
-        h_out, t_h = self._encode_hidden(features, guidance_hr=guidance_hr)
-        return self.out_proj(torch.cat([h_out, t_h], dim=1))
+        h_out, t_h, tex_n = self._encode_hidden(features, guidance_hr=guidance_hr)
+        logits = self.out_proj(torch.cat([h_out, t_h], dim=1))
+        if tex_n is not None:
+            logits = logits + self.pixel_proj(tex_n)
+        return logits
+
+    def apply_guide_residual(
+        self,
+        logits_canon: torch.Tensor,
+        canon_guide: torch.Tensor | None,
+        valid_hr_hw: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Anchor canonical structural logits to the smooth coarse-guide prior so
+        macroscopic intra-grain chemical zonation invisible in ``I_HR`` is preserved
+        while ``SpatialConvMLPHead`` learns high-frequency boundary deconvolution.
+        """
+        if not self.guide_residual or canon_guide is None or self.guide_alpha is None:
+            return logits_canon
+        g = canon_guide.float().to(logits_canon.device)
+        if g.ndim == 2:
+            g = g.unsqueeze(0).unsqueeze(0)
+        elif g.ndim == 3:
+            g = g.unsqueeze(0)
+        if g.shape[1] != self.out_channels:
+            if (
+                self.physics.spectral_dict is not None
+                and g.shape[1] == self.physics.spectral_dict.spectral_channels
+            ):
+                g = self.physics.spectral_dict.project_cube(g)
+            else:
+                g = g[:, : self.out_channels]
+        full_h, full_w = int(logits_canon.shape[-2]), int(logits_canon.shape[-1])
+        oh, ow = valid_hr_hw if valid_hr_hw is not None else (full_h, full_w)
+        g_hr = F.interpolate(g, size=(oh, ow), mode="bilinear", align_corners=False)
+        if self.loss_fn == "compositional_kl":
+            bg_hr = (1.0 - g_hr.sum(dim=1, keepdim=True)).clamp(1e-4, 1.0)
+            prior = torch.log(g_hr.clamp(1e-4, 1.0) / bg_hr)
+        else:
+            prior = torch.logit(g_hr.clamp(1e-4, 1.0 - 1e-4))
+        scaled_prior = self.guide_alpha.to(logits_canon.device) * prior
+        if (oh, ow) != (full_h, full_w):
+            scaled_prior = F.pad(
+                scaled_prior, (0, full_w - ow, 0, full_h - oh), mode="replicate"
+            )
+        return logits_canon + scaled_prior
 
     def compute_loss_from_logits(
         self,
@@ -292,7 +353,9 @@ class SpatialConvMLPHead(nn.Module):
         )
         if self.tv_weight > 0.0 and min(tv_logits.shape[-2], tv_logits.shape[-1]) >= 4:
             base_loss = base_loss + self.tv_weight * edge_aware_tv_loss(
-                tv_logits, guidance_hr=tv_guidance
+                tv_logits,
+                guidance_hr=tv_guidance,
+                simplex=(self.loss_fn == "compositional_kl"),
             )
         return base_loss
 
@@ -307,6 +370,7 @@ class SpatialConvMLPHead(nn.Module):
         loss_mask_lr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         logits = self.predict_logits(features, guidance_hr=guidance_hr)
+        logits = self.apply_guide_residual(logits, xrd_map, valid_hr_hw=valid_hr_hw)
         return self.compute_loss_from_logits(
             logits,
             xrd_map=xrd_map,
@@ -361,6 +425,7 @@ class WindowedGuideCrossAttentionHead(nn.Module):
         self.loss_fn: LossOptions = loss_fn
         self.max_kv_grid = max(4, int(max_kv_grid))
 
+        self.feat_norm = nn.GroupNorm(1, self.feat_dim)
         self.xrd_to_query = nn.Linear(self.guide_channels, self.feat_dim)
         self.feat_query_proj = nn.Conv2d(self.feat_dim, self.feat_dim, kernel_size=1)
         self.attention = nn.MultiheadAttention(
@@ -409,7 +474,12 @@ class WindowedGuideCrossAttentionHead(nn.Module):
         """Modulate ``features`` ``(B, C, H, W)`` in ``O(H * W * K_pool)`` memory."""
         bsz, channels, height, width = features.shape
         orig_dtype = features.dtype
-        feat_f = features.float()
+        feat_raw = features.float()
+        feat_f = (
+            self.feat_norm(feat_raw)
+            if feat_raw.shape[0] * height * width > 1
+            else feat_raw
+        )
 
         guide = self._prepare_guide(xrd_map, (height, width)).to(device=features.device)
         guide_flat = guide.reshape(guide.shape[0], guide.shape[1], -1).permute(0, 2, 1)

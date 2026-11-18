@@ -326,6 +326,7 @@ class CorrelativeFuser(nn.Module):
         conformal_method: Literal["lac", "aps"] = "lac",
         spectral_channels: int | None = None,
         tv_weight: float = 1e-3,
+        guide_residual: bool = False,
         tile_size: int | None = None,
         tile_overlap: int = 64,
         cache_features: bool = True,
@@ -376,6 +377,7 @@ class CorrelativeFuser(nn.Module):
         self.learn_psf: bool = bool(learn_psf)
         self.learned_upsampler: bool = bool(learned_upsampler)
         self.tv_weight: float = float(tv_weight)
+        self.guide_residual: bool = bool(guide_residual)
         self.cache_features: bool = bool(cache_features)
         self.conformal_alpha: float | None = conformal_alpha
         self.conformal_method: Literal["lac", "aps"] = conformal_method
@@ -611,6 +613,7 @@ class CorrelativeFuser(nn.Module):
                 learn_psf=self.learn_psf,
                 spectral_channels=spectral_channels,
                 tv_weight=self.tv_weight,
+                guide_residual=self.guide_residual,
             )
             if device is not None:
                 self.spatial_mlp = self.spatial_mlp.to(device)
@@ -1073,6 +1076,9 @@ class CorrelativeFuser(nn.Module):
                     )
                 logits_canon = self.inverse_transforms[i](logits_tr)
                 if isinstance(head_mod, SpatialConvMLPHead):
+                    logits_canon = head_mod.apply_guide_residual(
+                        logits_canon, canon_guide, valid_hr_hw=valid_hr_hw
+                    )
                     loss = head_mod.compute_loss_from_logits(
                         logits_canon,
                         xrd_map=canon_guide,
@@ -1641,6 +1647,10 @@ class CorrelativeFuser(nn.Module):
         mean_logits, epistemic_prob_var = self._predict_logits_and_var_maybe_tiled(
             x, guide_lr, top_k=top_k, valid_hr_hw=valid_hr_hw
         )
+        if self.xrd_fuse_method == "spatial_mlp" and self.spatial_mlp is not None:
+            mean_logits = self.spatial_mlp.apply_guide_residual(
+                mean_logits, guide_lr, valid_hr_hw=valid_hr_hw
+            )
 
         phys = self._active_physics()
         if self.loss_fn == "compositional_kl" and phys is not None:
@@ -1894,6 +1904,10 @@ class CorrelativeFuser(nn.Module):
             mean_logits, epi_var = self._predict_logits_and_var_maybe_tiled(
                 hr_prepared, bound_g, valid_hr_hw=valid_hw
             )
+            if self.xrd_fuse_method == "spatial_mlp" and self.spatial_mlp is not None:
+                mean_logits = self.spatial_mlp.apply_guide_residual(
+                    mean_logits, bound_g, valid_hr_hw=valid_hw
+                )
             mean_logits = mean_logits[:, :, :orig_h, :orig_w]
             epi_var = epi_var[:, :, :orig_h, :orig_w]
             n_g = int(ref_g.shape[1])

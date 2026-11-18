@@ -9,6 +9,7 @@ import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from scipy.ndimage import gaussian_filter
@@ -266,6 +267,7 @@ def make_experimental_holdout(
     psf_sigma: float | None = None,
     poisson_counts: float | None = None,
     seed: int = 0,
+    beam_profile: Literal["gaussian", "moffat", "boxcar"] = "gaussian",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create a realistic coarse-guide input from a full-resolution experimental
     chemical/crystallographic map (e.g., STEM-EDS, SEM-EDS, EELS, Bragg-edge) so
@@ -276,18 +278,29 @@ def make_experimental_holdout(
         hr_image: High-resolution structural image ``(H, W)`` or ``(C, H, W)``.
         full_guide_map: Full-resolution guide map ``(H, W)`` or ``(M, H, W)``.
         factor: Spatial binning / coarse step ratio (>= 1).
-        psf_sigma: Gaussian interaction-volume / probe blur sigma in HR pixels
+        psf_sigma: Characteristic probe / interaction-volume blur width in HR pixels
             (defaults to ``0.5 * factor``).
         poisson_counts: Optional mean photon/electron count per coarse pixel to
             simulate low-dose shot noise.
         seed: Random seed for reproducible Poisson noise.
+        beam_profile: Physical probe kernel shape: ``"gaussian"`` (default),
+            ``"moffat"`` (heavy-tailed Lorentzian/Moffat synchrotron/EDS wings
+            ``(1 + r^2 / alpha^2)^(-beta)`` for testing forward-PSF mismatch),
+            or ``"boxcar"`` (pure flat detector/slit integration without pre-blur).
 
     Returns:
         Tuple ``(hr_cropped, coarse_guide, gt_guide_cropped)`` where spatial
         dimensions are cropped to exact multiples of ``factor``.
     """
+    from scipy.ndimage import convolve
+
     if factor < 1:
         raise ValueError(f"factor must be >= 1, got {factor}")
+    if beam_profile not in ("gaussian", "moffat", "boxcar"):
+        raise ValueError(
+            f"Unsupported beam_profile {beam_profile!r}; "
+            "expected 'gaussian', 'moffat', or 'boxcar'."
+        )
 
     guide = np.asarray(full_guide_map, dtype=np.float32)
     squeeze_guide = False
@@ -311,12 +324,23 @@ def make_experimental_holdout(
 
     sigma = 0.5 * factor if psf_sigma is None and factor > 1 else (psf_sigma or 0.0)
     blurred = np.empty_like(guide_crop)
-    for m in range(guide_crop.shape[0]):
-        blurred[m] = (
-            gaussian_filter(guide_crop[m], sigma=sigma, mode="nearest")
-            if sigma > 0
-            else guide_crop[m]
+    if beam_profile == "boxcar" or sigma <= 0:
+        blurred[:] = guide_crop
+    elif beam_profile == "moffat":
+        rad = max(1, int(round(3.0 * sigma)))
+        yy, xx = np.meshgrid(
+            np.arange(-rad, rad + 1, dtype=np.float32),
+            np.arange(-rad, rad + 1, dtype=np.float32),
+            indexing="ij",
         )
+        alpha_m = max(float(sigma) * 0.85, 0.25)
+        kern = (1.0 + (yy**2 + xx**2) / (alpha_m**2)) ** (-1.75)
+        kern = (kern / kern.sum()).astype(np.float32)
+        for m in range(guide_crop.shape[0]):
+            blurred[m] = convolve(guide_crop[m], kern, mode="nearest")
+    else:
+        for m in range(guide_crop.shape[0]):
+            blurred[m] = gaussian_filter(guide_crop[m], sigma=sigma, mode="nearest")
 
     # Physical box-integration / average-pooling onto coarse dwell grid
     n_m = blurred.shape[0]

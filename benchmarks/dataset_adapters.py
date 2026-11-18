@@ -61,7 +61,8 @@ def load_bundled_zn13x_pairs() -> list[CorrelativeSample]:
 
 def load_bundled_morgis_samples() -> list[CorrelativeSample]:
     """Load bundled MOR-GIS synchrotron XCT zeolite micrographs paired with
-    multi-phase attenuation reference maps for high-resolution tiling tests.
+    semi-synthetic multi-phase attenuation percentile maps (for tiling and
+    attenuation-consistency smoke tests rather than independent chemical holdout).
     """
     mg_dir = get_sample_dataset_path("MOR-GIS")
     samples: list[CorrelativeSample] = []
@@ -82,7 +83,8 @@ def load_bundled_morgis_samples() -> list[CorrelativeSample]:
                 is_full_res_ground_truth=True,
                 metadata={
                     "hr_modality": "Synchrotron XCT",
-                    "guide_modality": "Multi-phase reference",
+                    "guide_modality": "Semi-synthetic XCT percentile reference",
+                    "semi_synthetic": True,
                     "source_file": png_path.name,
                 },
             )
