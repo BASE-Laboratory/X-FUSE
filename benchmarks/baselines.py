@@ -34,6 +34,31 @@ from x_fuse.upsamplers import ForwardPSFDownsampler
 from x_fuse.utils import guide_to_tensor
 
 
+def _hr_to_pan_tensor(
+    hr_image: np.ndarray | torch.Tensor, device: str | torch.device = "cpu"
+) -> torch.Tensor:
+    """Convert 2D ``(H, W)``, channels-first ``(C, H, W)``, or channels-last
+    ``(H, W, C)`` structural image into a normalized ``[0, 1]`` 2D tensor.
+    """
+    hr_t = (
+        hr_image.detach().clone().float().to(device)
+        if isinstance(hr_image, torch.Tensor)
+        else torch.from_numpy(np.asarray(hr_image, dtype=np.float32)).to(device)
+    )
+    hr_t = torch.nan_to_num(hr_t, nan=0.0, posinf=1.0, neginf=0.0)
+    if hr_t.ndim == 4:
+        hr_t = hr_t[0]
+    if hr_t.ndim == 3:
+        if hr_t.shape[-1] in (1, 2, 3, 4) and hr_t.shape[0] > 4 and hr_t.shape[1] > 4:
+            hr_t = hr_t.mean(dim=-1)
+        else:
+            hr_t = hr_t.mean(dim=0)
+    if hr_t.ndim != 2:
+        raise ValueError(f"Expected 2D or 3D hr_image, got shape {tuple(hr_t.shape)}.")
+    span = (hr_t.max() - hr_t.min()).clamp(min=1e-6)
+    return (hr_t - hr_t.min()) / span
+
+
 def _probs_to_report(
     probs_fg: torch.Tensor,
     guide_t: torch.Tensor,
@@ -65,15 +90,9 @@ def gram_schmidt_pansharpen_baseline(
     mode: Literal["multiclass", "multilabel"] = "multiclass",
 ) -> UncertaintyReport:
     """Gram-Schmidt orthogonal component-substitution pan-sharpening."""
-    hr_np = (
-        hr_image.detach().cpu().float().numpy()
-        if isinstance(hr_image, torch.Tensor)
-        else np.asarray(hr_image, dtype=np.float32)
-    )
-    if hr_np.ndim == 3:
-        hr_np = hr_np.mean(axis=0)
-    h_hr, w_hr = hr_np.shape
-    pan = (hr_np - hr_np.min()) / max(float(hr_np.max() - hr_np.min()), 1e-6)
+    pan_t = _hr_to_pan_tensor(hr_image, device="cpu")
+    pan = pan_t.numpy()
+    h_hr, w_hr = pan.shape
 
     g_t = guide_to_tensor(coarse_guide, normalize=True)  # (1, M, H_lr, W_lr)
     ms_up = F.interpolate(g_t, size=(h_hr, w_hr), mode="bicubic", align_corners=False)[
@@ -110,41 +129,35 @@ def cnmf_pansharpen_baseline(
     mode: Literal["multiclass", "multilabel"] = "multiclass",
     n_endmembers: int = 4,
     n_iters: int = 35,
+    device: str | torch.device = "cpu",
 ) -> UncertaintyReport:
     """Coupled Non-negative Matrix Factorization (CNMF, Yokoya et al.) fusing
     multi-band structural intensity channels ``[I_HR, 1 - I_HR, I_HR^2]`` with
     coarse physical guide ``G_LR``.
     """
-    hr_np = (
-        hr_image.detach().cpu().float().numpy()
-        if isinstance(hr_image, torch.Tensor)
-        else np.asarray(hr_image, dtype=np.float32)
-    )
-    if hr_np.ndim == 3:
-        hr_np = hr_np.mean(axis=0)
-    h_hr, w_hr = hr_np.shape
-    pan = (hr_np - hr_np.min()) / max(float(hr_np.max() - hr_np.min()), 1e-6)
+    pan = _hr_to_pan_tensor(hr_image, device=device)
+    h_hr, w_hr = int(pan.shape[0]), int(pan.shape[1])
     # Construct non-negative HR radiometric observation matrix Y_M: (C_hr, N_hr)
-    hr_bands = np.stack([pan, 1.0 - pan, pan**2, (1.0 - pan) ** 2], axis=0).astype(
-        np.float32
-    )
-    y_hr = torch.from_numpy(hr_bands.reshape(4, -1)).clamp(min=1e-5)
+    hr_bands = torch.stack([pan, 1.0 - pan, pan**2, (1.0 - pan) ** 2], dim=0)
+    y_hr = hr_bands.reshape(4, -1).clamp(min=1e-5)
 
-    g_t = guide_to_tensor(coarse_guide, normalize=True)  # (1, M, H_lr, W_lr)
+    g_t = guide_to_tensor(coarse_guide, device=device, normalize=True)
     m_ch = int(g_t.shape[1])
     height_lr, width_lr = int(g_t.shape[2]), int(g_t.shape[3])
-    # Augment coarse guide with implicit matrix channel (1 - max_m G_m)
-    bg_lr = (1.0 - g_t[0].amax(dim=0, keepdim=True)).clamp(0.0, 1.0)
+    # Augment coarse guide with simplex matrix residual (1 - sum_m G_m)
+    bg_lr = (1.0 - g_t[0].sum(dim=0, keepdim=True)).clamp(0.0, 1.0)
     y_lr_4d = torch.cat([bg_lr, g_t[0]], dim=0).unsqueeze(0)  # (1, M+1, H_lr, W_lr)
     c_lr = m_ch + 1
     y_lr = y_lr_4d.reshape(c_lr, -1).clamp(min=1e-5)  # (C_lr, N_lr)
 
     k_end = max(c_lr, int(n_endmembers))
     gen = torch.Generator(device="cpu").manual_seed(0)
-    dict_lr = torch.rand((c_lr, k_end), generator=gen) + 0.1
+    dict_lr = (torch.rand((c_lr, k_end), generator=gen) + 0.1).to(device)
     # Anchor first c_lr endmembers to identity-like pure phases
-    dict_lr[:, :c_lr] = torch.eye(c_lr) + 0.05
-    h_lr_ab = torch.full((k_end, height_lr * width_lr), 1.0 / k_end)
+    dict_lr[:, :c_lr] = torch.eye(c_lr, device=device) + 0.05
+    h_lr_ab = torch.full(
+        (k_end, height_lr * width_lr), 1.0 / k_end, device=device, dtype=torch.float32
+    )
 
     eps = 1e-7
     for _ in range(max(5, n_iters)):
@@ -171,9 +184,9 @@ def cnmf_pansharpen_baseline(
 
     # Estimate HR spectral response W_HR: (4, K) via pooled HR bands vs H_LR
     hr_pooled = F.adaptive_avg_pool2d(
-        torch.from_numpy(hr_bands).unsqueeze(0), output_size=(height_lr, width_lr)
+        hr_bands.unsqueeze(0), output_size=(height_lr, width_lr)
     ).reshape(4, -1)
-    dict_hr = torch.rand((4, k_end), generator=gen) + 0.1
+    dict_hr = (torch.rand((4, k_end), generator=gen) + 0.1).to(device)
     for _ in range(max(5, n_iters)):
         dict_hr = dict_hr * (
             (hr_pooled @ h_lr_ab.T) / (dict_hr @ (h_lr_ab @ h_lr_ab.T)).clamp(min=eps)
@@ -188,8 +201,8 @@ def cnmf_pansharpen_baseline(
 
     recon_hr = (dict_lr @ h_hr_ab).reshape(1, c_lr, h_hr, w_hr)
     recon_hr = recon_hr / recon_hr.sum(dim=1, keepdim=True).clamp(min=eps)
-    probs_fg = recon_hr[:, 1:].clamp(0.0, 1.0)
-    return _probs_to_report(probs_fg, g_t, mode=mode, method_name="cnmf")
+    probs_fg = recon_hr[:, 1:].clamp(0.0, 1.0).cpu()
+    return _probs_to_report(probs_fg, g_t.cpu(), mode=mode, method_name="cnmf")
 
 
 def guided_variational_sr_baseline(
@@ -207,15 +220,8 @@ def guided_variational_sr_baseline(
     ``||D_Sigma(P_HR) - G_LR||_2^2 + tv_weight * TV_{w(I_HR)}(P_HR)``.
     """
     steps = int(n_steps) if n_steps is not None else int(n_iters)
-    hr_t = (
-        hr_image.detach().clone().float().to(device)
-        if isinstance(hr_image, torch.Tensor)
-        else torch.from_numpy(np.asarray(hr_image, dtype=np.float32)).to(device)
-    )
-    if hr_t.ndim == 3:
-        hr_t = hr_t.mean(dim=0)
-    h_hr, w_hr = int(hr_t.shape[0]), int(hr_t.shape[1])
-    pan = (hr_t - hr_t.min()) / (hr_t.max() - hr_t.min()).clamp(min=1e-6)
+    pan = _hr_to_pan_tensor(hr_image, device=device)
+    h_hr, w_hr = int(pan.shape[0]), int(pan.shape[1])
 
     g_t = guide_to_tensor(coarse_guide, device=device, normalize=True)
     lr_hw = (int(g_t.shape[-2]), int(g_t.shape[-1]))
@@ -224,8 +230,16 @@ def guided_variational_sr_baseline(
     ).clamp(0.02, 0.98)
     logits = nn.Parameter(torch.log(init_up / (1.0 - init_up)))
 
-    wy = torch.exp(-15.0 * (pan[1:, :] - pan[:-1, :]).abs()).view(1, 1, h_hr - 1, w_hr)
-    wx = torch.exp(-15.0 * (pan[:, 1:] - pan[:, :-1]).abs()).view(1, 1, h_hr, w_hr - 1)
+    wy = (
+        torch.exp(-15.0 * (pan[1:, :] - pan[:-1, :]).abs()).view(1, 1, h_hr - 1, w_hr)
+        if h_hr >= 2
+        else None
+    )
+    wx = (
+        torch.exp(-15.0 * (pan[:, 1:] - pan[:, :-1]).abs()).view(1, 1, h_hr, w_hr - 1)
+        if w_hr >= 2
+        else None
+    )
     ds = ForwardPSFDownsampler().to(device)
     opt = torch.optim.Adam([logits], lr=lr)
 
@@ -234,9 +248,13 @@ def guided_variational_sr_baseline(
             opt.zero_grad()
             probs = torch.sigmoid(logits)
             fid = F.mse_loss(ds(probs, lr_hw), g_t)
-            dy = (probs[:, :, 1:, :] - probs[:, :, :-1, :]).abs()
-            dx = (probs[:, :, :, 1:] - probs[:, :, :, :-1]).abs()
-            tv = (wy * dy).mean() + (wx * dx).mean()
+            tv = torch.zeros((), device=probs.device, dtype=probs.dtype)
+            if wy is not None:
+                dy = (probs[:, :, 1:, :] - probs[:, :, :-1, :]).abs()
+                tv = tv + (wy * dy).mean()
+            if wx is not None:
+                dx = (probs[:, :, :, 1:] - probs[:, :, :, :-1]).abs()
+                tv = tv + (wx * dx).mean()
             loss = fid + float(tv_weight) * tv
             loss.backward()
             opt.step()
@@ -250,7 +268,12 @@ def guided_variational_sr_baseline(
 
 class _SineLayer(nn.Module):
     def __init__(
-        self, in_dim: int, out_dim: int, omega_0: float = 15.0, is_first: bool = False
+        self,
+        in_dim: int,
+        out_dim: int,
+        omega_0: float = 30.0,
+        is_first: bool = False,
+        generator: torch.Generator | None = None,
     ):
         super().__init__()
         self.omega_0 = float(omega_0)
@@ -259,7 +282,10 @@ class _SineLayer(nn.Module):
             bound = (
                 (1.0 / in_dim) if is_first else (math.sqrt(6.0 / in_dim) / self.omega_0)
             )
-            self.linear.weight.uniform_(-bound, bound)
+            w = torch.empty_like(self.linear.weight, device="cpu").uniform_(
+                -bound, bound, generator=generator
+            )
+            self.linear.weight.copy_(w)
             self.linear.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -278,21 +304,23 @@ def coordinate_inr_baseline(
 ) -> UncertaintyReport:
     """``SIREN`` Implicit Neural Representation baseline mapping continuous
     coordinates + structural intensity ``(y, x, I_HR(y, x))`` to HR phase logits
-    supervised strictly through ``ForwardPSFDownsampler``.
+    supervised strictly through ``ForwardPSFDownsampler`` without mutating global
+    PyTorch RNG state.
     """
-    torch.manual_seed(int(seed))
-    hr_t = (
-        hr_image.detach().clone().float().to(device)
-        if isinstance(hr_image, torch.Tensor)
-        else torch.from_numpy(np.asarray(hr_image, dtype=np.float32)).to(device)
-    )
-    if hr_t.ndim == 3:
-        hr_t = hr_t.mean(dim=0)
-    h_hr, w_hr = int(hr_t.shape[0]), int(hr_t.shape[1])
-    pan = (hr_t - hr_t.min()) / (hr_t.max() - hr_t.min()).clamp(min=1e-6)
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+    pan = _hr_to_pan_tensor(hr_image, device=device)
+    h_hr, w_hr = int(pan.shape[0]), int(pan.shape[1])
 
-    ys = torch.linspace(-1.0, 1.0, h_hr, device=device)
-    xs = torch.linspace(-1.0, 1.0, w_hr, device=device)
+    ys = (
+        torch.linspace(-1.0, 1.0, h_hr, device=device)
+        if h_hr > 1
+        else torch.zeros(1, device=device)
+    )
+    xs = (
+        torch.linspace(-1.0, 1.0, w_hr, device=device)
+        if w_hr > 1
+        else torch.zeros(1, device=device)
+    )
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
     coords_in = torch.stack([yy, xx, 2.0 * pan - 1.0], dim=-1).reshape(-1, 3)
 
@@ -300,11 +328,21 @@ def coordinate_inr_baseline(
     m_ch = int(g_t.shape[1])
     lr_hw = (int(g_t.shape[-2]), int(g_t.shape[-1]))
 
-    net = nn.Sequential(
-        _SineLayer(3, hidden_dim, omega_0=12.0, is_first=True),
-        _SineLayer(hidden_dim, hidden_dim, omega_0=12.0),
-        nn.Linear(hidden_dim, m_ch),
-    ).to(device)
+    with torch.random.fork_rng(devices=[]):
+        last_lin = nn.Linear(hidden_dim, m_ch)
+        with torch.no_grad():
+            b_out = math.sqrt(6.0 / hidden_dim) / 30.0
+            w_out = torch.empty_like(last_lin.weight, device="cpu").uniform_(
+                -b_out, b_out, generator=gen
+            )
+            last_lin.weight.copy_(w_out)
+            last_lin.bias.zero_()
+
+        net = nn.Sequential(
+            _SineLayer(3, hidden_dim, omega_0=30.0, is_first=True, generator=gen),
+            _SineLayer(hidden_dim, hidden_dim, omega_0=30.0, generator=gen),
+            last_lin,
+        ).to(device)
     ds = ForwardPSFDownsampler().to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
 

@@ -132,8 +132,11 @@ def _cmd_fuse(
     fusion_method: FusionOptions = "learned_gating",
     loss_fn: LossOptions = "forward_psf_bce",
     upsampler: Interpolation = "jbu",
+    learned_upsampler: bool = False,
     debias_positional: bool = False,
     conformal_alpha: float | None = None,
+    spectral_unmix: bool = False,
+    n_components: int | None = None,
     layers: Literal["last", "multiscale"] = "last",
     align_guide: AlignMode = "none",
     learn_psf: bool = False,
@@ -144,6 +147,22 @@ def _cmd_fuse(
     device: str = "cpu",
     pixel_size_um: float | None = None,
 ) -> int:
+    if stride < 1:
+        raise ValueError(f"--stride must be >= 1, got {stride}.")
+    if epochs < 1:
+        raise ValueError(f"--epochs must be >= 1, got {epochs}.")
+    if conformal_alpha is not None and not (0.0 < conformal_alpha < 1.0):
+        raise ValueError(
+            f"--conformal-alpha must lie strictly in (0, 1), got {conformal_alpha}."
+        )
+    if tile_size is not None and tile_size < 16:
+        raise ValueError(f"--tile-size must be >= 16, got {tile_size}.")
+    if not hr_path.exists():
+        raise FileNotFoundError(f"High-resolution input file not found: {hr_path}")
+    for gp in guide_paths:
+        if not gp.exists():
+            raise FileNotFoundError(f"Coarse guide file not found: {gp}")
+
     hr_arr, _ = load_microscopy_file(hr_path)
     g_list = []
     names = []
@@ -160,6 +179,13 @@ def _cmd_fuse(
             raise ValueError(f"Unsupported guide array shape {g_arr.shape} from {gp}.")
 
     guide_stack = np.stack(g_list, axis=0).astype(np.float32)
+    spec_ch = int(guide_stack.shape[0]) if spectral_unmix else None
+    g_ch = (
+        int(n_components or 2) if spectral_unmix else max(1, int(guide_stack.shape[0]))
+    )
+    if spectral_unmix:
+        names = [f"component_{i}" for i in range(g_ch)]
+
     layer_sel: LayerSelection = layers
     model = XFuse(
         backbone=backbone,
@@ -167,7 +193,10 @@ def _cmd_fuse(
         stride=stride,
         dtype=torch.float32,
         loss_fn=loss_fn,
+        guide_channels=g_ch,
+        spectral_channels=spec_ch,
         interpolation_mode=upsampler,
+        learned_upsampler=learned_upsampler,
         debias_positional=debias_positional,
         conformal_alpha=conformal_alpha,
         pretrained=pretrained,
@@ -178,7 +207,14 @@ def _cmd_fuse(
         tile_size=tile_size,
         device=device,
     )
-    rep = model.fit_predict(hr_arr, guide_stack, epochs=epochs, mode="auto")
+    rep = model.fit_predict(
+        hr_arr,
+        guide_stack,
+        epochs=epochs,
+        mode="auto",
+        spectral_unmix=spectral_unmix,
+        n_components=n_components,
+    )
     ch_names = (
         ["background"] + names
         if rep.probabilities.shape[1] == len(names) + 1
@@ -244,7 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         nargs="+",
         required=True,
-        help="One or more coarse physical guide files.",
+        help="One or more coarse physical guide files (or 3D spectral cube).",
     )
     p_fuse.add_argument(
         "--output",
@@ -272,8 +308,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_fuse.add_argument(
         "--upsampler",
-        choices=["jbu", "cross_attn", "bilinear", "nearest-exact"],
+        choices=[
+            "jbu",
+            "cross_attn",
+            "bilinear",
+            "bicubic",
+            "nearest",
+            "nearest-exact",
+            "area",
+        ],
         default="jbu",
+    )
+    p_fuse.add_argument(
+        "--learned-upsampler",
+        action="store_true",
+        help="Jointly fine-tune CrossAttentionFeatureUpsampler projections.",
     )
     p_fuse.add_argument(
         "--debias-positional",
@@ -284,7 +333,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--conformal-alpha",
         type=float,
         default=None,
-        help="Optional miscoverage level alpha (e.g. 0.10 for 90%% conformal sets).",
+        help="Optional miscoverage level alpha in (0, 1) (e.g. 0.10 for 90%% sets).",
+    )
+    p_fuse.add_argument(
+        "--spectral-unmix",
+        action="store_true",
+        help="Unmix a raw 3D spectral/diffraction cube via NMF + forward model.",
+    )
+    p_fuse.add_argument(
+        "--n-components",
+        type=int,
+        default=None,
+        help="Number of unmixed components when --spectral-unmix is set.",
     )
     p_fuse.add_argument("--layers", choices=["last", "multiscale"], default="last")
     p_fuse.add_argument(
@@ -312,6 +372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "datasets":
         return _cmd_datasets(as_json=bool(args.json))
     if args.command == "demo":
+        if args.epochs < 1:
+            raise ValueError(f"--epochs must be >= 1, got {args.epochs}.")
         return _cmd_demo(
             output_path=args.output,
             dino_name=args.dino_name,
@@ -328,8 +390,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             fusion_method=args.fusion_method,
             loss_fn=args.loss,
             upsampler=args.upsampler,
+            learned_upsampler=bool(args.learned_upsampler),
             debias_positional=bool(args.debias_positional),
             conformal_alpha=args.conformal_alpha,
+            spectral_unmix=bool(args.spectral_unmix),
+            n_components=args.n_components,
             layers=args.layers,
             align_guide=args.align_guide,
             learn_psf=bool(args.learn_psf),

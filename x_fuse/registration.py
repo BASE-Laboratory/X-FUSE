@@ -73,14 +73,29 @@ class DifferentiableGuideAligner(nn.Module):
         else:
             self.register_parameter("raw_control_grid", None)
 
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        """Reset all warp parameters back to the identity transform."""
+        for p in (
+            self.raw_shift,
+            self.raw_angle,
+            self.raw_scale_shear,
+            self.raw_control_grid,
+        ):
+            if p is not None:
+                p.zero_()
+
     def _build_theta(
         self,
         batch_size: int,
         lr_hw: tuple[int, int],
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        hr_hw: tuple[int, int] | None = None,
     ) -> torch.Tensor:
-        """Construct ``(B, 2, 3)`` normalized grid_sample affine matrices."""
+        """Construct ``(B, 2, 3)`` normalized grid_sample affine matrices with
+        pixel-isotropic Euclidean rotation on non-square images.
+        """
         h_lr, w_lr = max(lr_hw[0], 1), max(lr_hw[1], 1)
         if self.mode == "none":
             eye = torch.tensor(
@@ -113,6 +128,13 @@ class DifferentiableGuideAligner(nn.Module):
             theta = torch.stack([row0, row1], dim=0)
             return theta.unsqueeze(0).expand(batch_size, -1, -1)
 
+        # Conjugate pixel-space rotation into [-1, 1]^2 normalized coordinates
+        eff_h, eff_w = (
+            (max(hr_hw[0], 1), max(hr_hw[1], 1)) if hr_hw is not None else (h_lr, w_lr)
+        )
+        aspect_h_over_w = float(eff_h) / float(eff_w)
+        aspect_w_over_h = float(eff_w) / float(eff_h)
+
         assert self.raw_angle is not None
         ang = -self.max_rotation_rad * torch.tanh(
             self.raw_angle[0].to(device=device, dtype=dtype)
@@ -121,8 +143,8 @@ class DifferentiableGuideAligner(nn.Module):
         sin_a = torch.sin(ang)
 
         if self.mode == "rigid":
-            row0 = torch.stack([cos_a, -sin_a, tx])
-            row1 = torch.stack([sin_a, cos_a, ty])
+            row0 = torch.stack([cos_a, -sin_a * aspect_h_over_w, tx])
+            row1 = torch.stack([sin_a * aspect_w_over_h, cos_a, ty])
             theta = torch.stack([row0, row1], dim=0)
             return theta.unsqueeze(0).expand(batch_size, -1, -1)
 
@@ -134,8 +156,12 @@ class DifferentiableGuideAligner(nn.Module):
         sy = 1.0 + ss[1]
         shx = ss[2]
         shy = ss[3]
-        row0 = torch.stack([sx * cos_a + shx * sin_a, -sx * sin_a + shx * cos_a, tx])
-        row1 = torch.stack([sy * sin_a + shy * cos_a, sy * cos_a - shy * sin_a, ty])
+        a00 = sx * cos_a + shx * sin_a
+        a01 = (-sx * sin_a + shx * cos_a) * aspect_h_over_w
+        a10 = (sy * sin_a + shy * cos_a) * aspect_w_over_h
+        a11 = sy * cos_a - shy * sin_a
+        row0 = torch.stack([a00, a01, tx])
+        row1 = torch.stack([a10, a11, ty])
         theta = torch.stack([row0, row1], dim=0)
         return theta.unsqueeze(0).expand(batch_size, -1, -1)
 
@@ -146,24 +172,37 @@ class DifferentiableGuideAligner(nn.Module):
         device: torch.device,
         dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        """Evaluate smooth bicubic B-spline inverse sampling displacement field
-        ``(1, H, W, 2)`` in normalized ``[-1, 1]`` ``(x, y)`` coordinates.
+        """Evaluate smooth zero-mean bicubic B-spline inverse sampling displacement
+        field ``(1, H, W, 2)`` in normalized ``[-1, 1]`` ``(x, y)`` coordinates,
+        capped by the Choi-Lee knot-spacing bound to guarantee ``det(J) > 0``.
         """
         assert self.raw_control_grid is not None
         h_lr, w_lr = max(lr_hw[0], 1), max(lr_hw[1], 1)
-        max_ty = 2.0 * self.max_shift_coarse_px / float(h_lr)
-        max_tx = 2.0 * self.max_shift_coarse_px / float(w_lr)
+        diffeo_cap = 0.22 * (2.0 / float(max(self.control_grid_size, 1)))
+        max_ty = min(2.0 * self.max_shift_coarse_px / float(h_lr), diffeo_cap)
+        max_tx = min(2.0 * self.max_shift_coarse_px / float(w_lr), diffeo_cap)
 
-        ctrl = torch.tanh(self.raw_control_grid.to(device=device, dtype=dtype))
+        raw = self.raw_control_grid.to(device=device, dtype=dtype)
+        ctrl = torch.tanh(raw - raw.mean(dim=(-2, -1), keepdim=True))
+        # Orthogonalize against raw_shift and re-bound sup-norm <= 1
+        ctrl = ctrl - ctrl.mean(dim=(-2, -1), keepdim=True)
+        ctrl = ctrl / ctrl.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1.0)
+
         # Channel 0 = dy, Channel 1 = dx in forward image space -> negate for sampling
         disp_y = -max_ty * ctrl[:, 0:1]
         disp_x = -max_tx * ctrl[:, 1:2]
         ctrl_xy = torch.cat([disp_x, disp_y], dim=1)  # (1, 2, Gy, Gx)
+        # Separable [1, 2, 1]/4 B-spline prefilter suppresses Keys bicubic overshoot
+        k1d = torch.tensor([0.25, 0.5, 0.25], device=device, dtype=dtype)
+        k2d = torch.outer(k1d, k1d).view(1, 1, 3, 3).expand(2, 1, 3, 3)
+        ctrl_smooth = F.conv2d(
+            F.pad(ctrl_xy, (1, 1, 1, 1), mode="replicate"), k2d, groups=2
+        )
         dense_xy = F.interpolate(
-            ctrl_xy,
+            ctrl_smooth,
             size=hr_hw,
             mode="bicubic",
-            align_corners=True,
+            align_corners=False,
         )
         return dense_xy.permute(0, 2, 3, 1)  # (1, H, W, 2)
 
@@ -177,7 +216,11 @@ class DifferentiableGuideAligner(nn.Module):
     ) -> torch.Tensor:
         """Build complete ``(B, H, W, 2)`` sampling grid in normalized coords."""
         theta = self._build_theta(
-            batch_size=batch_size, lr_hw=lr_hw, device=device, dtype=torch.float32
+            batch_size=batch_size,
+            lr_hw=lr_hw,
+            device=device,
+            dtype=torch.float32,
+            hr_hw=hr_hw,
         )
         grid = F.affine_grid(
             theta, [batch_size, channels, hr_hw[0], hr_hw[1]], align_corners=False
@@ -211,14 +254,19 @@ class DifferentiableGuideAligner(nn.Module):
         return warped.to(hr_map.dtype)
 
     def regularization_loss(
-        self, lr_hw: tuple[int, int], device: torch.device
+        self,
+        lr_hw: tuple[int, int],
+        device: torch.device,
+        hr_hw: tuple[int, int] | None = None,
     ) -> torch.Tensor:
-        """Prior nudging global warp toward identity and penalizing second-order
-        thin-plate bending energy ``||d^2 u||_2^2`` for ``mode="bspline"``.
+        """Prior nudging global warp toward identity and penalizing knot-scaled
+        thin-plate bending energy plus Jacobian folding barrier for ``mode="bspline"``.
         """
         if self.mode == "none" or self.reg_weight <= 0.0:
             return torch.zeros((), device=device, dtype=torch.float32)
-        theta = self._build_theta(1, lr_hw=lr_hw, device=device, dtype=torch.float32)[0]
+        theta = self._build_theta(
+            1, lr_hw=lr_hw, device=device, dtype=torch.float32, hr_hw=hr_hw
+        )[0]
         eye = torch.tensor(
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], device=device, dtype=torch.float32
         )
@@ -226,6 +274,8 @@ class DifferentiableGuideAligner(nn.Module):
 
         if self.mode == "bspline" and self.raw_control_grid is not None:
             u = torch.tanh(self.raw_control_grid.to(device=device, dtype=torch.float32))
+            u = u - u.mean(dim=(-2, -1), keepdim=True)
+            knot_scale = ((self.control_grid_size - 1) / 2.0) ** 2
             d2y = u[:, :, 2:, :] - 2.0 * u[:, :, 1:-1, :] + u[:, :, :-2, :]
             d2x = u[:, :, :, 2:] - 2.0 * u[:, :, :, 1:-1] + u[:, :, :, :-2]
             dyx = (
@@ -235,12 +285,26 @@ class DifferentiableGuideAligner(nn.Module):
                 + u[:, :, :-1, :-1]
             )
             bend = (
-                d2y.square().mean()
-                + d2x.square().mean()
-                + 2.0 * dyx.square().mean()
+                knot_scale
+                * (
+                    d2y.square().mean()
+                    + d2x.square().mean()
+                    + 2.0 * dyx.square().mean()
+                )
                 + 0.05 * u.square().mean()
             )
-            base_pen = base_pen + 5.0 * bend
+
+            eval_hw = (
+                (min(max(hr_hw[0], 8), 64), min(max(hr_hw[1], 8), 64))
+                if hr_hw is not None
+                else (min(max(lr_hw[0] * 4, 8), 64), min(max(lr_hw[1] * 4, 8), 64))
+            )
+            grid_j = self.build_sampling_grid(1, 1, eval_hw, lr_hw, device=device)[0]
+            dg_dx = (grid_j[:-1, 1:, :] - grid_j[:-1, :-1, :]) * (0.5 * eval_hw[1])
+            dg_dy = (grid_j[1:, :-1, :] - grid_j[:-1, :-1, :]) * (0.5 * eval_hw[0])
+            det_j = dg_dx[..., 0] * dg_dy[..., 1] - dg_dx[..., 1] * dg_dy[..., 0]
+            fold_barrier = F.relu(0.15 - det_j).square().mean()
+            base_pen = base_pen + 0.5 * bend + 25.0 * fold_barrier
 
         return self.reg_weight * base_pen
 
@@ -251,11 +315,10 @@ class DifferentiableGuideAligner(nn.Module):
         """Compute minimum spatial Jacobian determinant of the sampling map over
         ``hr_hw`` (``> 0`` certifies a diffeomorphic fold-free warp).
         """
-        if self.mode == "none":
+        if self.mode == "none" or hr_hw[0] < 2 or hr_hw[1] < 2:
             return 1.0
         grid = self.build_sampling_grid(1, 1, hr_hw, lr_hw, device=device)[0]  # (H,W,2)
-        h_hr, w_hr = max(hr_hw[0], 2), max(hr_hw[1], 2)
-        # Finite differences normalized by step size (2 / H, 2 / W)
+        h_hr, w_hr = hr_hw[0], hr_hw[1]
         step_x = 2.0 / float(w_hr)
         step_y = 2.0 / float(h_hr)
         dg_dx = (grid[:-1, 1:, :] - grid[:-1, :-1, :]) / step_x

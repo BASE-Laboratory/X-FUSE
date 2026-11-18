@@ -136,11 +136,15 @@ def generate_correlative_phantom_3d(
     hr_noise_std: float = 0.06,
     poisson_counts: float | None = 150.0,
     seed: int = 123,
+    shape_zyx: tuple[int, int, int] | None = None,
 ) -> CorrelativePhantom3D:
     """Synthesize a 3D multi-phase porous/composite volume ``(Z, Y, X)`` with
     anisotropic or isotropic 3D correlation lengths for benchmarking 2D slice-by-slice
     vs. SuRVoS 2.5D slab & orthogonal tri-plane fusion."""
-    z_dim, y_dim, x_dim = ((d // downsample_factor) * downsample_factor for d in shape)
+    eff_shape = shape_zyx if shape_zyx is not None else shape
+    z_dim, y_dim, x_dim = (
+        (d // downsample_factor) * downsample_factor for d in eff_shape
+    )
     rng = np.random.default_rng(seed)
 
     field_a = gaussian_filter(

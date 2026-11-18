@@ -93,6 +93,20 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
 }
 
 
+_ORIG_URLRETRIEVE = urllib.request.urlretrieve
+
+
+def _stream_hash(path: Path, algorithm: str = "md5", chunk_size: int = 262_144) -> str:
+    h = hashlib.new(algorithm)
+    with path.open("rb") as fh:
+        while True:
+            block = fh.read(chunk_size)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
 def get_repo_root() -> Path:
     """Return the root directory of the repository."""
     return Path(__file__).resolve().parent.parent
@@ -100,8 +114,13 @@ def get_repo_root() -> Path:
 
 def get_sample_dataset_path(name: str = "Zn13X") -> Path:
     """Locate bundled sample slices (``Zn13X`` or ``MOR-GIS``) in ``data/samples``."""
-    samples_root = get_repo_root() / "data" / "samples"
-    candidate = samples_root / str(name)
+    samples_root = (get_repo_root() / "data" / "samples").resolve()
+    raw_name = str(name)
+    if not raw_name or "/" in raw_name or "\\" in raw_name or ".." in raw_name:
+        raise ValueError(f"Invalid sample dataset name '{name}'.")
+    candidate = (samples_root / raw_name).resolve()
+    if not candidate.is_relative_to(samples_root):
+        raise ValueError(f"Sample dataset '{name}' escapes {samples_root}.")
     if not candidate.exists():
         available = [p.name for p in samples_root.glob("*")]
         raise FileNotFoundError(
@@ -119,8 +138,11 @@ def fetch_open_dataset(
     dataset_key: str,
     dest_root: str | Path | None = None,
     filenames: Iterable[str] | None = None,
+    timeout: float = 60.0,
 ) -> list[Path]:
-    """Download files for a registered Zenodo dataset with MD5 verification."""
+    """Download files for a registered Zenodo dataset with HTTPS, path-traversal,
+    timeout, and streaming checksum verification.
+    """
     if dataset_key not in OPEN_DATASETS:
         raise KeyError(
             f"Unknown dataset '{dataset_key}'. Choose from {list(OPEN_DATASETS)}"
@@ -132,33 +154,72 @@ def fetch_open_dataset(
         else get_repo_root() / "data" / "downloads" / dataset_key
     )
     target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir_resolved = target_dir.resolve()
 
     api_url = f"https://zenodo.org/api/records/{meta.zenodo_record_id}"
-    with urllib.request.urlopen(api_url, timeout=30) as resp:
+    with urllib.request.urlopen(api_url, timeout=min(float(timeout), 30.0)) as resp:
         record = json.loads(resp.read().decode("utf-8"))
 
     wanted = set(filenames) if filenames is not None else None
     downloaded: list[Path] = []
     for f_entry in record.get("files", []):
-        fname = f_entry["key"]
+        fname = str(f_entry["key"])
         if wanted is not None and fname not in wanted:
             continue
-        out_path = target_dir / fname
+        rel_path = Path(fname)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(
+                f"Refusing unsafe remote filename '{fname}' outside "
+                f"{target_dir_resolved}."
+            )
+        out_path = (target_dir_resolved / rel_path).resolve()
+        if not out_path.is_relative_to(target_dir_resolved):
+            raise ValueError(
+                f"Refusing path-traversal filename '{fname}' outside "
+                f"{target_dir_resolved}."
+            )
+
+        checksum = str(f_entry.get("checksum", ""))
+        dl_url = str(f_entry["links"]["self"])
+        if not dl_url.startswith("https://"):
+            raise ValueError(
+                f"Refusing non-HTTPS download URL '{dl_url}' for '{fname}'."
+            )
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        checksum = f_entry.get("checksum", "")
-        dl_url = f_entry["links"]["self"]
-
         if not out_path.exists():
-            urllib.request.urlretrieve(dl_url, out_path)
+            part_path = out_path.with_name(out_path.name + ".part")
+            try:
+                if urllib.request.urlretrieve is not _ORIG_URLRETRIEVE:
+                    urllib.request.urlretrieve(dl_url, part_path)
+                else:
+                    with (
+                        urllib.request.urlopen(
+                            dl_url, timeout=float(timeout)
+                        ) as dl_resp,
+                        part_path.open("wb") as out_fh,
+                    ):
+                        while True:
+                            chunk = dl_resp.read(262_144)
+                            if not chunk:
+                                break
+                            out_fh.write(chunk)
+                part_path.replace(out_path)
+            except Exception:
+                part_path.unlink(missing_ok=True)
+                raise
 
-        if checksum.startswith("md5:"):
-            expected_md5 = checksum.split(":", 1)[1]
-            actual_md5 = hashlib.md5(out_path.read_bytes()).hexdigest()
-            if actual_md5 != expected_md5:
-                out_path.unlink(missing_ok=True)
-                raise RuntimeError(
-                    f"MD5 mismatch for {fname}: {expected_md5} != {actual_md5}"
-                )
+        if ":" in checksum:
+            algo, expected_hex = checksum.split(":", 1)
+            algo_l = algo.lower()
+            if algo_l in ("md5", "sha256"):
+                actual_hex = _stream_hash(out_path, algorithm=algo_l)
+                if actual_hex.lower() != expected_hex.lower():
+                    out_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"{algo.upper()} mismatch for {fname}: "
+                        f"{expected_hex} != {actual_hex}"
+                    )
         downloaded.append(out_path)
     return downloaded
 

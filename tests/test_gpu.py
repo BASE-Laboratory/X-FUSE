@@ -61,7 +61,7 @@ def test_correlative_fuser_2d_on_cuda(method: str):
 def test_volumetric_fuser_triplane_on_cuda():
     assert torch.cuda.is_available(), "CUDA device is required for -m gpu tests"
     ph3 = generate_correlative_phantom_3d(
-        shape_zyx=(16, 32, 32), downsample_factor=4, seed=21
+        shape=(16, 32, 32), downsample_factor=4, seed=21
     )
     sparse = {2: ph3.coarse_guide_3d[:, 0], 12: ph3.coarse_guide_3d[:, -1]}
 

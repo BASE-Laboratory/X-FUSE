@@ -42,11 +42,15 @@ def build_orthonormal_spatial_basis(
     """
     if degree < 1:
         raise ValueError(f"Polynomial degree must be >= 1, got {degree}.")
-    ys = torch.linspace(
-        -1.0, 1.0, steps=max(height, 1), device=device, dtype=torch.float32
+    ys = (
+        torch.zeros(1, device=device, dtype=torch.float32)
+        if height <= 1
+        else torch.linspace(-1.0, 1.0, steps=height, device=device, dtype=torch.float32)
     )
-    xs = torch.linspace(
-        -1.0, 1.0, steps=max(width, 1), device=device, dtype=torch.float32
+    xs = (
+        torch.zeros(1, device=device, dtype=torch.float32)
+        if width <= 1
+        else torch.linspace(-1.0, 1.0, steps=width, device=device, dtype=torch.float32)
     )
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
     y_flat = yy.reshape(-1)
@@ -66,10 +70,12 @@ def build_orthonormal_spatial_basis(
         )
 
     raw = torch.stack(cols, dim=-1)  # (N, P)
-    # Center each basis column so constant channel means are strictly preserved
-    centered = raw - raw.mean(dim=0, keepdim=True)
-    if centered.shape[0] <= centered.shape[1]:
-        return torch.zeros((centered.shape[0], 0), device=device, dtype=dtype)
+    n_pts = int(raw.shape[0])
+    if n_pts <= 2:
+        return torch.zeros((n_pts, 0), device=device, dtype=dtype)
+    # Retain lower-degree polynomials on small patch grids (e.g. 2x2 -> linear [y, x])
+    max_cols = min(int(raw.shape[1]), n_pts - 2)
+    centered = raw[:, :max_cols] - raw[:, :max_cols].mean(dim=0, keepdim=True)
     q_mat, r_mat = torch.linalg.qr(centered, mode="reduced")
     diag = r_mat.diagonal().abs()
     keep = diag > 1e-6
@@ -78,7 +84,7 @@ def build_orthonormal_spatial_basis(
 
 def measure_positional_r2(features: torch.Tensor, degree: int = 2) -> torch.Tensor:
     """Compute per-channel spatial coordinate ``R^2`` in ``[0, 1]`` for a
-    ``(B, C, H, W)`` feature map.
+    ``(B, C, H, W)`` feature map, returning ``0`` for near-constant channels.
     """
     if features.ndim == 3:
         features = features.unsqueeze(0)
@@ -91,11 +97,12 @@ def measure_positional_r2(features: torch.Tensor, degree: int = 2) -> torch.Tens
 
     f_flat = features.detach().float().reshape(bsz, channels, -1)
     f_centered = f_flat - f_flat.mean(dim=-1, keepdim=True)
+    chan_var = f_centered.var(dim=-1, unbiased=False)
     tot_ss = f_centered.square().sum(dim=-1).clamp(min=1e-12)  # (B, C)
     proj_coeff = f_centered @ q_basis  # (B, C, P)
     reg_ss = proj_coeff.square().sum(dim=-1)  # (B, C)
-    r2 = (reg_ss / tot_ss).mean(dim=0).clamp(0.0, 1.0)
-    return r2
+    r2_bc = torch.where(chan_var > 1e-7, reg_ss / tot_ss, torch.zeros_like(reg_ss))
+    return r2_bc.mean(dim=0).clamp(0.0, 1.0)
 
 
 class ApositionalFeatureDebiaser(nn.Module):
@@ -136,9 +143,11 @@ class ApositionalFeatureDebiaser(nn.Module):
         q_mat = build_orthonormal_spatial_basis(
             height, width, degree=self.degree, device=device, dtype=torch.float32
         )
-        if len(self._basis_cache) >= 16:
-            self._basis_cache.clear()
-        self._basis_cache[key] = q_mat
+        # Only retain modest-sized bases in RAM cache
+        if height * width <= 65536:
+            if len(self._basis_cache) >= 16:
+                self._basis_cache.clear()
+            self._basis_cache[key] = q_mat
         return q_mat
 
     @torch.no_grad()
@@ -202,7 +211,9 @@ class ApositionalFeatureDebiaser(nn.Module):
             return features
 
         f_flat = x.float().reshape(bsz, channels, -1)  # (B, C, N)
-        proj = (f_flat @ q_basis) @ q_basis.T  # (B, C, N) zero-mean ramp component
+        f_mean = f_flat.mean(dim=-1, keepdim=True)
+        f_cent = f_flat - f_mean
+        proj = (f_cent @ q_basis) @ q_basis.T  # (B, C, N) zero-mean ramp component
 
         if (
             isinstance(self.calibrated_pos_mask, torch.Tensor)
@@ -211,10 +222,10 @@ class ApositionalFeatureDebiaser(nn.Module):
             mask = self.calibrated_pos_mask.to(device=x.device).view(1, channels, 1)
             debiased = torch.where(mask, f_flat - proj, f_flat)
         elif self.r2_threshold > 0.0:
-            f_cent = f_flat - f_flat.mean(dim=-1, keepdim=True)
+            chan_var = f_cent.var(dim=-1, keepdim=True, unbiased=False)
             tot_ss = f_cent.square().sum(dim=-1, keepdim=True).clamp(min=1e-12)
             reg_ss = proj.square().sum(dim=-1, keepdim=True)
-            mask = (reg_ss / tot_ss) >= self.r2_threshold
+            mask = (chan_var > 1e-7) & ((reg_ss / tot_ss) >= self.r2_threshold)
             debiased = torch.where(mask, f_flat - proj, f_flat)
         else:
             debiased = f_flat - proj

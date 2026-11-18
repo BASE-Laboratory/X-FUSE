@@ -8,7 +8,7 @@ X-FUSE uses a single modality-neutral interface across X-ray, electron, and neut
 
 - **Physical Regime**: High-resolution attenuation/phase-contrast XCT ($I_{\text{HR}}$, $0.5\text{–}2\,\mu\text{m}$ voxel) paired with pencil-beam XRD-CT ($G_{\text{LR}}$, $5\times\text{–}20\times$ coarser in-plane or acquired on only $3\text{–}25$ sparse $z$-slices).
 - **Recommended Setup**:
-  - Enable `VolumetricFuser` with `slab_thickness=3` (`2.5d_slab`) for training on sparse XRD-CT slices and `mode="triplane"` for full-volume 3D propagation.
+  - Enable `VolumetricFuser` with `delta=1` (`2.5d_slab`, 3-slice `[z-1, z, z+1]` context) for training on sparse XRD-CT slices and `mode="triplane"` for full-volume 3D propagation.
   - Stream large HDF5/NeXus or Zarr reconstructions lazily without loading the entire 3D tomogram into RAM.
 
 ```python

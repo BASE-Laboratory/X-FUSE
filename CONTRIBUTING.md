@@ -21,7 +21,7 @@ Use the root `Makefile` (or invoke `uv run` directly):
 make format          # Auto-format code and sort imports with Ruff
 make lint            # Check Ruff lint & formatting rules
 make typecheck       # Run static type checking on x_fuse/ with Mypy
-make test            # Run CPU unit tests with >=80% coverage gate
+make test            # Run CPU unit tests with >=85% coverage gate
 make benchmark-quick # Run offline synthetic & sample smoke suite
 make build           # Build wheel + sdist packages
 ```

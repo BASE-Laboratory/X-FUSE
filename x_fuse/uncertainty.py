@@ -110,14 +110,36 @@ class UncertaintyReport:
         )
 
 
+def _safe_quantile(tensor: torch.Tensor, q: float) -> torch.Tensor:
+    """Compute quantile safely on arbitrarily large tensors, striding when
+    ``numel() > 4_000_000`` to avoid PyTorch's ``2^24`` ``torch.quantile`` limit.
+    """
+    flat = torch.nan_to_num(
+        tensor.detach().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    n = int(flat.numel())
+    if n == 0:
+        return torch.zeros((), device=tensor.device, dtype=torch.float32)
+    if n > 4_000_000:
+        step = math.ceil(n / 4_000_000)
+        flat = flat[::step]
+    return torch.quantile(flat, float(q))
+
+
 def _conformal_quantile(scores: torch.Tensor, alpha: float) -> float:
     """Exact finite-sample split-conformal quantile at rank
     ``ceil((n + 1) * (1 - alpha))`` (1-indexed) on nonconformity ``scores``.
     """
-    flat = scores.detach().float().reshape(-1)
+    flat = torch.nan_to_num(
+        scores.detach().float().reshape(-1), nan=1.0, posinf=1.0, neginf=0.0
+    )
     n = int(flat.numel())
     if n == 0:
         return 1.0
+    if n > 4_000_000:
+        step = math.ceil(n / 4_000_000)
+        flat = flat[::step]
+        n = int(flat.numel())
     a_clamped = min(max(float(alpha), 1e-4), 0.999)
     rank = min(n, max(1, int(math.ceil((n + 1) * (1.0 - a_clamped)))))
     sorted_vals = torch.sort(flat).values
@@ -140,6 +162,7 @@ class ConformalCalibrator:
         self,
         alpha: float = 0.10,
         method: Literal["lac", "aps"] = "lac",
+        allow_empty_sets: bool = False,
     ) -> None:
         if not (0.0 < alpha < 1.0):
             raise ValueError(
@@ -147,8 +170,10 @@ class ConformalCalibrator:
             )
         self.alpha = float(alpha)
         self.method: Literal["lac", "aps"] = method
+        self.allow_empty_sets = bool(allow_empty_sets)
         self.q_label: float | None = None
         self.q_coarse_per_channel: torch.Tensor | None = None
+        self._coarse_scale: torch.Tensor | None = None
         self.n_calibration_points: int = 0
 
     @staticmethod
@@ -186,6 +211,7 @@ class ConformalCalibrator:
         """Calibrate phase prediction sets on ground-truth or sparse-scribble
         integer class labels ``targets`` (``(B, H, W)`` or ``(H, W)``).
         """
+        self.q_label = None
         p = probs.detach().float()
         if p.ndim == 3:
             p = p.unsqueeze(0)
@@ -197,7 +223,7 @@ class ConformalCalibrator:
         if y.ndim == 2:
             y = y.unsqueeze(0)
 
-        bsz, n_classes, height, width = p.shape
+        _, n_classes, _, _ = p.shape
         p_flat = p.permute(0, 2, 3, 1).reshape(-1, n_classes)
         y_flat = y.reshape(-1)
         valid = (y_flat >= 0) & (y_flat < n_classes)
@@ -216,7 +242,6 @@ class ConformalCalibrator:
             sorted_p, sorted_idx = torch.sort(p_cal, dim=-1, descending=True)
             cumsum_p = torch.cumsum(sorted_p, dim=-1)
             match = (sorted_idx == y_cal.unsqueeze(-1)).float()
-            # Include true class probability mass
             scores = (cumsum_p * match).sum(dim=-1)
         else:
             # Sadinle et al. (2019) LAC: 1 - p(true_class)
@@ -240,8 +265,16 @@ class ConformalCalibrator:
         """Zero-label coarse physical split-conformal calibration using held-out
         coarse pixels ``cal_mask_lr`` (or all coarse pixels if ``None``).
         """
+        self.q_label = None
+        self.q_coarse_per_channel = None
+        self._coarse_scale = None
+
         p = probs_hr.detach().float()
-        g = guide_lr.detach().float().to(p.device)
+        if p.ndim == 3:
+            p = p.unsqueeze(0)
+        g = torch.nan_to_num(
+            guide_lr.detach().float().to(p.device), nan=0.0, posinf=0.0, neginf=0.0
+        )
         if g.ndim == 2:
             g = g.unsqueeze(0).unsqueeze(0)
         elif g.ndim == 3:
@@ -266,9 +299,16 @@ class ConformalCalibrator:
         g_eval = g
         if float(g.max().item()) > 1.5:
             g_max = (
-                g.flatten(start_dim=2).max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
+                g.flatten(start_dim=2)
+                .max(dim=-1)
+                .values.unsqueeze(-1)
+                .unsqueeze(-1)
+                .clamp(min=1e-6)
             )
-            g_eval = g / g_max.clamp(min=1e-6)
+            self._coarse_scale = g_max.detach().clone()
+            g_eval = (g / g_max).clamp(0.0, 1.0)
+        else:
+            g_eval = g.clamp(0.0, 1.0)
 
         entropy_hr, _ = compute_posterior_uncertainty(p, mode=mode)
         epi_hr = (
@@ -303,36 +343,69 @@ class ConformalCalibrator:
             q_ch, device=p.device, dtype=torch.float32
         )
 
-        # Calibrate phase set threshold on high-purity coarse superpixels
-        p_full = (
-            torch.cat([1.0 - p, p], dim=1)
-            if p.shape[1] == 1
-            else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        )
-        p_pool = F.adaptive_avg_pool2d(p_full, output_size=(h_lr, w_lr))
-        if p_full.shape[1] == n_guide + 1:
-            bg_g = (1.0 - g_eval.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
-            g_simplex = torch.cat([bg_g, g_eval], dim=1)
-        elif p_full.shape[1] == 2 and n_guide == 1:
-            g_simplex = torch.cat([1.0 - g_eval, g_eval], dim=1)
+        # Calibrate phase/element set threshold on high-purity coarse superpixels
+        purity_fallback = False
+        if mode == "multilabel" and p.shape[1] >= 2:
+            p_pool = F.adaptive_avg_pool2d(p.clamp(0.0, 1.0), output_size=(h_lr, w_lr))
+            p_m = (
+                p_pool[:, :n_guide].permute(0, 2, 3, 1).reshape(-1, n_guide)[mask_flat]
+            )
+            g_m = (
+                g_eval[:, :n_guide].permute(0, 2, 3, 1).reshape(-1, n_guide)[mask_flat]
+            )
+            hi = g_m >= 0.75
+            lo = g_m <= 0.25
+            pure = hi | lo
+            if int(pure.sum().item()) >= 4:
+                scores_ml = torch.where(hi, 1.0 - p_m, p_m)[pure]
+                self.q_label = _conformal_quantile(scores_ml, self.alpha)
+            else:
+                purity_fallback = True
+                self.q_label = 1.0 - self.alpha
         else:
-            g_simplex = g_eval
+            p_full = (
+                torch.cat([1.0 - p, p], dim=1)
+                if p.shape[1] == 1
+                else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            )
+            p_pool = F.adaptive_avg_pool2d(p_full, output_size=(h_lr, w_lr))
+            if p_full.shape[1] == n_guide + 1:
+                bg_g = (1.0 - g_eval.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
+                g_simplex = torch.cat([bg_g, g_eval], dim=1)
+            elif p_full.shape[1] == 2 and n_guide == 1:
+                g_simplex = torch.cat([1.0 - g_eval, g_eval], dim=1)
+            else:
+                g_simplex = g_eval
 
-        max_frac, pseudo_cls = g_simplex.max(dim=1)  # (B, H_lr, W_lr)
-        pure_mask = (max_frac.reshape(-1) >= 0.75) & mask_flat
-        if int(pure_mask.sum().item()) >= 4:
-            p_pure = p_pool.permute(0, 2, 3, 1).reshape(-1, p_full.shape[1])[pure_mask]
-            y_pure = pseudo_cls.reshape(-1)[pure_mask]
-            true_p = p_pure.gather(1, y_pure.unsqueeze(-1)).squeeze(-1)
-            self.q_label = _conformal_quantile(1.0 - true_p, self.alpha)
-        elif self.q_label is None:
-            self.q_label = 1.0 - self.alpha
+            max_frac, pseudo_cls = g_simplex.max(dim=1)  # (B, H_lr, W_lr)
+            pure_mask = (max_frac.reshape(-1) >= 0.75) & mask_flat
+            if int(pure_mask.sum().item()) < 4:
+                purity_fallback = True
+                pure_mask = (max_frac.reshape(-1) >= 0.55) & mask_flat
+            if int(pure_mask.sum().item()) >= 4:
+                p_pure = p_pool.permute(0, 2, 3, 1).reshape(-1, p_full.shape[1])[
+                    pure_mask
+                ]
+                y_pure = pseudo_cls.reshape(-1)[pure_mask]
+                if self.method == "aps":
+                    sorted_p, sorted_idx = torch.sort(p_pure, dim=-1, descending=True)
+                    cumsum_p = torch.cumsum(sorted_p, dim=-1)
+                    match = (sorted_idx == y_pure.unsqueeze(-1)).float()
+                    scores_cls = (cumsum_p * match).sum(dim=-1)
+                else:
+                    true_p = p_pure.gather(1, y_pure.unsqueeze(-1)).squeeze(-1)
+                    scores_cls = 1.0 - true_p
+                self.q_label = _conformal_quantile(scores_cls, self.alpha)
+            else:
+                self.q_label = 1.0 - self.alpha
 
         return {
             "conformal_alpha": self.alpha,
+            "conformal_method": self.method,
             "conformal_q_label": round(float(self.q_label), 4),
             "conformal_q_coarse": [round(float(v), 4) for v in q_ch],
             "conformal_n_cal": self.n_calibration_points,
+            "conformal_purity_fallback": purity_fallback,
         }
 
     @torch.no_grad()
@@ -349,28 +422,32 @@ class ConformalCalibrator:
         and optional ``conformal_interval_halfwidth`` ``(B, M, H, W)``.
         """
         p = probs_hr.detach().float()
-        p_cls = (
-            torch.cat([1.0 - p, p], dim=1)
-            if p.shape[1] == 1
-            else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        )
+        if p.ndim == 3:
+            p = p.unsqueeze(0)
         q_lbl = self.q_label if self.q_label is not None else (1.0 - self.alpha)
 
-        if self.method == "aps":
-            sorted_p, sorted_idx = torch.sort(p_cls, dim=1, descending=True)
-            cumsum_p = torch.cumsum(sorted_p, dim=1)
-            # Include classes until cumulative mass reaches q_lbl (always include top-1)
-            prev_cumsum = cumsum_p - sorted_p
-            in_sorted = prev_cumsum <= q_lbl
-            in_sorted[:, 0] = True
-            pred_sets = torch.zeros_like(p_cls, dtype=torch.bool)
-            pred_sets.scatter_(1, sorted_idx, in_sorted)
-        else:
+        if mode == "multilabel" and p.shape[1] >= 2:
+            p_cls = p.clamp(0.0, 1.0)
             pred_sets = (1.0 - p_cls) <= q_lbl
-            # Guarantee non-empty sets unless q_lbl explicitly rejects all
-            top1 = p_cls.argmax(dim=1, keepdim=True)
-            if q_lbl >= 0.5:
-                pred_sets.scatter_(1, top1, True)
+        else:
+            p_cls = (
+                torch.cat([1.0 - p, p], dim=1)
+                if p.shape[1] == 1
+                else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            )
+            if self.method == "aps":
+                sorted_p, sorted_idx = torch.sort(p_cls, dim=1, descending=True)
+                cumsum_p = torch.cumsum(sorted_p, dim=1)
+                prev_cumsum = cumsum_p - sorted_p
+                in_sorted = prev_cumsum <= q_lbl
+                in_sorted[:, 0] = True
+                pred_sets = torch.zeros_like(p_cls, dtype=torch.bool)
+                pred_sets.scatter_(1, sorted_idx, in_sorted)
+            else:
+                pred_sets = (1.0 - p_cls) <= q_lbl
+                if not self.allow_empty_sets:
+                    top1 = p_cls.argmax(dim=1, keepdim=True)
+                    pred_sets.scatter_(1, top1, True)
 
         halfwidth: torch.Tensor | None = None
         if guide_lr is not None and self.q_coarse_per_channel is not None:
@@ -388,42 +465,63 @@ class ConformalCalibrator:
             )
             difficulty_hr = (0.5 * entropy_hr + 0.5 * epi_hr.sqrt()).clamp(min=0.08)
             q_vec = self.q_coarse_per_channel.to(p.device).view(1, -1, 1, 1)
-            halfwidth = (q_vec * difficulty_hr.unsqueeze(1)).clamp(0.0, 1.0)
+            raw_halfwidth = (q_vec * difficulty_hr.unsqueeze(1)).clamp(min=0.0)
+            halfwidth = raw_halfwidth.clamp(0.0, 1.0)
 
             # Physical contrast safeguard: where coarse guide shows excess phase m
-            # unexplained by D(P_HR) beyond halfwidth, include phase m in the set!
-            g = guide_lr.detach().float().to(p.device)
+            # unexplained by D(P_HR) beyond raw_halfwidth, include phase m in the set!
+            g = torch.nan_to_num(
+                guide_lr.detach().float().to(p.device), nan=0.0, posinf=0.0, neginf=0.0
+            )
             if g.ndim == 2:
                 g = g.unsqueeze(0).unsqueeze(0)
             elif g.ndim == 3:
                 g = g.unsqueeze(0)
-            if float(g.max().item()) <= 1.5:
-                n_guide = g.shape[1]
-                fg_p = (
-                    p_cls[:, 1:]
-                    if p_cls.shape[1] == n_guide + 1
-                    else p_cls[:, :n_guide]
+            if (
+                self._coarse_scale is not None
+                and self._coarse_scale.shape[1] == g.shape[1]
+            ):
+                g_unit = (g / self._coarse_scale.to(g.device)).clamp(0.0, 1.0)
+            elif float(g.max().item()) > 1.5:
+                g_max = (
+                    g.flatten(start_dim=2)
+                    .max(dim=-1)
+                    .values.unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .clamp(min=1e-6)
                 )
-                ds = downsampler if downsampler is not None else ForwardPSFDownsampler()
-                h_lr, w_lr = int(g.shape[-2]), int(g.shape[-1])
-                src = (
-                    aligner(fg_p, (h_lr, w_lr))
-                    if (aligner is not None and aligner.mode != "none")
-                    else fg_p
+                g_unit = (g / g_max).clamp(0.0, 1.0)
+            else:
+                g_unit = g.clamp(0.0, 1.0)
+
+            n_guide = g_unit.shape[1]
+            fg_p = (
+                p_cls[:, 1:]
+                if (mode == "multiclass" and p_cls.shape[1] == n_guide + 1)
+                else p_cls[:, :n_guide]
+            )
+            ds = downsampler if downsampler is not None else ForwardPSFDownsampler()
+            h_lr, w_lr = int(g_unit.shape[-2]), int(g_unit.shape[-1])
+            src = (
+                aligner(fg_p, (h_lr, w_lr))
+                if (aligner is not None and aligner.mode != "none")
+                else fg_p
+            )
+            deficit_lr = (g_unit - ds(src, (h_lr, w_lr))).clamp(min=0.0)
+            deficit_hr = F.interpolate(
+                deficit_lr,
+                size=p.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            missing_contrast = deficit_hr > raw_halfwidth
+            offset = (
+                1 if (mode == "multiclass" and p_cls.shape[1] == n_guide + 1) else 0
+            )
+            for m in range(min(n_guide, pred_sets.shape[1] - offset)):
+                pred_sets[:, m + offset] = (
+                    pred_sets[:, m + offset] | missing_contrast[:, m]
                 )
-                deficit_lr = (g - ds(src, (h_lr, w_lr))).clamp(min=0.0)
-                deficit_hr = F.interpolate(
-                    deficit_lr,
-                    size=p.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                missing_contrast = deficit_hr > halfwidth
-                offset = 1 if p_cls.shape[1] == n_guide + 1 else 0
-                for m in range(min(n_guide, pred_sets.shape[1] - offset)):
-                    pred_sets[:, m + offset] = (
-                        pred_sets[:, m + offset] | missing_contrast[:, m]
-                    )
 
         return pred_sets, halfwidth
 
@@ -434,8 +532,8 @@ def empirical_conformal_coverage(
 ) -> dict[str, float]:
     """Evaluate empirical marginal coverage ``P(Y in C(X))`` and average set
     cardinality ``E[|C(X)|]`` against ground-truth integer labels.
-    Supports full grids ``(B, K, H, W)`` / ``(K, H, W)`` and masked 1D slices
-    ``(B, K, N)`` / ``(K, N)``.
+    Supports full grids ``(B, K, H, W)`` / ``(K, H, W)`` / ``(K, Z, Y, X)`` and
+    masked 1D slices ``(B, K, N)`` / ``(K, N)``.
     """
     s = (
         prediction_sets.detach().cpu().numpy().astype(bool)
@@ -451,6 +549,10 @@ def empirical_conformal_coverage(
         # Masked (K, N) slice paired with (N,) targets
         n_classes = s.shape[0]
         s_flat = s.T.reshape(-1, n_classes)
+    elif s.ndim >= 3 and s.shape[1:] == y.shape:
+        # Unbatched (K, H, W) or (K, Z, Y, X) paired with (H, W) or (Z, Y, X)
+        n_classes = s.shape[0]
+        s_flat = np.moveaxis(s, 0, -1).reshape(-1, n_classes)
     elif (
         s.ndim == 3
         and y.ndim == 2
@@ -668,7 +770,7 @@ def build_uncertainty_report(
     else:
         epi = epistemic_var.mean(dim=1) if epistemic_var.ndim == 4 else epistemic_var
         epi = epi.float().to(entropy.device)
-        p99 = torch.quantile(epi.flatten(), 0.99).clamp(min=1e-6)
+        p99 = _safe_quantile(epi, 0.99).clamp(min=1e-6)
         epi_norm = (epi / p99).clamp(0.0, 1.0)
 
     combined = (0.45 * entropy + 0.25 * epi_norm + 0.30 * phys_res).clamp(0.0, 1.0)

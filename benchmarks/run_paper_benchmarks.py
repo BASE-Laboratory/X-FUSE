@@ -379,6 +379,7 @@ def run_paper_benchmarks(
 
     # Active schedule starts from 2 boundary seed slices and greedily adds slices
     active_chosen = [1, vol_shape[0] - 2]
+    prev_active_rep: Any = None
     for b_idx, budget in enumerate(budgets):
         rand_idxs = sorted(
             rng.choice(vol_shape[0], size=budget, replace=False).tolist()
@@ -393,12 +394,13 @@ def run_paper_benchmarks(
 
         if b_idx > 0 and len(active_chosen) < budget:
             need = budget - len(active_chosen)
-            _, prev_rep = _eval_3d_schedule(active_chosen)
+            if prev_active_rep is None:
+                _, prev_active_rep = _eval_3d_schedule(active_chosen)
             rec = suggest_next_slices(
-                prev_rep, acquired_indices=active_chosen, k=need, min_spacing=2
+                prev_active_rep, acquired_indices=active_chosen, k=need, min_spacing=2
             )
             active_chosen = sorted(set(active_chosen + rec.recommended_indices))
-        a_iou, _ = _eval_3d_schedule(active_chosen[:budget])
+        a_iou, prev_active_rep = _eval_3d_schedule(active_chosen[:budget])
         active_mious.append(a_iou)
 
     results["active_slice_tomography"] = {
@@ -629,11 +631,26 @@ def run_paper_benchmarks(
         for ds_key in OPEN_DATASETS:
             try:
                 sample = load_zenodo_correlative_sample(ds_key, auto_download=True)
-                hr_h, coarse_h, gt_h = make_experimental_holdout(
-                    sample.hr_image[:256, :256],
-                    sample.guide_map[:, :256, :256],
-                    factor=8,
-                )
+                h_tot, w_tot = sample.hr_image.shape[-2:]
+                gh_tot, gw_tot = sample.guide_map.shape[-2:]
+                crop_h = min(256, h_tot)
+                crop_w = min(256, w_tot)
+                if sample.is_full_res_ground_truth and (gh_tot, gw_tot) == (
+                    h_tot,
+                    w_tot,
+                ):
+                    hr_h, coarse_h, gt_h = make_experimental_holdout(
+                        sample.hr_image[:crop_h, :crop_w],
+                        sample.guide_map[:, :crop_h, :crop_w],
+                        factor=8,
+                    )
+                else:
+                    gc_h = max(4, int(round(crop_h * gh_tot / max(h_tot, 1))))
+                    gc_w = max(4, int(round(crop_w * gw_tot / max(w_tot, 1))))
+                    hr_h = sample.hr_image[:crop_h, :crop_w]
+                    coarse_h = sample.guide_map[:, :gc_h, :gc_w]
+                    gt_h = None
+
                 z_mod = XFuse(
                     backbone=backbone,
                     stride=stride,
@@ -649,13 +666,19 @@ def run_paper_benchmarks(
                 z_rep = z_mod.fit_predict(
                     hr_h, coarse_h, epochs=epochs, mode="multilabel"
                 )
-                pred_np = z_rep.probabilities[0].cpu().numpy()
-                mse_val = float(np.mean((pred_np - gt_h) ** 2))
-                results["zenodo_holdouts"][ds_key] = {
+                entry: dict[str, Any] = {
                     "channels": sample.channel_names,
-                    "holdout_8x_mse": round(mse_val, 5),
+                    "mean_physical_residual": round(
+                        float(z_rep.physical_residual.mean().item()), 5
+                    ),
                     "diagnostics": z_rep.diagnostics,
                 }
+                if gt_h is not None:
+                    pred_np = z_rep.probabilities[0].cpu().numpy()
+                    entry["holdout_8x_mse"] = round(
+                        float(np.mean((pred_np - gt_h) ** 2)), 5
+                    )
+                results["zenodo_holdouts"][ds_key] = entry
             except Exception as exc:  # pragma: no cover
                 results["zenodo_holdouts"][ds_key] = {"error": str(exc)}
 

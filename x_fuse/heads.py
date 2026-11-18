@@ -114,12 +114,16 @@ class LinearProbeHead(nn.Module):
         xrd_map: torch.Tensor,
         coarse_target: torch.Tensor | None = None,
         aligner: DifferentiableGuideAligner | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
+        loss_mask_lr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.physics.compute_loss_from_logits(
             logits,
             guide_map=xrd_map,
             coarse_target=coarse_target,
             aligner=aligner,
+            valid_hr_hw=valid_hr_hw,
+            loss_mask_lr=loss_mask_lr,
         )
 
     def compute_loss(
@@ -128,10 +132,17 @@ class LinearProbeHead(nn.Module):
         xrd_map: torch.Tensor,
         coarse_target: torch.Tensor | None = None,
         aligner: DifferentiableGuideAligner | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
+        loss_mask_lr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         logits = self.predict_logits(features)
         return self.compute_loss_from_logits(
-            logits, xrd_map=xrd_map, coarse_target=coarse_target, aligner=aligner
+            logits,
+            xrd_map=xrd_map,
+            coarse_target=coarse_target,
+            aligner=aligner,
+            valid_hr_hw=valid_hr_hw,
+            loss_mask_lr=loss_mask_lr,
         )
 
     def get_channel_importance(self) -> torch.Tensor:
@@ -180,10 +191,10 @@ class SpatialConvMLPHead(nn.Module):
         self.loss_fn: LossOptions = loss_fn
         self.tv_weight = float(tv_weight)
 
-        n_groups = 8 if self.hidden_dim % 8 == 0 else 1
+        n_groups = 8 if (self.hidden_dim > 8 and self.hidden_dim % 8 == 0) else 1
         self.feat_norm = nn.GroupNorm(1, self.feat_dim)
         self.in_proj = nn.Conv2d(self.feat_dim, self.hidden_dim, kernel_size=1)
-        self.tex_norm = nn.InstanceNorm2d(8, affine=True)
+        self.tex_norm = nn.GroupNorm(8, 8)
         self.tex_stem = nn.Sequential(
             nn.Conv2d(8, self.hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
@@ -233,7 +244,11 @@ class SpatialConvMLPHead(nn.Module):
             tex = extract_multiscale_texture_descriptors(g_resized.to(features.device))
             if tex.shape[0] == 1 and bsz > 1:
                 tex = tex.expand(bsz, -1, -1, -1)
-            t_h = self.tex_stem(self.tex_norm(tex))
+            if tex.shape[0] * height * width > 1:
+                tex_n = self.tex_norm(tex)
+            else:
+                tex_n = tex * 0.0 + self.tex_norm.bias.view(1, -1, 1, 1)
+            t_h = self.tex_stem(tex_n)
         else:
             t_h = torch.zeros_like(f_h)
 
@@ -254,16 +269,30 @@ class SpatialConvMLPHead(nn.Module):
         coarse_target: torch.Tensor | None = None,
         aligner: DifferentiableGuideAligner | None = None,
         guidance_hr: torch.Tensor | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
+        loss_mask_lr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         base_loss = self.physics.compute_loss_from_logits(
             logits,
             guide_map=xrd_map,
             coarse_target=coarse_target,
             aligner=aligner,
+            valid_hr_hw=valid_hr_hw,
+            loss_mask_lr=loss_mask_lr,
         )
-        if self.tv_weight > 0.0 and min(logits.shape[-2], logits.shape[-1]) >= 4:
+        tv_logits = (
+            logits[:, :, : valid_hr_hw[0], : valid_hr_hw[1]]
+            if valid_hr_hw is not None
+            else logits
+        )
+        tv_guidance = (
+            guidance_hr[..., : valid_hr_hw[0], : valid_hr_hw[1]]
+            if (guidance_hr is not None and valid_hr_hw is not None)
+            else guidance_hr
+        )
+        if self.tv_weight > 0.0 and min(tv_logits.shape[-2], tv_logits.shape[-1]) >= 4:
             base_loss = base_loss + self.tv_weight * edge_aware_tv_loss(
-                logits, guidance_hr=guidance_hr
+                tv_logits, guidance_hr=tv_guidance
             )
         return base_loss
 
@@ -274,6 +303,8 @@ class SpatialConvMLPHead(nn.Module):
         coarse_target: torch.Tensor | None = None,
         aligner: DifferentiableGuideAligner | None = None,
         guidance_hr: torch.Tensor | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
+        loss_mask_lr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         logits = self.predict_logits(features, guidance_hr=guidance_hr)
         return self.compute_loss_from_logits(
@@ -282,6 +313,8 @@ class SpatialConvMLPHead(nn.Module):
             coarse_target=coarse_target,
             aligner=aligner,
             guidance_hr=guidance_hr,
+            valid_hr_hw=valid_hr_hw,
+            loss_mask_lr=loss_mask_lr,
         )
 
     def forward(
@@ -414,15 +447,41 @@ class WindowedGuideCrossAttentionHead(nn.Module):
             bsz, self.guide_channels, height, width
         )
 
+    def compute_loss_from_logits(
+        self,
+        logits: torch.Tensor,
+        guide_map: torch.Tensor,
+        coarse_target: torch.Tensor | None = None,
+        aligner: DifferentiableGuideAligner | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
+        loss_mask_lr: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.physics.compute_loss_from_logits(
+            logits,
+            guide_map=guide_map,
+            coarse_target=coarse_target if coarse_target is not None else guide_map,
+            aligner=aligner,
+            valid_hr_hw=valid_hr_hw,
+            loss_mask_lr=loss_mask_lr,
+        )
+
     def compute_loss(
         self,
         features: torch.Tensor,
         guide_map: torch.Tensor,
+        coarse_target: torch.Tensor | None = None,
         aligner: DifferentiableGuideAligner | None = None,
+        valid_hr_hw: tuple[int, int] | None = None,
+        loss_mask_lr: torch.Tensor | None = None,
     ) -> torch.Tensor:
         logits = self.predict_logits(features.float(), guide_map.float())
-        return self.physics.compute_loss_from_logits(
-            logits, guide_map=guide_map, coarse_target=guide_map, aligner=aligner
+        return self.compute_loss_from_logits(
+            logits,
+            guide_map=guide_map,
+            coarse_target=coarse_target,
+            aligner=aligner,
+            valid_hr_hw=valid_hr_hw,
+            loss_mask_lr=loss_mask_lr,
         )
 
 

@@ -29,7 +29,7 @@ def _report_to_arrays(
     is_3d = isinstance(report, VolumetricUncertaintyReport)
     if isinstance(report, VolumetricUncertaintyReport):
         probs = report.probabilities.detach().cpu().float().numpy()  # (K, Z, Y, X)
-        arrays = {
+        arrays: dict[str, np.ndarray] = {
             "probabilities": probs,
             "hard_mask": report.hard_mask.detach().cpu().numpy().astype(np.int32),
             "aleatoric_entropy": (
@@ -45,6 +45,14 @@ def _report_to_arrays(
                 report.combined_uncertainty.detach().cpu().float().numpy()
             ),
         }
+        if report.prediction_sets is not None:
+            arrays["prediction_sets"] = (
+                report.prediction_sets.detach().cpu().numpy().astype(np.uint8)
+            )
+        if report.conformal_interval_halfwidth is not None:
+            arrays["conformal_interval_halfwidth"] = (
+                report.conformal_interval_halfwidth.detach().cpu().float().numpy()
+            )
         meta: dict[str, Any] = {
             "report_type": "VolumetricUncertaintyReport",
             "z_slice_consistency": float(report.z_slice_consistency),
@@ -93,6 +101,7 @@ def _report_to_arrays(
     else:
         names = [f"phase_{i}" for i in range(n_k)]
     meta["channel_names"] = names
+    meta["spatial_shape"] = [int(d) for d in probs.shape[1:]]
     return arrays, meta, is_3d
 
 
@@ -143,11 +152,12 @@ def save_uncertainty_report(
         return out_path
 
     if lower_name.endswith((".ome.tif", ".ome.tiff", ".tif", ".tiff")):
-        # Stack float32 channels: [probs, hard_mask, entropy, epi, residual, combined]
         probs = arrays["probabilities"].astype(np.float32)
+        n_probs = int(probs.shape[0])
         p_names = list(meta["channel_names"])
-        while len(p_names) < probs.shape[0]:
+        while len(p_names) < n_probs:
             p_names.append(f"phase_{len(p_names)}")
+
         extra_keys = [
             "hard_mask",
             "aleatoric_entropy",
@@ -157,12 +167,37 @@ def save_uncertainty_report(
         ]
         if "unresolved_mask" in arrays:
             extra_keys.append("unresolved_mask")
-        extra_stack = np.stack(
-            [arrays[ek].astype(np.float32) for ek in extra_keys], axis=0
-        )
-        full_stack = np.concatenate([probs, extra_stack], axis=0)
-        all_labels = p_names[: probs.shape[0]] + extra_keys
+
+        stack_blocks: list[np.ndarray] = [probs]
+        all_labels: list[str] = list(p_names[:n_probs])
+        layout: dict[str, Any] = {"probabilities": [0, n_probs]}
+        cursor = n_probs
+
+        for ek in extra_keys:
+            stack_blocks.append(arrays[ek].astype(np.float32)[None, ...])
+            all_labels.append(ek)
+            layout[ek] = cursor
+            cursor += 1
+
+        if "prediction_sets" in arrays:
+            ps = arrays["prediction_sets"].astype(np.float32)
+            n_ps = int(ps.shape[0])
+            stack_blocks.append(ps)
+            all_labels.extend([f"prediction_sets_{i}" for i in range(n_ps)])
+            layout["prediction_sets"] = [cursor, cursor + n_ps]
+            cursor += n_ps
+
+        if "conformal_interval_halfwidth" in arrays:
+            hw = arrays["conformal_interval_halfwidth"].astype(np.float32)
+            n_hw = int(hw.shape[0])
+            stack_blocks.append(hw)
+            all_labels.extend([f"conformal_halfwidth_{i}" for i in range(n_hw)])
+            layout["conformal_interval_halfwidth"] = [cursor, cursor + n_hw]
+            cursor += n_hw
+
+        full_stack = np.concatenate(stack_blocks, axis=0)
         meta["ome_channel_labels"] = all_labels
+        meta["stack_layout"] = layout
 
         try:
             import tifffile  # type: ignore[import-not-found]
@@ -207,14 +242,30 @@ def save_uncertainty_report(
                 raise ImportError(
                     "3D OME-TIFF export requires `tifffile` (`pip install x-fuse[io]`)."
                 ) from None
+            from PIL.TiffImagePlugin import ImageFileDirectory_v2
+
+            ifd = ImageFileDirectory_v2()
+            ifd[270] = json.dumps(meta)
             frames = [Image.fromarray(ch) for ch in full_stack]
-            frames[0].save(out_path, save_all=True, append_images=frames[1:])
+            frames[0].save(
+                out_path, save_all=True, append_images=frames[1:], tiffinfo=ifd
+            )
             return out_path
 
     raise ValueError(
         f"Unsupported output extension for '{out_path}'. "
         "Supported: .ome.tif, .tif, .h5, .hdf5, .nxs, .zarr."
     )
+
+
+def _normalize_loaded_arrays(out: dict[str, Any]) -> dict[str, Any]:
+    if "prediction_sets" in out:
+        out["prediction_sets"] = np.asarray(out["prediction_sets"]) > 0.5
+    if "unresolved_mask" in out:
+        out["unresolved_mask"] = np.asarray(out["unresolved_mask"]) > 0.5
+    if "hard_mask" in out:
+        out["hard_mask"] = np.rint(np.asarray(out["hard_mask"])).astype(np.int32)
+    return out
 
 
 def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
@@ -233,7 +284,7 @@ def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
                 if isinstance(raw_meta, bytes)
                 else str(raw_meta)
             )
-        return out
+        return _normalize_loaded_arrays(out)
 
     if suffix == ".zarr":
         import zarr  # type: ignore[import-not-found]
@@ -241,28 +292,58 @@ def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
         root_in: Any = zarr.open_group(str(in_path), mode="r")
         out = {k: np.asarray(root_in[k]) for k in root_in.keys()}
         out["metadata"] = json.loads(str(root_in.attrs.get("metadata_json", "{}")))
-        return out
+        return _normalize_loaded_arrays(out)
 
     if lower_name.endswith((".ome.tif", ".ome.tiff", ".tif", ".tiff")):
-        import tifffile  # type: ignore[import-not-found]
+        try:
+            import tifffile  # type: ignore[import-not-found]
 
-        with tifffile.TiffFile(in_path) as tf:
-            stack = tf.asarray()
-            desc = str(getattr(tf.pages[0], "description", "") or "")
+            with tifffile.TiffFile(in_path) as tf:
+                stack = tf.asarray()
+                desc = str(getattr(tf.pages[0], "description", "") or "")
+        except ImportError:
+            from PIL import ImageSequence
+
+            with Image.open(in_path) as im:
+                desc = str(im.tag_v2.get(270, "") if hasattr(im, "tag_v2") else "")
+                frames_in = [
+                    np.array(frame, dtype=np.float32)
+                    for frame in ImageSequence.Iterator(im)
+                ]
+                stack = np.stack(frames_in, axis=0)
+
         meta_dict: dict[str, Any] = {}
         if desc.startswith("{"):
             meta_dict = json.loads(desc)
         elif "Description=" in desc or "<Description>" in desc:
+            import html
             import re
 
             m = re.search(r"<Description>(.*?)</Description>", desc, flags=re.DOTALL)
             if m:
-                import html
-
                 unesc = html.unescape(m.group(1)).strip()
                 if unesc.startswith("{"):
                     meta_dict = json.loads(unesc)
-        return {"stack": stack, "metadata": meta_dict}
+
+        spatial_shape = meta_dict.get("spatial_shape")
+        if (
+            isinstance(spatial_shape, list)
+            and len(spatial_shape) == 3
+            and stack.ndim == 3
+            and spatial_shape[0] == 1
+        ):
+            # Restore Z=1 axis squeezed by OME-TIFF reader on single-slice 3D reports
+            stack = stack[:, np.newaxis, :, :]
+
+        result: dict[str, Any] = {"stack": stack, "metadata": meta_dict}
+        layout = meta_dict.get("stack_layout")
+        if isinstance(layout, dict):
+            for key_name, spec in layout.items():
+                if isinstance(spec, list) and len(spec) == 2:
+                    result[key_name] = stack[int(spec[0]) : int(spec[1])]
+                elif isinstance(spec, int):
+                    result[key_name] = stack[int(spec)]
+        return _normalize_loaded_arrays(result)
 
     raise ValueError(f"Unsupported report file format: {in_path}")
 

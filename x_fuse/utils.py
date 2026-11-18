@@ -145,17 +145,19 @@ def load_xrd_h5(xrd_path: str, key: str = "xrd") -> np.ndarray:
 
 
 def guide_to_tensor(
-    guide_img: np.ndarray | torch.Tensor,
+    guide_img: np.ndarray | torch.Tensor | Sequence[np.ndarray | torch.Tensor],
     device: str | torch.device = "cpu",
     normalize: bool = True,
     normalization: GuideNormalization | None = None,
 ) -> torch.Tensor:
-    """Convert a 2D ``(H, W)``, 3D ``(M, H, W)``, or 4D ``(B, M, H, W)`` coarse
-    physical guide map (or spectral cube) into a ``(B, M, H, W)`` float32 tensor.
+    """Convert a 2D ``(H, W)``, 3D ``(M, H, W)``, 4D ``(B, M, H, W)`` coarse
+    physical guide map (or a sequence of 2D maps) into a ``(B, M, H, W)`` float32
+    tensor with safe NaN/Inf & negative FBP baseline handling.
 
     Normalization modes (``normalization`` overrides ``normalize`` when set):
-    - ``"minmax"`` (default when ``normalize=True``): Independent per-channel
-      min-max scaling into ``[0, 1]`` (zero-variance channels map to ``0.0``).
+    - ``"minmax"`` (default when ``normalize=True``): Clamps negative FBP/ringing
+      baselines when positive signal exists, then scales each channel into ``[0, 1]``
+      (zero-variance channels map to ``0.0``).
     - ``"preserve_counts"`` (default when ``normalize=False``): Clamps negative
       detector baseline artifacts to ``0.0`` while preserving raw physical photon/X-ray
       counts for ``loss_fn="forward_psf_poisson"``.
@@ -164,7 +166,17 @@ def guide_to_tensor(
     - ``"simplex"``: Normalizes non-negative channels per pixel so ``sum_m G_m = 1``
       (when total > 0) for ``loss_fn="compositional_kl"``.
     """
-    if isinstance(guide_img, torch.Tensor):
+    import warnings
+
+    if isinstance(guide_img, (list, tuple)):
+        stacked = [
+            g.detach().cpu().float().numpy()
+            if isinstance(g, torch.Tensor)
+            else np.asarray(g, dtype=np.float32)
+            for g in guide_img
+        ]
+        t = torch.from_numpy(np.stack(stacked, axis=0))
+    elif isinstance(guide_img, torch.Tensor):
         t = guide_img.detach().clone().to(dtype=torch.float32)
     else:
         t = torch.from_numpy(np.asarray(guide_img, dtype=np.float32))
@@ -176,6 +188,14 @@ def guide_to_tensor(
     elif t.ndim != 4:
         raise ValueError(f"Expected 2D, 3D, or 4D guide map, got shape {t.shape}.")
 
+    if not torch.isfinite(t).all():
+        warnings.warn(
+            "Non-finite (NaN/Inf) pixels detected in coarse guide; replacing with 0.0.",
+            UserWarning,
+            stacklevel=2,
+        )
+        t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+
     mode: GuideNormalization = (
         normalization
         if normalization is not None
@@ -183,6 +203,12 @@ def guide_to_tensor(
     )
 
     if mode == "minmax":
+        flat0 = t.flatten(start_dim=2)
+        mn0 = flat0.min(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
+        mx0 = flat0.max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
+        # Clamp negative FBP sinogram ringing around zero when positive signal exists
+        has_neg_ringing = (mn0 < 0.0) & (mx0 > 0.0)
+        t = torch.where(has_neg_ringing, t.clamp(min=0.0), t)
         flat = t.flatten(start_dim=2)
         mn = flat.min(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
         mx = flat.max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
@@ -196,7 +222,7 @@ def guide_to_tensor(
         t_pos = t.clamp(min=0.0)
         g_max = t_pos.flatten(start_dim=1).max(dim=-1).values.view(-1, 1, 1, 1)
         t = torch.where(
-            g_max > 1e-12, t_pos / g_max.clamp(min=1e-12), torch.zeros_like(t_pos)
+            g_max > 1e-6, t_pos / g_max.clamp(min=1e-6), torch.zeros_like(t_pos)
         )
     elif mode == "simplex":
         t_pos = t.clamp(min=0.0)

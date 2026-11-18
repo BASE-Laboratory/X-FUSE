@@ -188,6 +188,19 @@ def normalize_structural(
     else:
         raise ValueError(f"Expected 2D or 3D image, got {arr.ndim}D shape {arr.shape}.")
 
+    if not np.isfinite(arr).all():
+        import warnings
+
+        warnings.warn(
+            "Non-finite (NaN/Inf) pixels detected in structural HR image; "
+            "imputing with finite median.",
+            UserWarning,
+            stacklevel=2,
+        )
+        finite_vals = arr[np.isfinite(arr)]
+        fill_val = float(np.median(finite_vals)) if finite_vals.size > 0 else 0.0
+        arr = np.nan_to_num(arr, nan=fill_val, posinf=fill_val, neginf=fill_val)
+
     if clip_percentiles is not None:
         lo, hi = np.percentile(arr, clip_percentiles)
         arr = np.clip(arr, lo, hi)

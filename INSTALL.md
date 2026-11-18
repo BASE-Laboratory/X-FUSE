@@ -1,6 +1,6 @@
 # Installation Guide
 
-`x-fuse` (`v0.2.0+`) is a **100% self-contained pure-PyTorch package** with no external sub-repositories or custom C++/CUDA extensions to compile. It runs cleanly on Linux, macOS (Intel & Apple Silicon), and Windows.
+`x-fuse` (`v1.0.0+`) is a **100% self-contained pure-PyTorch package** with no external sub-repositories or custom C++/CUDA extensions to compile. It runs cleanly on Linux, macOS (Intel & Apple Silicon), and Windows.
 
 ## Prerequisites
 
@@ -58,8 +58,8 @@ pip install -e ".[dev,synthetic]"
 # 1. Verify package import & version
 uv run python -c "import x_fuse; print('x-fuse version:', x_fuse.__version__)"
 
-# 2. Run the CPU unit test suite with >=82% coverage gate
-uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=82 -v
+# 2. Run the CPU unit test suite with >=85% coverage gate
+uv run pytest -m "not gpu" --cov=x_fuse --cov-fail-under=85 -v
 
 # 3. Run the quick synthetic & paper ablation benchmarks
 uv run python -m benchmarks.run_synthetic_suite --quick

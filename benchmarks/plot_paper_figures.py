@@ -238,3 +238,24 @@ def generate_paper_figures(
 def main(json_path: str | Path, output_dir: str | Path) -> list[Path]:
     data = json.loads(Path(json_path).read_text(encoding="utf-8"))
     return generate_paper_figures(data, output_dir=output_dir)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Render publication PDF/PNG figures from paper_benchmark_results.json."
+        )
+    )
+    parser.add_argument(
+        "json_path", type=Path, help="Path to paper_benchmark_results.json"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("benchmarks/outputs/paper/paper_figures"),
+    )
+    cli_args = parser.parse_args()
+    rendered = main(cli_args.json_path, cli_args.output_dir)
+    print(json.dumps([str(p) for p in rendered], indent=2))

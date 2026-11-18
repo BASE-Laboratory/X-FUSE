@@ -410,18 +410,17 @@ class HighResBackbone(nn.Module):
         target_hw: tuple[int, int],
         guidance_img: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        pm = self.debiaser(patch_map)
         if self.interpolation_mode == "cross_attn" and guidance_img is not None:
-            return self.cross_attn_upsampler(pm, guidance_img)
+            return self.cross_attn_upsampler(patch_map, guidance_img)
         if self.interpolation_mode == "jbu" and guidance_img is not None:
-            return self.jbu_upsampler(pm, guidance_img)
+            return self.jbu_upsampler(patch_map, guidance_img)
         mode = (
             "bilinear"
             if self.interpolation_mode in ("jbu", "cross_attn")
             else self.interpolation_mode
         )
         kwargs = {"align_corners": False} if mode in ("bilinear", "bicubic") else {}
-        return F.interpolate(pm, size=target_hw, mode=mode, **kwargs)
+        return F.interpolate(patch_map, size=target_hw, mode=mode, **kwargs)
 
     @torch.no_grad()
     def get_transformed_input_batch(
@@ -531,16 +530,20 @@ class HighResBackbone(nn.Module):
 
     @torch.no_grad()
     def forward_sequential(
-        self, x: torch.Tensor, attn_choice: AttentionOptions = "none"
+        self,
+        x: torch.Tensor,
+        attn_choice: AttentionOptions = "none",
+        apply_debias: bool = True,
     ) -> torch.Tensor:
         """Extract dense TTA-averaged high-resolution features ``(1, C, H, W)``,
-        automatically tiling when ``self.tile_size`` is set.
+        automatically tiling when ``self.tile_size`` is set and applying full-FOV
+        apositional debiasing once after stitching (avoiding tile-boundary seams).
         """
         if (
             self.tile_size is not None
             and max(x.shape[-2], x.shape[-1]) > self.tile_size
         ):
-            return run_tiled_2d(
+            out = run_tiled_2d(
                 lambda tile: self._forward_single_tile(tile, attn_choice=attn_choice),
                 x,
                 tile_size=self.tile_size,
@@ -548,7 +551,9 @@ class HighResBackbone(nn.Module):
                 patch_size=self.original_patch_size,
                 stride=self.stride[0],
             )
-        return self._forward_single_tile(x, attn_choice=attn_choice)
+        else:
+            out = self._forward_single_tile(x, attn_choice=attn_choice)
+        return self.debiaser(out) if apply_debias else out
 
     @torch.no_grad()
     def forward(

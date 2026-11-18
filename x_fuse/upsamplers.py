@@ -358,7 +358,8 @@ def extract_multiscale_texture_descriptors(guidance: torch.Tensor) -> torch.Tens
     norm_g = (gray - g_min) / (g_max - g_min).clamp(min=1e-6)
 
     # Sobel gradient magnitude & pooled high-frequency texture energies
-    p1 = F.pad(norm_g, (1, 1, 1, 1), mode="reflect")
+    mode1 = "reflect" if min(height, width) > 1 else "replicate"
+    p1 = F.pad(norm_g, (1, 1, 1, 1), mode=mode1)
     ky = (
         torch.tensor(
             [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
@@ -380,22 +381,23 @@ def extract_multiscale_texture_descriptors(guidance: torch.Tensor) -> torch.Tens
     grad_x = F.conv2d(p1, kx)
     grad_mag = (grad_y.square() + grad_x.square() + 1e-8).sqrt()
     grad_energy3 = F.avg_pool2d(
-        F.pad(grad_mag, (1, 1, 1, 1), mode="reflect"), kernel_size=3, stride=1
+        F.pad(grad_mag, (1, 1, 1, 1), mode=mode1), kernel_size=3, stride=1
     )
     lap_abs = F.conv2d(p1, klap).abs()
     lap_energy3 = F.avg_pool2d(
-        F.pad(lap_abs, (1, 1, 1, 1), mode="reflect"), kernel_size=3, stride=1
+        F.pad(lap_abs, (1, 1, 1, 1), mode=mode1), kernel_size=3, stride=1
     )
 
     # Local 3x3 and 7x7 mean & texture energy (standard deviation)
     mean3 = F.avg_pool2d(p1, kernel_size=3, stride=1)
-    sq3 = F.avg_pool2d(F.pad(norm_g.square(), (1, 1, 1, 1), mode="reflect"), 3, 1)
+    sq3 = F.avg_pool2d(F.pad(norm_g.square(), (1, 1, 1, 1), mode=mode1), 3, 1)
     std3 = (sq3 - mean3.square()).clamp(min=0.0).sqrt()
 
     pad7 = 3 if min(height, width) > 3 else 1
+    mode7 = "reflect" if min(height, width) > pad7 else "replicate"
     k7 = 2 * pad7 + 1
-    mean7 = F.avg_pool2d(F.pad(norm_g, [pad7] * 4, mode="reflect"), k7, 1)
-    sq7 = F.avg_pool2d(F.pad(norm_g.square(), [pad7] * 4, mode="reflect"), k7, 1)
+    mean7 = F.avg_pool2d(F.pad(norm_g, [pad7] * 4, mode=mode7), k7, 1)
+    sq7 = F.avg_pool2d(F.pad(norm_g.square(), [pad7] * 4, mode=mode7), k7, 1)
     std7 = (sq7 - mean7.square()).clamp(min=0.0).sqrt()
 
     desc = torch.cat(
