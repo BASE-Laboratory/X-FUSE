@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
 from typing import Literal, TypeAlias
 
 import torch
@@ -21,11 +23,84 @@ import torch.nn.functional as F
 
 from .physics import LossOptions, PhysicsForwardModel
 from .registration import DifferentiableGuideAligner
-from .upsamplers import ForwardPSFDownsampler, extract_multiscale_texture_descriptors
+from .upsamplers import (
+    ForwardPSFDownsampler,
+    PSFProfile,
+    extract_multiscale_texture_descriptors,
+    extract_structure_tensor_field,
+)
 
 FusionOptions: TypeAlias = Literal[
     "gating", "learned_gating", "spatial_mlp", "attention"
 ]
+
+_HR_DESC_CACHE: OrderedDict[
+    tuple[bytes, tuple[int, ...], str, bool],
+    tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+] = OrderedDict()
+_HR_DESC_CACHE_MAX = 16
+
+
+def _get_hr_descriptors(
+    g_dev: torch.Tensor, orientation_aware: bool
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Extract (or fetch from bounded LRU cache when ``not g_dev.requires_grad``)
+    ``(tex_8ch, spin2_4ch, coh_2ch, gy_edge, gx_edge)`` for ``g_dev``.
+    """
+    g_f32 = g_dev.float()
+    can_cache = not g_f32.requires_grad and g_f32.device.type == "cpu"
+    key: tuple[bytes, tuple[int, ...], str, bool] | None = None
+    if can_cache:
+        g_c = g_f32.detach().contiguous()
+        digest = hashlib.blake2b(g_c.numpy().tobytes(), digest_size=12).digest()
+        key = (digest, tuple(g_c.shape), bool(orientation_aware))  # type: ignore[assignment]
+        cached = _HR_DESC_CACHE.get(key)  # type: ignore[arg-type]
+        if cached is not None:
+            _HR_DESC_CACHE.move_to_end(key)  # type: ignore[arg-type]
+            return cached
+
+    desc = extract_multiscale_texture_descriptors(g_f32)
+    edge_sig = desc[:, [0, 5, 7]]
+    gy = (
+        (edge_sig[:, :, 1:, :] - edge_sig[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+    )
+    gx = (
+        (edge_sig[:, :, :, 1:] - edge_sig[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+    )
+    spin2: torch.Tensor | None = None
+    coh: torch.Tensor | None = None
+    if orientation_aware:
+        spin2 = extract_structure_tensor_field(g_f32)
+        coh = torch.cat(
+            [
+                torch.hypot(spin2[:, 0:1], spin2[:, 1:2]),
+                torch.hypot(spin2[:, 2:3], spin2[:, 3:4]),
+            ],
+            dim=1,
+        )
+        sy = (spin2[:, :, 1:, :] - spin2[:, :, :-1, :]).norm(dim=1, keepdim=True)
+        sx = (spin2[:, :, :, 1:] - spin2[:, :, :, :-1]).norm(dim=1, keepdim=True)
+        gy = gy + 0.5 * sy
+        gx = gx + 0.5 * sx
+
+    out = (desc, spin2, coh, gy, gx)
+    if can_cache and key is not None:
+        _HR_DESC_CACHE[key] = out
+        if len(_HR_DESC_CACHE) > _HR_DESC_CACHE_MAX:
+            _HR_DESC_CACHE.popitem(last=False)
+    return out
 
 
 def edge_aware_tv_loss(
@@ -33,10 +108,12 @@ def edge_aware_tv_loss(
     guidance_hr: torch.Tensor | None = None,
     edge_beta: float = 10.0,
     simplex: bool = False,
+    orientation_aware: bool = True,
 ) -> torch.Tensor:
     """Anisotropic edge-aware Total Variation prior on HR ``logits`` ``(B, M, H, W)``.
     Smooths noisy sub-patch predictions inside homogeneous grains while relaxing
-    smoothing across strong structural intensity or texture boundaries in ``I_HR``.
+    smoothing across strong structural intensity, texture, or spin-2 orientation
+    boundaries in ``I_HR``.
     """
     if simplex:
         bg = torch.zeros_like(logits[:, :1], dtype=torch.float32)
@@ -49,20 +126,8 @@ def edge_aware_tv_loss(
     if guidance_hr is not None:
         if guidance_hr.ndim == 3:
             guidance_hr = guidance_hr.unsqueeze(0)
-        desc = extract_multiscale_texture_descriptors(guidance_hr.to(logits.device))
-        # Combine intensity gradient + texture std gradient so textured boundaries
-        # are also protected from over-smoothing!
-        edge_sig = desc[:, [0, 5, 7]]
-        gy = (
-            (edge_sig[:, :, 1:, :] - edge_sig[:, :, :-1, :])
-            .abs()
-            .mean(dim=1, keepdim=True)
-        )
-        gx = (
-            (edge_sig[:, :, :, 1:] - edge_sig[:, :, :, :-1])
-            .abs()
-            .mean(dim=1, keepdim=True)
-        )
+        g_dev = guidance_hr.to(logits.device)
+        _, _, _, gy, gx = _get_hr_descriptors(g_dev, orientation_aware)
         wy = torch.exp(-edge_beta * gy)
         wx = torch.exp(-edge_beta * gx)
         return (wy * dy).mean() + (wx * dx).mean()
@@ -82,6 +147,7 @@ class LinearProbeHead(nn.Module):
         out_channels: int = 1,
         learn_psf: bool = False,
         spectral_channels: int | None = None,
+        psf_profile: PSFProfile = "gaussian",
     ) -> None:
         super().__init__()
         self.feat_dim = int(feat_dim)
@@ -93,6 +159,7 @@ class LinearProbeHead(nn.Module):
             loss_fn=loss_fn,
             learn_psf=learn_psf,
             spectral_channels=spectral_channels,
+            psf_profile=psf_profile,
         )
         self._channel_mask: torch.Tensor | None = None
 
@@ -175,8 +242,9 @@ class LinearProbeHead(nn.Module):
 
 class SpatialConvMLPHead(nn.Module):
     """Nonlinear spatial fusion head (``fusion_method="spatial_mlp"``) combining
-    ViT semantic features with multi-scale HR texture descriptors via a bottleneck
-    residual depthwise-separable Conv-MLP block and optional edge-aware TV prior.
+    ViT semantic features with multi-scale HR texture & anisotropy coherence
+    descriptors via a bottleneck residual depthwise-separable Conv-MLP block and
+    optional spin-2 edge-aware TV prior.
     """
 
     def __init__(
@@ -189,6 +257,8 @@ class SpatialConvMLPHead(nn.Module):
         spectral_channels: int | None = None,
         tv_weight: float = 1e-3,
         guide_residual: bool = False,
+        psf_profile: PSFProfile = "gaussian",
+        orientation_aware: bool = True,
     ) -> None:
         super().__init__()
         self.feat_dim = int(feat_dim)
@@ -197,6 +267,7 @@ class SpatialConvMLPHead(nn.Module):
         self.loss_fn: LossOptions = loss_fn
         self.tv_weight = float(tv_weight)
         self.guide_residual = bool(guide_residual)
+        self.orientation_aware = bool(orientation_aware)
 
         n_groups = 8 if (self.hidden_dim > 8 and self.hidden_dim % 8 == 0) else 1
         self.feat_norm = nn.GroupNorm(1, self.feat_dim)
@@ -207,6 +278,10 @@ class SpatialConvMLPHead(nn.Module):
             nn.GELU(),
             nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1),
         )
+        self.coh_stem = nn.Conv2d(2, self.hidden_dim, kernel_size=1)
+        nn.init.zeros_(self.coh_stem.weight)
+        if self.coh_stem.bias is not None:
+            nn.init.zeros_(self.coh_stem.bias)
         self.norm1 = nn.GroupNorm(n_groups, self.hidden_dim)
         self.dw_conv = nn.Conv2d(
             self.hidden_dim,
@@ -222,6 +297,10 @@ class SpatialConvMLPHead(nn.Module):
         nn.init.zeros_(self.pixel_proj.weight)
         if self.pixel_proj.bias is not None:
             nn.init.zeros_(self.pixel_proj.bias)
+        self.coh_proj = nn.Conv2d(2, self.out_channels, kernel_size=1)
+        nn.init.zeros_(self.coh_proj.weight)
+        if self.coh_proj.bias is not None:
+            nn.init.zeros_(self.coh_proj.bias)
         self.guide_alpha: nn.Parameter | None = None
         if self.guide_residual:
             self.guide_alpha = nn.Parameter(torch.ones(1, self.out_channels, 1, 1))
@@ -234,6 +313,7 @@ class SpatialConvMLPHead(nn.Module):
             loss_fn=loss_fn,
             learn_psf=learn_psf,
             spectral_channels=spectral_channels,
+            psf_profile=psf_profile,
         )
 
     @property
@@ -242,10 +322,29 @@ class SpatialConvMLPHead(nn.Module):
 
     def _encode_hidden(
         self, features: torch.Tensor, guidance_hr: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        mod_dtype = self.in_proj.weight.dtype
         bsz, _, height, width = features.shape
-        f_h = self.in_proj(self.feat_norm(features.float()))
+        if not features.requires_grad and self.feat_norm.weight is not None:
+            with torch.no_grad():
+                x_hat = F.group_norm(
+                    features.float(), 1, None, None, self.feat_norm.eps
+                )
+            w_eff = self.in_proj.weight.float() * self.feat_norm.weight.float().view(
+                1, -1, 1, 1
+            )
+            b_eff = self.in_proj.bias.float() if self.in_proj.bias is not None else None
+            if self.feat_norm.bias is not None:
+                b_shift = (
+                    self.in_proj.weight.float().squeeze(-1).squeeze(-1)
+                    @ self.feat_norm.bias.float()
+                )
+                b_eff = b_shift if b_eff is None else (b_eff + b_shift)
+            f_h = F.conv2d(x_hat, w_eff, b_eff).to(mod_dtype)
+        else:
+            f_h = self.in_proj(self.feat_norm(features.to(mod_dtype)))
         tex_n: torch.Tensor | None = None
+        coh: torch.Tensor | None = None
         if guidance_hr is not None:
             if guidance_hr.ndim == 3:
                 guidance_hr = guidance_hr.unsqueeze(0)
@@ -259,29 +358,41 @@ class SpatialConvMLPHead(nn.Module):
                 if guidance_hr.shape[-2:] != (height, width)
                 else guidance_hr.float()
             )
-            tex = extract_multiscale_texture_descriptors(g_resized.to(features.device))
+            g_dev = g_resized.to(features.device)
+            tex_f, _, coh_raw, _, _ = _get_hr_descriptors(g_dev, self.orientation_aware)
+            tex = tex_f.to(mod_dtype)
             if tex.shape[0] == 1 and bsz > 1:
                 tex = tex.expand(bsz, -1, -1, -1)
             if tex.shape[0] * height * width > 1:
                 tex_n = self.tex_norm(tex)
             else:
-                tex_n = tex * 0.0 + self.tex_norm.bias.view(1, -1, 1, 1)
+                tex_n = tex * 0.0 + self.tex_norm.bias.to(mod_dtype).view(1, -1, 1, 1)
             t_h = self.tex_stem(tex_n)
+            if self.orientation_aware and coh_raw is not None:
+                coh_m = coh_raw.to(mod_dtype)
+                coh = (
+                    coh_m.expand(bsz, -1, -1, -1)
+                    if (coh_m.shape[0] == 1 and bsz > 1)
+                    else coh_m
+                )
+                t_h = t_h + self.coh_stem(coh)
         else:
             t_h = torch.zeros_like(f_h)
 
         h = F.gelu(self.norm1(f_h + t_h))
         res = self.pw_conv(F.gelu(self.dw_conv(h)))
-        return F.gelu(self.norm2(h + res)), t_h, tex_n
+        return F.gelu(self.norm2(h + res)), t_h, tex_n, coh
 
     def predict_logits(
         self, features: torch.Tensor, guidance_hr: torch.Tensor | None = None
     ) -> torch.Tensor:
-        h_out, t_h, tex_n = self._encode_hidden(features, guidance_hr=guidance_hr)
+        h_out, t_h, tex_n, coh = self._encode_hidden(features, guidance_hr=guidance_hr)
         logits = self.out_proj(torch.cat([h_out, t_h], dim=1))
         if tex_n is not None:
             logits = logits + self.pixel_proj(tex_n)
-        return logits
+        if coh is not None:
+            logits = logits + self.coh_proj(coh)
+        return logits.float()
 
     def apply_guide_residual(
         self,
@@ -316,12 +427,12 @@ class SpatialConvMLPHead(nn.Module):
             prior = torch.log(g_hr.clamp(1e-4, 1.0) / bg_hr)
         else:
             prior = torch.logit(g_hr.clamp(1e-4, 1.0 - 1e-4))
-        scaled_prior = self.guide_alpha.to(logits_canon.device) * prior
+        scaled_prior = self.guide_alpha.float().to(logits_canon.device) * prior
         if (oh, ow) != (full_h, full_w):
             scaled_prior = F.pad(
                 scaled_prior, (0, full_w - ow, 0, full_h - oh), mode="replicate"
             )
-        return logits_canon + scaled_prior
+        return logits_canon.float() + scaled_prior
 
     def compute_loss_from_logits(
         self,
@@ -356,6 +467,7 @@ class SpatialConvMLPHead(nn.Module):
                 tv_logits,
                 guidance_hr=tv_guidance,
                 simplex=(self.loss_fn == "compositional_kl"),
+                orientation_aware=self.orientation_aware,
             )
         return base_loss
 
@@ -387,7 +499,6 @@ class SpatialConvMLPHead(nn.Module):
         xrd_map: torch.Tensor | None = None,
         guidance_hr: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Modulate feature channels using input projection importance
         w_feat = self.in_proj.weight.detach().float()[:, :, 0, 0]
         gates = w_feat.norm(dim=0)
         gates = gates / gates.max().clamp(min=1e-8)
@@ -415,6 +526,7 @@ class WindowedGuideCrossAttentionHead(nn.Module):
         learn_psf: bool = False,
         spectral_channels: int | None = None,
         max_kv_grid: int = 16,
+        psf_profile: PSFProfile = "gaussian",
     ) -> None:
         super().__init__()
         while feat_dim % num_heads != 0 and num_heads > 1:
@@ -443,6 +555,7 @@ class WindowedGuideCrossAttentionHead(nn.Module):
             loss_fn=loss_fn,
             learn_psf=learn_psf,
             spectral_channels=spectral_channels,
+            psf_profile=psf_profile,
         )
 
     @property
@@ -474,14 +587,17 @@ class WindowedGuideCrossAttentionHead(nn.Module):
         """Modulate ``features`` ``(B, C, H, W)`` in ``O(H * W * K_pool)`` memory."""
         bsz, channels, height, width = features.shape
         orig_dtype = features.dtype
-        feat_raw = features.float()
+        mod_dtype = self.feat_query_proj.weight.dtype
+        feat_raw = features.to(mod_dtype)
         feat_f = (
             self.feat_norm(feat_raw)
             if feat_raw.shape[0] * height * width > 1
             else feat_raw
         )
 
-        guide = self._prepare_guide(xrd_map, (height, width)).to(device=features.device)
+        guide = self._prepare_guide(xrd_map, (height, width)).to(
+            device=features.device, dtype=mod_dtype
+        )
         guide_flat = guide.reshape(guide.shape[0], guide.shape[1], -1).permute(0, 2, 1)
         q_guide = self.xrd_to_query(guide_flat)
         if q_guide.shape[0] == 1 and bsz > 1:
@@ -510,9 +626,10 @@ class WindowedGuideCrossAttentionHead(nn.Module):
     def predict_logits(
         self, features: torch.Tensor, guide_map: torch.Tensor
     ) -> torch.Tensor:
-        attended = self.forward(features.float(), guide_map.float())
+        mod_dtype = self.pred_head.weight.dtype
+        attended = self.forward(features.to(mod_dtype), guide_map)
         bsz, _, height, width = attended.shape
-        logits = self.pred_head(attended.permute(0, 2, 3, 1))
+        logits = self.pred_head(attended.permute(0, 2, 3, 1)).float()
         return logits.permute(0, 3, 1, 2).reshape(
             bsz, self.guide_channels, height, width
         )

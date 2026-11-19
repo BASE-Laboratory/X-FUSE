@@ -201,6 +201,8 @@ class HighResBackbone(nn.Module):
         debias_positional: bool = False,
         debias_degree: int = 2,
         learned_upsampler: bool = False,
+        upsampler_orientation: bool = True,
+        upsampler_subtoken: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -248,6 +250,8 @@ class HighResBackbone(nn.Module):
         self.transforms: list[partial] = []
         self.inverse_transforms: list[partial] = []
         self.interpolation_mode: Interpolation = interpolation_mode
+        self.upsampler_orientation: bool = bool(upsampler_orientation)
+        self.upsampler_subtoken: bool = bool(upsampler_subtoken)
         self.jbu_upsampler = JointBilateralUpsampler(
             guidance_dim=3, radius=2, sigma_spatial=1.5, sigma_range=0.15, learned=False
         )
@@ -256,6 +260,8 @@ class HighResBackbone(nn.Module):
             key_dim=16,
             radius=2,
             learned=learned_upsampler,
+            orientation_aware=self.upsampler_orientation,
+            subtoken_offsets=self.upsampler_subtoken,
         )
         self.debiaser = ApositionalFeatureDebiaser(
             enabled=debias_positional, degree=debias_degree

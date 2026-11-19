@@ -369,6 +369,7 @@ class VolumetricFuser:
         )
         self._global_prior: torch.Tensor | None = None
         self._sparse_guides_norm: dict[int, torch.Tensor] = {}
+        self._last_fit_diagnostics: dict[str, Any] = {}
 
     def _can_tile_head(self) -> bool:
         return self.fuser.xrd_fuse_method in ("learned_gating", "spatial_mlp")
@@ -402,6 +403,237 @@ class VolumetricFuser:
         )
         return padded, orig_hw
 
+    def _forward_slab_logits_grad(
+        self,
+        slab_t: torch.Tensor,
+        orig_hw: tuple[int, int],
+        guide_ref: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Differentiably predict canonical HR logits ``(1, M, H_pad, W_pad)``
+        ensembled across TTA views while reusing cached frozen ViT features."""
+        from .heads import SpatialConvMLPHead
+
+        _, img_h, img_w = slab_t.shape
+        kind, cached_views = self.fuser._extract_tta_views(slab_t, want_hr=True)
+        img_batch: torch.Tensor | None = None
+        if kind == "patch" or self.fuser.xrd_fuse_method == "spatial_mlp":
+            x_in = (
+                slab_t.to(self.fuser.dtype)
+                if self.fuser.dtype != torch.float32
+                else slab_t
+            )
+            with torch.no_grad():
+                img_batch = self.fuser.get_transformed_input_batch(
+                    x_in, self.fuser.transforms
+                )
+
+        n_tr = len(self.fuser.transforms)
+        valid_hw = orig_hw if orig_hw != (img_h, img_w) else None
+        logits_acc: torch.Tensor | None = None
+        for i in range(n_tr):
+            tr_img = img_batch[i].unsqueeze(0) if img_batch is not None else None
+            feat_in = (
+                self.fuser._upsample_patch_map(
+                    cached_views[i].float(), (img_h, img_w), guidance_img=tr_img
+                )
+                if (kind == "patch" and tr_img is not None)
+                else cached_views[i]
+            )
+            if self.fuser.xrd_fuse_method in ("learned_gating", "spatial_mlp"):
+                head_mod = (
+                    self.fuser.learned_gating
+                    if self.fuser.xrd_fuse_method == "learned_gating"
+                    else self.fuser.spatial_mlp
+                )
+                assert head_mod is not None
+                l_tr = head_mod.predict_logits(feat_in, guidance_hr=tr_img)
+                if l_tr.shape[-2:] != (img_h, img_w):
+                    l_tr = F.interpolate(
+                        l_tr,
+                        size=(img_h, img_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                l_can = self.fuser.inverse_transforms[i](l_tr)
+                if isinstance(head_mod, SpatialConvMLPHead) and guide_ref is not None:
+                    l_can = head_mod.apply_guide_residual(
+                        l_can, guide_ref, valid_hr_hw=valid_hw
+                    )
+            else:
+                assert self.fuser.spatial_attention is not None
+                if feat_in.shape[-2:] != (img_h, img_w):
+                    feat_in = F.interpolate(
+                        feat_in.float(),
+                        size=(img_h, img_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                f_can = self.fuser.inverse_transforms[i](feat_in)
+                g_att = (
+                    guide_ref
+                    if guide_ref is not None
+                    else torch.full(
+                        (1, self.fuser.guide_channels, 4, 4),
+                        0.5,
+                        device=slab_t.device,
+                    )
+                )
+                l_can = self.fuser.spatial_attention.predict_logits(f_can, g_att)
+            logits_acc = l_can if logits_acc is None else (logits_acc + l_can)
+        assert logits_acc is not None
+        return logits_acc / float(max(n_tr, 1))
+
+    def _logits_to_probs_grad(
+        self, logits: torch.Tensor, target_hint: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, str]:
+        phys = self.fuser._active_physics()
+        if phys is not None and phys.loss_fn == "compositional_kl":
+            sp = phys.logits_to_simplex_probs(logits.float(), target=target_hint)
+            tag = "simplex_bg" if sp.shape[1] == phys.n_channels + 1 else "simplex_full"
+            return sp, tag
+        return torch.sigmoid(logits.float()), "sigmoid"
+
+    @staticmethod
+    def _probs_to_effective_logits(
+        probs: torch.Tensor, mode_tag: str, eps: float = 1e-6
+    ) -> torch.Tensor:
+        p = probs.clamp(eps, 1.0 - eps)
+        if mode_tag == "simplex_bg":
+            return torch.log(p[:, 1:]) - torch.log(p[:, :1])
+        if mode_tag == "simplex_full":
+            return torch.log(p)
+        return torch.logit(p, eps=eps)
+
+    def _depth_psf_slice_step(
+        self,
+        s_idx: int,
+        canon_guide: torch.Tensor,
+        center_slab: torch.Tensor,
+        orig_hw: tuple[int, int],
+        loss_mask_lr: torch.Tensor | None,
+        stencil_slabs: dict[int, tuple[torch.Tensor, tuple[int, int]]],
+        sparse_norm_cpu: dict[int, torch.Tensor],
+        depth_ax: int,
+        axis: int,
+        stencil_radius: int,
+        z_step: int,
+        sigma_z: torch.Tensor,
+        update_aligner: bool,
+        dev: torch.device,
+    ) -> float:
+        assert self.fuser.fusion_optimizer is not None
+        self.fuser.fusion_optimizer.zero_grad()
+        if self.fuser.align_optimizer is not None:
+            self.fuser.align_optimizer.zero_grad()
+
+        g_ref = canon_guide.unsqueeze(0) if canon_guide.ndim == 3 else canon_guide
+        dz = torch.tensor(
+            [float(j * z_step) for j in range(-stencil_radius, stencil_radius + 1)],
+            device=dev,
+            dtype=torch.float32,
+        )
+        w_z = torch.exp(-0.5 * (dz / sigma_z) ** 2)
+        w_z = w_z / w_z.sum().clamp(min=1e-8)
+
+        p_bar: torch.Tensor | None = None
+        l_center: torch.Tensor | None = None
+        mode_tag = "sigmoid"
+        for j_i, j in enumerate(range(-stencil_radius, stencil_radius + 1)):
+            z_nb = int(np.clip(s_idx + j * z_step, 0, depth_ax - 1))
+            nb_slab, nb_hw = stencil_slabs[z_nb]
+            g_nb = self._resolve_slice_guide_2d(
+                idx=z_nb,
+                depth=depth_ax,
+                axis=axis,
+                coarse_guide_3d_norm=None,
+                sparse_guides_norm=sparse_norm_cpu or None,
+                fallback_guide=g_ref,
+                device=dev,
+            )
+            l_nb = self._forward_slab_logits_grad(nb_slab, nb_hw, guide_ref=g_nb)
+            if j == 0:
+                l_center = l_nb
+            p_nb, mode_tag = self._logits_to_probs_grad(l_nb, target_hint=g_ref)
+            w_p = w_z[j_i] * p_nb
+            p_bar = w_p if p_bar is None else (p_bar + w_p)
+
+        assert p_bar is not None
+        logits_eff = self._probs_to_effective_logits(p_bar, mode_tag)
+        aligner_arg = (
+            self.fuser.guide_aligner if self.fuser.align_guide != "none" else None
+        )
+        valid_hw = orig_hw if orig_hw != tuple(center_slab.shape[-2:]) else None
+        if self.fuser.xrd_fuse_method == "spatial_mlp":
+            from .heads import edge_aware_tv_loss
+
+            assert self.fuser.spatial_mlp is not None
+            loss_t = self.fuser.spatial_mlp.physics.compute_loss_from_logits(
+                logits_eff,
+                guide_map=g_ref,
+                coarse_target=g_ref,
+                aligner=aligner_arg,
+                valid_hr_hw=valid_hw,
+                loss_mask_lr=loss_mask_lr,
+            )
+            if self.fuser.spatial_mlp.tv_weight > 0.0 and l_center is not None:
+                tv_logits = (
+                    l_center[:, :, : valid_hw[0], : valid_hw[1]]
+                    if valid_hw is not None
+                    else l_center
+                )
+                g_hr_c = center_slab.unsqueeze(0)
+                tv_g = (
+                    g_hr_c[:, :, : valid_hw[0], : valid_hw[1]]
+                    if valid_hw is not None
+                    else g_hr_c
+                )
+                simplex = self.fuser.spatial_mlp.loss_fn in (
+                    "compositional_kl",
+                    "forward_psf_poisson",
+                ) or (self.fuser.spatial_mlp.physics.spectral_dict is not None)
+                loss_t = loss_t + self.fuser.spatial_mlp.tv_weight * edge_aware_tv_loss(
+                    tv_logits,
+                    guidance_hr=tv_g,
+                    simplex=simplex,
+                    orientation_aware=self.fuser.spatial_mlp.orientation_aware,
+                )
+        elif self.fuser.xrd_fuse_method == "learned_gating":
+            assert self.fuser.learned_gating is not None
+            loss_t = self.fuser.learned_gating.compute_loss_from_logits(
+                logits_eff,
+                xrd_map=g_ref,
+                coarse_target=g_ref,
+                aligner=aligner_arg,
+                valid_hr_hw=valid_hw,
+                loss_mask_lr=loss_mask_lr,
+            )
+        else:
+            assert self.fuser.spatial_attention is not None
+            loss_t = self.fuser.spatial_attention.compute_loss_from_logits(
+                logits_eff[:, :, : orig_hw[0], : orig_hw[1]],
+                guide_map=g_ref,
+                coarse_target=g_ref,
+                aligner=aligner_arg,
+                loss_mask_lr=loss_mask_lr,
+            )
+        if aligner_arg is not None:
+            loss_t = loss_t + aligner_arg.regularization_loss(
+                (int(g_ref.shape[-2]), int(g_ref.shape[-1])), device=dev
+            )
+        loss_t.backward()
+        all_p = [
+            p for pg in self.fuser.fusion_optimizer.param_groups for p in pg["params"]
+        ]
+        if all_p:
+            torch.nn.utils.clip_grad_norm_(all_p, max_norm=1.0)
+        self.fuser.fusion_optimizer.step()
+        if update_aligner and self.fuser.align_optimizer is not None:
+            torch.nn.utils.clip_grad_norm_(
+                list(self.fuser.guide_aligner.parameters()), max_norm=1.0
+            )
+            self.fuser.align_optimizer.step()
+        return float(loss_t.item())
+
     def fit_sparse_slices(
         self,
         hr_volume: Any,
@@ -410,15 +642,30 @@ class VolumetricFuser:
         delta: int = 1,
         axis: int = 0,
         reset_weights: bool = True,
+        *,
+        depth_psf_sigma: float = 0.0,
+        learn_depth_psf: bool = False,
+        depth_stencil_radius: int = 1,
+        triplane_consistency_weight: float = 0.0,
+        n_consistency_slices: int = 2,
     ) -> list[float]:
         """Train the ``CorrelativeFuser`` head on sparse 2D guided slices
-        ``{slice_idx: guide_map}`` using 2.5D ``(z - delta, z, z + delta)`` slabs."""
+        ``{slice_idx: guide_map}`` using 2.5D ``(z - delta, z, z + delta)`` slabs,
+        with optional axial depth-PSF deconvolution and tri-plane consistency."""
         if not sparse_guides:
             raise ValueError("sparse_guides must contain at least one guided slice.")
         if reset_weights:
             self.fuser.reset_trainable_weights()
+        elif self.fuser.fusion_optimizer is not None:
+            self.fuser.fusion_optimizer.param_groups = [
+                pg
+                for pg in self.fuser.fusion_optimizer.param_groups
+                if not pg.get("_depth_psf_group", False)
+            ]
 
         accessor = VolumeSliceAccessor(hr_volume)
+        z_dim, y_dim, x_dim = accessor.shape
+        depth_ax = accessor.shape[axis]
         vmin, vmax = accessor.estimate_robust_range()
         dev = next(self.fuser.dinov2.parameters()).device
         is_spectral = self.fuser.spectral_channels is not None
@@ -458,17 +705,122 @@ class VolumetricFuser:
         self._sparse_guides_norm = sparse_norm_cpu
         if prior_accum:
             self._global_prior = torch.stack(prior_accum, dim=0).mean(dim=0)
-        # Ensure all sparse slices fit in the TTA feature cache across epochs
-        self.fuser._max_cache_entries = max(
-            self.fuser._max_cache_entries, len(prepared_slabs) + 2
+
+        slice_keys = sorted(prepared_guides.keys())
+        use_depth_psf = (depth_psf_sigma > 0.0 or learn_depth_psf) and depth_ax >= 2
+        use_cons = (
+            triplane_consistency_weight > 0.0
+            and min(z_dim, y_dim, x_dim) >= 4
+            and max(1, int(n_consistency_slices)) >= 1
         )
 
+        self.fuser.set_guide_transforms(
+            prepared_guides[slice_keys[0]],
+            self.fwd_tta,
+            self.inv_tta,
+            spectral_unmix=is_spectral,
+            n_components=self.fuser.guide_channels,
+        )
+
+        raw_depth_sigma: torch.nn.Parameter | None = None
+        init_sig = float(
+            np.clip(depth_psf_sigma if depth_psf_sigma > 0.0 else 1.5, 0.35, 5.8)
+        )
+        # Contiguous unit-step stencil (z_step=1) avoids skipping intermediate slices
+        stencil_r = (
+            min(
+                4,
+                max(
+                    int(depth_stencil_radius),
+                    int(np.ceil(1.5 * init_sig)),
+                    2 if learn_depth_psf else 1,
+                ),
+            )
+            if use_depth_psf
+            else max(1, int(depth_stencil_radius))
+        )
+        z_step = 1
+        stencil_slabs: dict[int, tuple[torch.Tensor, tuple[int, int]]] = {
+            s_i: (prepared_slabs[s_i], orig_hws[s_i]) for s_i in slice_keys
+        }
+        if use_depth_psf:
+            if learn_depth_psf and self.fuser.fusion_optimizer is not None:
+                frac = float(np.clip((init_sig - 0.25) / 6.0, 1e-3, 1.0 - 1e-3))
+                raw_depth_sigma = torch.nn.Parameter(
+                    torch.tensor(
+                        float(np.log(frac / (1.0 - frac))),
+                        device=dev,
+                        dtype=torch.float32,
+                    )
+                )
+                self.fuser.fusion_optimizer.add_param_group(
+                    {
+                        "params": [raw_depth_sigma],
+                        "lr": max(self.fuser.lr * 2.0, 2e-2),
+                        "_depth_psf_group": True,
+                    }
+                )
+            for s_i in slice_keys:
+                for j in range(-stencil_r, stencil_r + 1):
+                    z_nb = int(np.clip(s_i + j * z_step, 0, depth_ax - 1))
+                    if z_nb not in stencil_slabs:
+                        stencil_slabs[z_nb] = self._prepare_slab_tensor(
+                            accessor,
+                            z_nb,
+                            axis=axis,
+                            delta=delta,
+                            vmin=vmin,
+                            vmax=vmax,
+                            device=dev,
+                        )
+
+        cons_coords: list[tuple[int, int, int]] = []
+        cons_slabs: dict[tuple[int, int], tuple[torch.Tensor, tuple[int, int]]] = {}
+        if use_cons:
+            n_cs = max(1, int(n_consistency_slices))
+            n_pool = max(2, n_cs * 2)
+            unguided = [
+                z_i for z_i in range(z_dim) if (axis != 0 or z_i not in prepared_guides)
+            ] or list(range(z_dim))
+            rng_c = np.random.default_rng(137 + len(slice_keys))
+            z_ps = [
+                int(unguided[i % len(unguided)])
+                for i in np.linspace(0, len(unguided) - 1, num=n_pool, dtype=int)
+            ]
+            y_ps = rng_c.integers(1, max(2, y_dim - 1), size=n_pool).tolist()
+            x_ps = rng_c.integers(1, max(2, x_dim - 1), size=n_pool).tolist()
+            for z_u, y_u, x_u in zip(z_ps, y_ps, x_ps, strict=False):
+                cons_coords.append((int(z_u), int(y_u), int(x_u)))
+                for ax_c, idx_c in ((0, int(z_u)), (1, int(y_u)), (2, int(x_u))):
+                    if (ax_c, idx_c) not in cons_slabs:
+                        cons_slabs[(ax_c, idx_c)] = (
+                            stencil_slabs[idx_c]
+                            if (ax_c == axis and idx_c in stencil_slabs)
+                            else self._prepare_slab_tensor(
+                                accessor,
+                                idx_c,
+                                axis=ax_c,
+                                delta=delta,
+                                vmin=vmin,
+                                vmax=vmax,
+                                device=dev,
+                            )
+                        )
+
+        self.fuser._max_cache_entries = max(
+            self.fuser._max_cache_entries, len(stencil_slabs) + len(cons_slabs) + 4
+        )
         self.fuser.train()
         self.fuser.dinov2.eval()
         epoch_losses: list[float] = []
-        slice_keys = sorted(prepared_guides.keys())
         n_ep = max(1, epochs)
         warmup_ep = int(round(0.3 * n_ep)) if self.fuser.align_guide != "none" else 0
+        dummy_guide = (
+            self._global_prior.to(dev).unsqueeze(-1).unsqueeze(-1)
+            if self._global_prior is not None
+            else torch.full((1, self.fuser.guide_channels, 4, 4), 0.5, device=dev)
+        )
+
         for ep in range(n_ep):
             step_losses = []
             for s_idx in slice_keys:
@@ -479,17 +831,114 @@ class VolumetricFuser:
                     spectral_unmix=is_spectral,
                     n_components=self.fuser.guide_channels,
                 )
-                loss_val = self.fuser.train_fusion_step(
-                    prepared_slabs[s_idx],
-                    update_aligner=(ep >= warmup_ep),
-                    valid_hr_hw=orig_hws[s_idx],
-                    loss_mask_lr=train_masks[s_idx],
-                )
+                if not use_depth_psf:
+                    loss_val = self.fuser.train_fusion_step(
+                        prepared_slabs[s_idx],
+                        update_aligner=(ep >= warmup_ep),
+                        valid_hr_hw=orig_hws[s_idx],
+                        loss_mask_lr=train_masks[s_idx],
+                    )
+                else:
+                    sig_t = (
+                        0.25 + 6.0 * torch.sigmoid(raw_depth_sigma)
+                        if raw_depth_sigma is not None
+                        else torch.tensor(
+                            max(float(depth_psf_sigma), 0.25),
+                            device=dev,
+                            dtype=torch.float32,
+                        )
+                    )
+                    loss_val = self._depth_psf_slice_step(
+                        s_idx=s_idx,
+                        canon_guide=prepared_guides[s_idx],
+                        center_slab=prepared_slabs[s_idx],
+                        orig_hw=orig_hws[s_idx],
+                        loss_mask_lr=train_masks[s_idx],
+                        stencil_slabs=stencil_slabs,
+                        sparse_norm_cpu=sparse_norm_cpu,
+                        depth_ax=depth_ax,
+                        axis=axis,
+                        stencil_radius=stencil_r,
+                        z_step=z_step,
+                        sigma_z=sig_t,
+                        update_aligner=(ep >= warmup_ep),
+                        dev=dev,
+                    )
                 step_losses.append(loss_val)
+
+            if (
+                use_cons
+                and ep >= int(0.25 * n_ep)
+                and self.fuser.fusion_optimizer is not None
+                and cons_coords
+            ):
+                self.fuser.fusion_optimizer.zero_grad()
+                n_cs = max(1, int(n_consistency_slices))
+                c_sum = torch.tensor(0.0, device=dev)
+                for k_c in range(n_cs):
+                    z_u, y_u, x_u = cons_coords[(ep * n_cs + k_c) % len(cons_coords)]
+                    s_xy, hw_xy = cons_slabs[(0, z_u)]
+                    s_xz, hw_xz = cons_slabs[(1, y_u)]
+                    s_yz, hw_yz = cons_slabs[(2, x_u)]
+                    g_xy = self._resolve_slice_guide_2d(
+                        z_u, z_dim, 0, None, sparse_norm_cpu or None, dummy_guide, dev
+                    )
+                    p_xy = self._logits_to_probs_grad(
+                        self._forward_slab_logits_grad(s_xy, hw_xy, guide_ref=g_xy)
+                    )[0][0, :, : hw_xy[0], : hw_xy[1]]
+                    p_xz = self._logits_to_probs_grad(
+                        self._forward_slab_logits_grad(
+                            s_xz, hw_xz, guide_ref=dummy_guide
+                        )
+                    )[0][0, :, : hw_xz[0], : hw_xz[1]]
+                    p_yz = self._logits_to_probs_grad(
+                        self._forward_slab_logits_grad(
+                            s_yz, hw_yz, guide_ref=dummy_guide
+                        )
+                    )[0][0, :, : hw_yz[0], : hw_yz[1]]
+
+                    lx_a, lx_b = p_xy[:, y_u, :], p_xz[:, z_u, :]
+                    bx = 0.55 * lx_a.detach() + 0.45 * lx_b.detach()
+                    ly_a, ly_b = p_xy[:, :, x_u], p_yz[:, z_u, :]
+                    by = 0.55 * ly_a.detach() + 0.45 * ly_b.detach()
+                    lz_a, lz_b = p_xz[:, :, x_u], p_yz[:, :, y_u]
+                    bz = 0.50 * (lz_a.detach() + lz_b.detach())
+                    c_sum = (
+                        c_sum
+                        + (
+                            F.mse_loss(lx_a, bx)
+                            + F.mse_loss(lx_b, bx)
+                            + F.mse_loss(ly_a, by)
+                            + F.mse_loss(ly_b, by)
+                            + F.mse_loss(lz_a, bz)
+                            + F.mse_loss(lz_b, bz)
+                        )
+                        / 6.0
+                    )
+                (float(triplane_consistency_weight) * (c_sum / float(n_cs))).backward()
+                all_p = [
+                    p
+                    for pg in self.fuser.fusion_optimizer.param_groups
+                    for p in pg["params"]
+                ]
+                if all_p:
+                    torch.nn.utils.clip_grad_norm_(all_p, max_norm=1.0)
+                self.fuser.fusion_optimizer.step()
+
             epoch_losses.append(float(np.mean(step_losses)))
         self.fuser.eval()
 
-        # Calibrate zero-label conformal sets on held-out blocks of first guided slice
+        learned_sig_z = (
+            float((0.25 + 6.0 * torch.sigmoid(raw_depth_sigma)).detach().cpu().item())
+            if raw_depth_sigma is not None
+            else float(depth_psf_sigma)
+        )
+        self._last_fit_diagnostics = {
+            "depth_psf_enabled": bool(use_depth_psf),
+            "depth_psf_sigma_learned": learned_sig_z,
+            "triplane_consistency_weight": float(triplane_consistency_weight),
+        }
+
         if self.fuser.calibrator is not None and slice_keys:
             s0 = slice_keys[0]
             self.fuser.set_guide_transforms(
@@ -890,6 +1339,7 @@ class VolumetricFuser:
             combined_uncertainty=combined_3d,
             z_slice_consistency=z_cons,
             diagnostics={
+                **self._last_fit_diagnostics,
                 "volumetric_mode": mode,
                 "delta": eff_delta,
                 "volume_shape": [z_dim, y_dim, x_dim],

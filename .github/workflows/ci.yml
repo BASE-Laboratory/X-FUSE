@@ -46,6 +46,12 @@ jobs:
     name: Unit Tests (Py ${{ matrix.python-version }} / ${{ matrix.os }})
     needs: quality
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +95,11 @@ jobs:
     name: Package Build & Benchmark Smoke
     needs: quality
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 

@@ -50,6 +50,7 @@ from .transforms import (
 )
 from .uncertainty import (
     ConformalCalibrator,
+    ConformalMethod,
     UncertaintyReport,
     WelfordAccumulator,
     _safe_quantile,
@@ -58,7 +59,11 @@ from .uncertainty import (
     compute_posterior_uncertainty,
     match_coarse_priors,
 )
-from .upsamplers import CrossAttentionFeatureUpsampler, ForwardPSFDownsampler
+from .upsamplers import (
+    CrossAttentionFeatureUpsampler,
+    ForwardPSFDownsampler,
+    PSFProfile,
+)
 from .utils import guide_to_tensor
 from .vit_patch import AttentionOptions
 
@@ -315,6 +320,8 @@ class CorrelativeFuser(nn.Module):
         fusion_method: FusionOptions | None = None,
         upsampler: Interpolation | None = None,
         learned_upsampler: bool = False,
+        upsampler_orientation: bool = True,
+        upsampler_subtoken: bool = True,
         debias_positional: bool = False,
         debias_degree: int = 2,
         layers: LayerSelection = "last",
@@ -322,8 +329,11 @@ class CorrelativeFuser(nn.Module):
         max_shift_coarse_px: float = 1.5,
         bspline_grid_size: int = 6,
         learn_psf: bool = False,
+        psf_profile: PSFProfile = "gaussian",
         conformal_alpha: float | None = None,
-        conformal_method: Literal["lac", "aps"] = "lac",
+        conformal_method: ConformalMethod = "lac",
+        conformal_fit_temperature: bool = False,
+        conformal_spatial_block_size: int = 1,
         spectral_channels: int | None = None,
         tv_weight: float = 1e-3,
         guide_residual: bool = False,
@@ -361,6 +371,8 @@ class CorrelativeFuser(nn.Module):
             debias_positional=debias_positional,
             debias_degree=debias_degree,
             learned_upsampler=learned_upsampler,
+            upsampler_orientation=upsampler_orientation,
+            upsampler_subtoken=upsampler_subtoken,
             **kwargs,
         )
 
@@ -375,15 +387,27 @@ class CorrelativeFuser(nn.Module):
         self.max_shift_coarse_px: float = float(max_shift_coarse_px)
         self.bspline_grid_size: int = int(bspline_grid_size)
         self.learn_psf: bool = bool(learn_psf)
+        self.psf_profile: PSFProfile = psf_profile
         self.learned_upsampler: bool = bool(learned_upsampler)
+        self.upsampler_orientation: bool = bool(upsampler_orientation)
+        self.upsampler_subtoken: bool = bool(upsampler_subtoken)
         self.tv_weight: float = float(tv_weight)
         self.guide_residual: bool = bool(guide_residual)
         self.cache_features: bool = bool(cache_features)
         self.conformal_alpha: float | None = conformal_alpha
-        self.conformal_method: Literal["lac", "aps"] = conformal_method
+        self.conformal_method: ConformalMethod = conformal_method
+        self.conformal_fit_temperature: bool = bool(conformal_fit_temperature)
+        self.conformal_spatial_block_size: int = max(
+            1, int(conformal_spatial_block_size)
+        )
 
         self.calibrator: ConformalCalibrator | None = (
-            ConformalCalibrator(alpha=conformal_alpha, method=conformal_method)
+            ConformalCalibrator(
+                alpha=conformal_alpha,
+                method=conformal_method,
+                fit_temperature=self.conformal_fit_temperature,
+                spatial_block_size=self.conformal_spatial_block_size,
+            )
             if conformal_alpha is not None
             else None
         )
@@ -599,6 +623,7 @@ class CorrelativeFuser(nn.Module):
                 out_channels=self.guide_channels,
                 learn_psf=self.learn_psf,
                 spectral_channels=spectral_channels,
+                psf_profile=self.psf_profile,
             )
             if device is not None:
                 self.learned_gating = self.learned_gating.to(device)
@@ -614,6 +639,8 @@ class CorrelativeFuser(nn.Module):
                 spectral_channels=spectral_channels,
                 tv_weight=self.tv_weight,
                 guide_residual=self.guide_residual,
+                psf_profile=self.psf_profile,
+                orientation_aware=self.upsampler_orientation,
             )
             if device is not None:
                 self.spatial_mlp = self.spatial_mlp.to(device)
@@ -628,6 +655,7 @@ class CorrelativeFuser(nn.Module):
                 loss_fn=self.loss_fn,
                 learn_psf=self.learn_psf,
                 spectral_channels=spectral_channels,
+                psf_profile=self.psf_profile,
             )
             if device is not None:
                 self.spatial_attention = self.spatial_attention.to(device)
@@ -661,6 +689,8 @@ class CorrelativeFuser(nn.Module):
                     key_dim=16,
                     radius=2,
                     learned=True,
+                    orientation_aware=self.upsampler_orientation,
+                    subtoken_offsets=self.upsampler_subtoken,
                 ).to(dev)
             )
         self._init_fusion_heads(
@@ -798,10 +828,14 @@ class CorrelativeFuser(nn.Module):
         ``learned_upsampler=True``.
         """
         _, img_h, img_w = x.shape
+        is_tiled = self.tile_size is not None and max(img_h, img_w) > self.tile_size
         train_up = self.learned_upsampler and self.interpolation_mode == "cross_attn"
+        can_cache = (
+            self.cache_features and not self.track_grad and not (train_up and is_tiled)
+        )
         cache_hr = want_hr and not train_up and (img_h * img_w <= 512 * 512)
         key = self._cache_key(x, cache_hr)
-        if self.cache_features and not train_up and key in self._tta_cache:
+        if can_cache and key in self._tta_cache:
             self._tta_cache.move_to_end(key)
             return self._tta_cache[key]
 
@@ -810,7 +844,8 @@ class CorrelativeFuser(nn.Module):
             img_batch = self.get_transformed_input_batch(x_in, self.transforms)
         n_transforms = len(self.transforms)
 
-        if self.tile_size is not None and max(img_h, img_w) > self.tile_size:
+        if is_tiled and self.tile_size is not None:
+            tile_sz = self.tile_size
             hr_views: list[torch.Tensor] = []
             for i in range(n_transforms):
                 tr_img = img_batch[i]
@@ -834,14 +869,14 @@ class CorrelativeFuser(nn.Module):
                 hr_v = run_tiled_2d(
                     _single_tr_tile,
                     tr_img,
-                    tile_size=self.tile_size,
+                    tile_size=tile_sz,
                     overlap=self.tile_overlap,
                     patch_size=self.original_patch_size,
                     stride=self.stride[0],
                 )
                 # Full-FOV debiasing after stitching prevents tile-boundary seams
                 hr_views.append(self.backbone_extractor.debiaser(hr_v))
-            if self.cache_features and not train_up and (img_h * img_w <= 512 * 512):
+            if can_cache and (img_h * img_w <= 512 * 512):
                 self._tta_cache[key] = ("hr", hr_views)
                 while len(self._tta_cache) > self._max_cache_entries:
                     self._tta_cache.popitem(last=False)
@@ -871,7 +906,7 @@ class CorrelativeFuser(nn.Module):
                 out_views.append(debiased)
 
         result = (kind, out_views)
-        if self.cache_features and not train_up:
+        if can_cache:
             self._tta_cache[key] = result
             while len(self._tta_cache) > self._max_cache_entries:
                 self._tta_cache.popitem(last=False)

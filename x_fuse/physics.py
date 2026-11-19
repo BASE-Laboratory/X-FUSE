@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .registration import DifferentiableGuideAligner
-from .upsamplers import ForwardPSFDownsampler
+from .upsamplers import ForwardPSFDownsampler, PSFProfile
 
 LossOptions: TypeAlias = Literal[
     "pearson",
@@ -265,6 +265,7 @@ class PhysicsForwardModel(nn.Module):
         psf_sigma_ratio: float = 0.5,
         spectral_channels: int | None = None,
         simplex_include_background: bool | None = None,
+        psf_profile: PSFProfile = "gaussian",
     ) -> None:
         super().__init__()
         self.n_channels = max(1, int(n_channels))
@@ -276,6 +277,7 @@ class PhysicsForwardModel(nn.Module):
             psf_sigma_ratio=psf_sigma_ratio,
             learnable=learn_psf,
             n_channels=self.n_channels,
+            psf_profile=psf_profile,
         )
         self.spectral_dict: SpectralUnmixingDictionary | None = (
             SpectralUnmixingDictionary(self.n_channels, spectral_channels)
@@ -370,8 +372,10 @@ class PhysicsForwardModel(nn.Module):
             self.raw_background is not None
             and q05.numel() == self.raw_background.shape[1]
         ):
-            bg = q05.clamp(min=1e-3, max=1e4)
-            inv_sp = torch.log(torch.expm1(bg).clamp(min=1e-6))
+            bg = q05.clamp(min=1e-3, max=1e6)
+            inv_sp = torch.where(
+                bg > 20.0, bg, torch.log(torch.expm1(bg).clamp(min=1e-6))
+            )
             self.raw_background.copy_(
                 inv_sp.view(1, -1, 1, 1).to(self.raw_background.device)
             )

@@ -962,7 +962,9 @@ def run_referee_evaluation(
     crop_sz = 224
 
     # ── Experiment 1: Real Synchrotron Diamond DIAD Zn13X Guided 16x Hold-Out SR ─
-    if "1" in active and not (resume and "exp1_zn13x_guided_16x_holdout" in results):
+    if ({"1", "1a", "1b"} & active) and not (
+        resume and "exp1_zn13x_guided_16x_holdout" in results
+    ):
         print(
             "[1/6] Running Real Diamond DIAD Zn13X 16x Moffat Hold-Out SR "
             "(N=4 ROIs)...",
@@ -970,17 +972,15 @@ def run_referee_evaluation(
         )
         p05_s4, p99_s4 = np.percentile(s4.guide_map[0], [5, 99])
         zn_rois = [(192, 1024), (640, 640), (448, 512), (512, 768)]
-        zn_guided_acc: dict[str, dict[str, list[float]]] = {
-            k: {
-                "pearson_r": [],
-                "psnr_db": [],
-                "mae": [],
-                "support_iou": [],
-                "latency_s": [],
-            }
-            for k in METHOD_KEYS
-        }
+        roi_subset = (
+            {0, 1}
+            if active == {"1a"}
+            else ({2, 3} if active == {"1b"} else {0, 1, 2, 3})
+        )
+        exp1_part: dict[str, Any] = dict(results.get("_exp1_partial", {}))
         for roi_idx, (y0, x0) in enumerate(zn_rois):
+            if roi_idx not in roi_subset or (resume and str(roi_idx) in exp1_part):
+                continue
             hr_sub = s4.hr_image[y0 : y0 + crop_sz, x0 : x0 + crop_sz].astype(
                 np.float32
             )
@@ -1098,6 +1098,7 @@ def run_referee_evaluation(
             )
             t_xf = time.perf_counter() - t0
 
+            roi_rec: dict[str, dict[str, float]] = {}
             for m_k, rep_m, lat_m in [
                 ("otsu", r_otsu, t_otsu),
                 ("bicubic", r_bic, t_bic),
@@ -1108,12 +1109,10 @@ def run_referee_evaluation(
                 ("xfuse", r_xf, t_xf),
             ]:
                 c_met = _continuous_metrics_zn13x(rep_m.probabilities, gt_112)
-                for met_name, met_val in c_met.items():
-                    zn_guided_acc[m_k][met_name].append(met_val)
-                zn_guided_acc[m_k]["latency_s"].append(lat_m)
+                roi_rec[m_k] = {**c_met, "latency_s": lat_m}
 
             if roi_idx == 0:
-                xf_c = _continuous_metrics_zn13x(r_xf.probabilities, gt_112)
+                xf_c = roi_rec["xfuse"]
                 vis_cache.setdefault("zn13x", {}).update(
                     {
                         "s4_hr": hr_sub,
@@ -1124,22 +1123,47 @@ def run_referee_evaluation(
                         "s4_xfuse_psnr": xf_c["psnr_db"],
                     }
                 )
+            exp1_part[str(roi_idx)] = roi_rec
+            results["_exp1_partial"] = exp1_part
+            _save_state(output_dir, results, vis_cache)
+            print(
+                f"  [1/6] ROI {roi_idx + 1}/{len(zn_rois)} done (xfuse={t_xf:.1f}s)",
+                flush=True,
+            )
 
-        results["exp1_zn13x_guided_16x_holdout"] = {
-            "rois_yx": [list(r) for r in zn_rois],
-            "crop_size_hr": crop_sz,
-            "measured_xrdct_grid": 112,
-            "holdout_moffat_grid": 14,
-            "effective_resolution_gap_vs_xct": 16,
-            "methods": {
-                k: {m_n: _mean_std(vals) for m_n, vals in m_dict.items()}
-                for k, m_dict in zn_guided_acc.items()
-            },
-        }
-        _save_state(output_dir, results, vis_cache)
+        if len(exp1_part) == len(zn_rois):
+            zn_guided_acc: dict[str, dict[str, list[float]]] = {
+                k: {
+                    "pearson_r": [],
+                    "psnr_db": [],
+                    "mae": [],
+                    "support_iou": [],
+                    "latency_s": [],
+                }
+                for k in METHOD_KEYS
+            }
+            for r_i in range(len(zn_rois)):
+                for m_k in METHOD_KEYS:
+                    for met_name, met_val in exp1_part[str(r_i)][m_k].items():
+                        zn_guided_acc[m_k][met_name].append(float(met_val))
+            results["exp1_zn13x_guided_16x_holdout"] = {
+                "rois_yx": [list(r) for r in zn_rois],
+                "crop_size_hr": crop_sz,
+                "measured_xrdct_grid": 112,
+                "holdout_moffat_grid": 14,
+                "effective_resolution_gap_vs_xct": 16,
+                "methods": {
+                    k: {m_n: _mean_std(vals) for m_n, vals in m_dict.items()}
+                    for k, m_dict in zn_guided_acc.items()
+                },
+            }
+            results.pop("_exp1_partial", None)
+            _save_state(output_dir, results, vis_cache)
 
     # ── Experiment 2: Real Zn13X Cross-Slice Zero-Shot Transfer (coarse_guide=None) ─
-    if "2" in active and not (resume and "exp2_zn13x_cross_slice_zeroshot" in results):
+    if ({"2", "2a", "2b"} & active) and not (
+        resume and "exp2_zn13x_cross_slice_zeroshot" in results
+    ):
         print(
             "[2/6] Running Real Diamond DIAD Zn13X Zero-Shot Cross-Slice "
             "Transfer (N=4 pairs)...",
@@ -1148,21 +1172,18 @@ def run_referee_evaluation(
         zs_rois = [(192, 1024), (640, 640)]
         zs_directions = [("slice4_to_slice9", s4, s9), ("slice9_to_slice4", s9, s4)]
         zs_methods = ("mean_prior", "poly_ols", "patch_ridge", "xfuse_zeroshot")
-        zs_acc: dict[str, dict[str, list[float]]] = {
-            k: {
-                "pearson_r": [],
-                "psnr_db": [],
-                "mae": [],
-                "support_iou": [],
-                "predict_latency_s": [],
-            }
-            for k in zs_methods
-        }
+        dir_subset = {0} if active == {"2a"} else ({1} if active == {"2b"} else {0, 1})
+        exp2_part: dict[str, Any] = dict(results.get("_exp2_partial", {}))
 
         for dir_idx, (dir_name, src_s, tgt_s) in enumerate(zs_directions):
+            if dir_idx not in dir_subset:
+                continue
             p05_src, p99_src = np.percentile(src_s.guide_map[0], [5, 99])
             span_src = max(float(p99_src - p05_src), 1e-6)
             for roi_idx, (y0, x0) in enumerate(zs_rois):
+                pkey = f"{dir_idx}_{roi_idx}"
+                if resume and pkey in exp2_part:
+                    continue
                 src_hr = src_s.hr_image[y0 : y0 + crop_sz, x0 : x0 + crop_sz].astype(
                     np.float32
                 )
@@ -1241,6 +1262,7 @@ def run_referee_evaluation(
                 lat_xf_zs = time.perf_counter() - t0
                 pred_xf_zs = rep_zs.probabilities[0, 0].detach().cpu().numpy()
 
+                pair_rec: dict[str, dict[str, float]] = {}
                 for zk, p_arr, l_val in [
                     ("mean_prior", pred_mean, lat_mean),
                     ("poly_ols", pred_poly, lat_poly),
@@ -1248,13 +1270,11 @@ def run_referee_evaluation(
                     ("xfuse_zeroshot", pred_xf_zs, lat_xf_zs),
                 ]:
                     cm = _continuous_metrics_zn13x(p_arr, tgt_gt)
-                    for mn, mv in cm.items():
-                        zs_acc[zk][mn].append(mv)
-                    zs_acc[zk]["predict_latency_s"].append(l_val)
+                    pair_rec[zk] = {**cm, "predict_latency_s": l_val}
 
                 if dir_idx == 0 and roi_idx == 0:
-                    cm_poly = _continuous_metrics_zn13x(pred_poly, tgt_gt)
-                    cm_xf = _continuous_metrics_zn13x(pred_xf_zs, tgt_gt)
+                    cm_poly = pair_rec["poly_ols"]
+                    cm_xf = pair_rec["xfuse_zeroshot"]
                     vis_cache.setdefault("zn13x", {}).update(
                         {
                             "s9_gt_112": tgt_gt,
@@ -1267,36 +1287,64 @@ def run_referee_evaluation(
                             "direction": dir_name,
                         }
                     )
+                exp2_part[pkey] = pair_rec
+                results["_exp2_partial"] = exp2_part
+                _save_state(output_dir, results, vis_cache)
+                print(f"  [2/6] pair {pkey} done", flush=True)
 
-        results["exp2_zn13x_cross_slice_zeroshot"] = {
-            "transfer_pairs": [
-                f"{d}@{r[0]}_{r[1]}" for d, _, _ in zs_directions for r in zs_rois
-            ],
-            "unguided_target_slice": True,
-            "inapplicable_guided_only_baselines": [
-                "bicubic",
-                "jbu",
-                "cnmf",
-                "guided_tv",
-                "siren_inr",
-            ],
-            "methods": {
-                k: {mn: _mean_std(vals) for mn, vals in mdict.items()}
-                for k, mdict in zs_acc.items()
-            },
-        }
-        _save_state(output_dir, results, vis_cache)
+        if len(exp2_part) == 4:
+            zs_acc: dict[str, dict[str, list[float]]] = {
+                k: {
+                    "pearson_r": [],
+                    "psnr_db": [],
+                    "mae": [],
+                    "support_iou": [],
+                    "predict_latency_s": [],
+                }
+                for k in zs_methods
+            }
+            for d_i in range(2):
+                for r_i in range(2):
+                    for zk in zs_methods:
+                        for mn, mv in exp2_part[f"{d_i}_{r_i}"][zk].items():
+                            zs_acc[zk][mn].append(float(mv))
+            results["exp2_zn13x_cross_slice_zeroshot"] = {
+                "transfer_pairs": [
+                    f"{d}@{r[0]}_{r[1]}" for d, _, _ in zs_directions for r in zs_rois
+                ],
+                "unguided_target_slice": True,
+                "inapplicable_guided_only_baselines": [
+                    "bicubic",
+                    "jbu",
+                    "cnmf",
+                    "guided_tv",
+                    "siren_inr",
+                ],
+                "methods": {
+                    k: {mn: _mean_std(vals) for mn, vals in mdict.items()}
+                    for k, mdict in zs_acc.items()
+                },
+            }
+            results.pop("_exp2_partial", None)
+            _save_state(output_dir, results, vis_cache)
 
     # ── Experiment 3: Regime A — Piecewise-Constant Intensity Cartoon (4x, 8x, 16x) ─
-    if "3" in active and not (resume and "exp3_regime_a_cartoon_sweep" in results):
+    if ({"3", "3a", "3b"} & active) and not (
+        resume and "exp3_regime_a_cartoon_sweep" in results
+    ):
+        car_factors = (
+            (4, 8) if active == {"3a"} else ((16,) if active == {"3b"} else (4, 8, 16))
+        )
         print(
-            "[3/6] Running Regime A (Piecewise Intensity Cartoon, "
-            "4x/8x/16x Moffat, N=3 seeds)...",
+            f"[3/6] Running Regime A (Piecewise Intensity Cartoon, "
+            f"factors={car_factors} Moffat, N=3 seeds)...",
             flush=True,
         )
         cartoon_size = 160
-        reg_a_rows: list[dict[str, Any]] = []
-        for factor in (4, 8, 16):
+        exp3_part: dict[str, Any] = dict(results.get("_exp3_partial", {}))
+        for factor in car_factors:
+            if resume and str(factor) in exp3_part:
+                continue
             per_m: dict[str, dict[str, list[float]]] = {
                 k: {"miou": [], "bf1": [], "latency_s": []} for k in METHOD_KEYS
             }
@@ -1329,32 +1377,47 @@ def run_referee_evaluation(
                     per_m[k]["bf1"].append(met["boundary_f1"])
                     per_m[k]["latency_s"].append(times[k])
 
-            reg_a_rows.append(
-                {
-                    "downsample_factor": factor,
-                    "image_size": cartoon_size,
-                    "methods": {
-                        k: {mn: _mean_std(vals) for mn, vals in mdict.items()}
-                        for k, mdict in per_m.items()
-                    },
-                }
-            )
-        results["exp3_regime_a_cartoon_sweep"] = reg_a_rows
-        _save_state(output_dir, results, vis_cache)
+            exp3_part[str(factor)] = {
+                "downsample_factor": factor,
+                "image_size": cartoon_size,
+                "methods": {
+                    k: {mn: _mean_std(vals) for mn, vals in mdict.items()}
+                    for k, mdict in per_m.items()
+                },
+            }
+            results["_exp3_partial"] = exp3_part
+            _save_state(output_dir, results, vis_cache)
+            print(f"  [3/6] factor={factor}x done", flush=True)
+
+        if all(str(f) in exp3_part for f in (4, 8, 16)):
+            results["exp3_regime_a_cartoon_sweep"] = [
+                exp3_part["4"],
+                exp3_part["8"],
+                exp3_part["16"],
+            ]
+            results.pop("_exp3_partial", None)
+            _save_state(output_dir, results, vis_cache)
 
     # ── Experiment 4: Regime B1 — Oriented Iso-Intensity Lamellar Colonies (8x, 16x) ─
-    if "4" in active and not (resume and "exp4_regime_b_lamellar_sweep" in results):
+    if ({"4", "4a", "4b"} & active) and not (
+        resume and "exp4_regime_b_lamellar_sweep" in results
+    ):
+        lam_factors = (
+            (8,) if active == {"4a"} else ((16,) if active == {"4b"} else (8, 16))
+        )
         print(
-            "[4/6] Running Regime B1 (Oriented Iso-Intensity Lamellae, "
-            "8x/16x Moffat, N=3 seeds)...",
+            f"[4/6] Running Regime B1 (Oriented Iso-Intensity Lamellae, "
+            f"factors={lam_factors} Moffat, N=3 seeds)...",
             flush=True,
         )
         lam_size = 224
-        reg_b_rows: list[dict[str, Any]] = []
+        partial_rows: dict[str, Any] = dict(results.get("_exp4_partial_rows", {}))
         ause_lam_8x: dict[str, list[float]] = {
             k: [] for k in METHOD_KEYS if k != "otsu"
         }
-        for factor in (8, 16):
+        for factor in lam_factors:
+            if resume and str(factor) in partial_rows:
+                continue
             per_m = {k: {"miou": [], "bf1": [], "latency_s": []} for k in METHOD_KEYS}
             colony_stats_list: list[dict[str, float]] = []
             for s_idx, s in enumerate(seeds):
@@ -1422,28 +1485,40 @@ def run_referee_evaluation(
                         .cpu()
                         .numpy(),
                     }
+                print(
+                    f"  [4/6] factor={factor}x seed={s} done "
+                    f"(xfuse={times['xfuse']:.1f}s)",
+                    flush=True,
+                )
 
-            reg_b_rows.append(
-                {
-                    "downsample_factor": factor,
-                    "image_size": lam_size,
-                    "colony_intensity_parity": {
-                        stat_k: round(
-                            float(np.mean([cs[stat_k] for cs in colony_stats_list])), 4
-                        )
-                        for stat_k in colony_stats_list[0]
-                    },
-                    "methods": {
-                        k: {mn: _mean_std(vals) for mn, vals in mdict.items()}
-                        for k, mdict in per_m.items()
-                    },
+            partial_rows[str(factor)] = {
+                "downsample_factor": factor,
+                "image_size": lam_size,
+                "colony_intensity_parity": {
+                    stat_k: round(
+                        float(np.mean([cs[stat_k] for cs in colony_stats_list])), 4
+                    )
+                    for stat_k in colony_stats_list[0]
+                },
+                "methods": {
+                    k: {mn: _mean_std(vals) for mn, vals in mdict.items()}
+                    for k, mdict in per_m.items()
+                },
+            }
+            results["_exp4_partial_rows"] = partial_rows
+            if factor == 8:
+                results["_ause_lam_8x"] = {
+                    k: _mean_std(vals) for k, vals in ause_lam_8x.items()
                 }
-            )
-        results["exp4_regime_b_lamellar_sweep"] = reg_b_rows
-        results["_ause_lam_8x"] = {
-            k: _mean_std(vals) for k, vals in ause_lam_8x.items()
-        }
-        _save_state(output_dir, results, vis_cache)
+            _save_state(output_dir, results, vis_cache)
+
+        if "8" in partial_rows and "16" in partial_rows:
+            results["exp4_regime_b_lamellar_sweep"] = [
+                partial_rows["8"],
+                partial_rows["16"],
+            ]
+            results.pop("_exp4_partial_rows", None)
+            _save_state(output_dir, results, vis_cache)
 
     # ── Experiment 5a: Low-Count 16-Bin Poisson Spectral Cube ─────────────────
     spec_size = 128
@@ -1562,13 +1637,19 @@ def run_referee_evaluation(
         _save_state(output_dir, results, vis_cache)
 
     # ── Experiment 5b: Correlative Stage Drift Sweep ──────────────────────────
-    if "5b" in active and not (
+    if ({"5b", "5b1", "5b2"} & active) and not (
         resume
         and "exp5_poisson_and_drift" in results
         and "stage_drift_sweep" in results["exp5_poisson_and_drift"]
     ):
+        shifts_list = (0.0, 2.0, 4.0, 5.0)
+        run_shifts = (
+            (0.0, 2.0)
+            if active == {"5b1"}
+            else ((4.0, 5.0) if active == {"5b2"} else shifts_list)
+        )
         print(
-            "[5b/6] Running Correlative Stage Drift Sweep (0, 2, 4, 5 HR px, "
+            f"[5b/6] Running Correlative Stage Drift Sweep (shifts={run_shifts} HR px, "
             "N=3 seeds)...",
             flush=True,
         )
@@ -1581,54 +1662,56 @@ def run_referee_evaluation(
             "xfuse_unaligned",
             "xfuse_aligned",
         )
-        shifts_list = (0.0, 2.0, 4.0, 5.0)
-        per_shift_acc: dict[float, dict[str, dict[str, list[float]]]] = {
-            sh: {k: {"miou": [], "bf1": []} for k in drift_keys} for sh in shifts_list
-        }
-        est_shifts_by_sh: dict[float, list[float]] = {sh: [] for sh in shifts_list}
-        err_shifts_by_sh: dict[float, list[float]] = {sh: [] for sh in shifts_list}
+        exp5b_part: dict[str, Any] = dict(results.get("_exp5b_partial", {}))
+        for shift_px in run_shifts:
+            sh_key = f"{shift_px:.1f}"
+            if resume and sh_key in exp5b_part:
+                continue
+            sh_acc: dict[str, dict[str, list[float]]] = {
+                k: {"miou": [], "bf1": []} for k in drift_keys
+            }
+            est_sh: list[float] = []
+            err_sh: list[float] = []
 
-        for s in seeds:
-            ph_d = generate_correlative_phantom_2d(
-                size=spec_size,
-                downsample_factor=4,
-                phase_b_contrast=0.35,
-                hr_noise_std=0.025,
-                poisson_counts=300.0,
-                beam_profile="moffat",
-                seed=s + 200,
-            )
-            m_un = XFuse(
-                backbone=backbone,
-                stride=stride,
-                dtype=torch.float32,
-                loss_fn="compositional_kl",
-                interpolation_mode="cross_attn",
-                fusion_method="spatial_mlp",
-                align_guide="none",
-                learn_psf=False,
-                tv_weight=0.005,
-                pretrained=pretrained,
-                lr=1e-2,
-                device=device,
-            )
-            m_al = XFuse(
-                backbone=backbone,
-                stride=stride,
-                dtype=torch.float32,
-                loss_fn="compositional_kl",
-                interpolation_mode="cross_attn",
-                fusion_method="spatial_mlp",
-                align_guide="translation",
-                max_shift_coarse_px=2.0,
-                learn_psf=True,
-                tv_weight=0.005,
-                pretrained=pretrained,
-                lr=1e-2,
-                device=device,
-            )
-
-            for shift_px in shifts_list:
+            for s in seeds:
+                ph_d = generate_correlative_phantom_2d(
+                    size=spec_size,
+                    downsample_factor=4,
+                    phase_b_contrast=0.35,
+                    hr_noise_std=0.025,
+                    poisson_counts=300.0,
+                    beam_profile="moffat",
+                    seed=s + 200,
+                )
+                m_un = XFuse(
+                    backbone=backbone,
+                    stride=stride,
+                    dtype=torch.float32,
+                    loss_fn="compositional_kl",
+                    interpolation_mode="cross_attn",
+                    fusion_method="spatial_mlp",
+                    align_guide="none",
+                    learn_psf=False,
+                    tv_weight=0.005,
+                    pretrained=pretrained,
+                    lr=1e-2,
+                    device=device,
+                )
+                m_al = XFuse(
+                    backbone=backbone,
+                    stride=stride,
+                    dtype=torch.float32,
+                    loss_fn="compositional_kl",
+                    interpolation_mode="cross_attn",
+                    fusion_method="spatial_mlp",
+                    align_guide="translation",
+                    max_shift_coarse_px=2.0,
+                    learn_psf=True,
+                    tv_weight=0.005,
+                    pretrained=pretrained,
+                    lr=1e-2,
+                    device=device,
+                )
                 g_drift = _inject_shifted_moffat_guide(
                     ph_d.gt_phase_channels,
                     factor=4,
@@ -1695,8 +1778,8 @@ def run_referee_evaluation(
                     reset_weights=True,
                 )
                 dx_hat = float(r_al.diagnostics.get("shift_x_hr_px", 0.0))
-                est_shifts_by_sh[shift_px].append(dx_hat)
-                err_shifts_by_sh[shift_px].append(abs(abs(dx_hat) - abs(shift_px)))
+                est_sh.append(dx_hat)
+                err_sh.append(abs(abs(dx_hat) - abs(shift_px)))
 
                 for dk, rep_d in [
                     ("bicubic", r_db),
@@ -1710,171 +1793,238 @@ def run_referee_evaluation(
                     dm = compute_segmentation_metrics(
                         rep_d.hard_mask[0], ph_d.gt_labels
                     )
-                    per_shift_acc[shift_px][dk]["miou"].append(dm["iou"])
-                    per_shift_acc[shift_px][dk]["bf1"].append(dm["boundary_f1"])
+                    sh_acc[dk]["miou"].append(dm["iou"])
+                    sh_acc[dk]["bf1"].append(dm["boundary_f1"])
 
-        drift_rows = [
-            {
-                "injected_shift_hr_px": sh,
+            exp5b_part[sh_key] = {
+                "injected_shift_hr_px": shift_px,
                 "image_size": spec_size,
-                "estimated_shift_hr_px": _mean_std(est_shifts_by_sh[sh]),
-                "shift_abs_error_hr_px": _mean_std(err_shifts_by_sh[sh]),
+                "estimated_shift_hr_px": _mean_std(est_sh),
+                "shift_abs_error_hr_px": _mean_std(err_sh),
                 "methods": {
                     dk: {mn: _mean_std(vals) for mn, vals in ddict.items()}
-                    for dk, ddict in per_shift_acc[sh].items()
+                    for dk, ddict in sh_acc.items()
                 },
             }
-            for sh in shifts_list
-        ]
-        results.setdefault("exp5_poisson_and_drift", {})["stage_drift_sweep"] = (
-            drift_rows
-        )
-        _save_state(output_dir, results, vis_cache)
+            results["_exp5b_partial"] = exp5b_part
+            _save_state(output_dir, results, vis_cache)
+            print(f"  [5b/6] shift={shift_px}px done", flush=True)
 
-    # ── Experiment 6: Cross-Specimen LAC Conformal Calibration (A -> Unseen B) ─
-    if "6" in active and not (resume and "exp6_uncertainty_and_conformal" in results):
+        if all(f"{sh:.1f}" in exp5b_part for sh in shifts_list):
+            results.setdefault("exp5_poisson_and_drift", {})["stage_drift_sweep"] = [
+                exp5b_part[f"{sh:.1f}"] for sh in shifts_list
+            ]
+            results.pop("_exp5b_partial", None)
+            _save_state(output_dir, results, vis_cache)
+
+    # ── Experiment 6: Cross-Specimen Conformal Calibration (A -> Unseen B) ────
+    if ({"6", "6a", "6b"} & active) and not (
+        resume and "exp6_uncertainty_and_conformal" in results
+    ):
         print(
-            "[6/6] Running Cross-Specimen LAC Conformal Calibration "
+            "[6/6] Running Cross-Specimen Conformal Calibration "
             "(Specimen A -> Specimen B, N=3 pairs)...",
             flush=True,
         )
         alphas = (0.05, 0.10, 0.20)
-        lac_lam_acc: dict[float, dict[str, list[float]]] = {
-            a: {"empirical_coverage": [], "mean_set_size": [], "singleton_fraction": []}
-            for a in alphas
-        }
-        lac_car_acc: dict[float, dict[str, list[float]]] = {
-            a: {"empirical_coverage": [], "mean_set_size": [], "singleton_fraction": []}
-            for a in alphas
-        }
+        exp6_part: dict[str, Any] = dict(results.get("_exp6_partial", {}))
 
-        for s in seeds:
-            ph_a_lam = generate_oriented_lamellar_phantom_2d(
-                size=160, downsample_factor=8, beam_profile="moffat", seed=s
-            )
-            ph_b_lam = generate_oriented_lamellar_phantom_2d(
-                size=160, downsample_factor=8, beam_profile="moffat", seed=s + 1000
-            )
-            _set_all_seeds(s)
-            m_cal_lam = XFuse(
-                backbone=backbone,
-                stride=stride,
-                dtype=torch.float32,
-                loss_fn="compositional_kl",
-                interpolation_mode="cross_attn",
-                fusion_method="spatial_mlp",
-                learn_psf=True,
-                tv_weight=0.01,
-                pretrained=pretrained,
-                lr=1e-2,
-                device=device,
-            )
-            rep_a_lam = m_cal_lam.fit_predict(
-                ph_a_lam.hr_image,
-                ph_a_lam.coarse_guide,
-                epochs=40,
-                mode="multiclass",
-                tta_shifts=(),
-                tta_flips=True,
-                guide_normalization=norm,
-            )
-            rep_b_lam = m_cal_lam.predict(
-                ph_b_lam.hr_image,
-                coarse_guide=None,
-                mode="multiclass",
-                calibrate_to_guide=False,
-            )
-            gt_a_lam_t = torch.from_numpy(ph_a_lam.gt_labels).unsqueeze(0)
-            gt_b_lam_t = torch.from_numpy(ph_b_lam.gt_labels).unsqueeze(0)
-            for a in alphas:
-                cal = ConformalCalibrator(alpha=a, method="lac")
-                cal.calibrate_labels(rep_a_lam.probabilities, gt_a_lam_t)
-                ps_b, _ = cal.predict_sets_and_intervals(
-                    rep_b_lam.probabilities, guide_lr=None, mode="multiclass"
+        if ({"6", "6a"} & active) and not (resume and "lam" in exp6_part):
+            lac_lam_acc: dict[float, dict[str, list[float]]] = {a: {} for a in alphas}
+            raps_lam_acc: dict[float, dict[str, list[float]]] = {a: {} for a in alphas}
+            for s in seeds:
+                ph_a_lam = generate_oriented_lamellar_phantom_2d(
+                    size=160, downsample_factor=8, beam_profile="moffat", seed=s
                 )
-                st = empirical_conformal_coverage(ps_b, gt_b_lam_t)
-                for sk, sv in st.items():
-                    lac_lam_acc[a][sk].append(sv)
-
-            ph_a_car = generate_correlative_phantom_2d(
-                size=160,
-                downsample_factor=8,
-                phase_b_contrast=0.35,
-                hr_noise_std=0.03,
-                poisson_counts=300.0,
-                beam_profile="moffat",
-                seed=s,
-            )
-            ph_b_car = generate_correlative_phantom_2d(
-                size=160,
-                downsample_factor=8,
-                phase_b_contrast=0.35,
-                hr_noise_std=0.03,
-                poisson_counts=300.0,
-                beam_profile="moffat",
-                seed=s + 1000,
-            )
-            _set_all_seeds(s)
-            m_cal_car = XFuse(
-                backbone=backbone,
-                stride=stride,
-                dtype=torch.float32,
-                loss_fn="compositional_kl",
-                interpolation_mode="cross_attn",
-                fusion_method="spatial_mlp",
-                learn_psf=True,
-                tv_weight=0.005,
-                pretrained=pretrained,
-                lr=1e-2,
-                device=device,
-            )
-            rep_a_car = m_cal_car.fit_predict(
-                ph_a_car.hr_image,
-                ph_a_car.coarse_guide,
-                epochs=35,
-                mode="multiclass",
-                tta_shifts=(),
-                tta_flips=True,
-                guide_normalization=norm,
-            )
-            rep_b_car = m_cal_car.predict(
-                ph_b_car.hr_image,
-                coarse_guide=None,
-                mode="multiclass",
-                calibrate_to_guide=False,
-            )
-            gt_a_car_t = torch.from_numpy(ph_a_car.gt_labels).unsqueeze(0)
-            gt_b_car_t = torch.from_numpy(ph_b_car.gt_labels).unsqueeze(0)
-            for a in alphas:
-                cal = ConformalCalibrator(alpha=a, method="lac")
-                cal.calibrate_labels(rep_a_car.probabilities, gt_a_car_t)
-                ps_b, _ = cal.predict_sets_and_intervals(
-                    rep_b_car.probabilities, guide_lr=None, mode="multiclass"
+                ph_b_lam = generate_oriented_lamellar_phantom_2d(
+                    size=160, downsample_factor=8, beam_profile="moffat", seed=s + 1000
                 )
-                st = empirical_conformal_coverage(ps_b, gt_b_car_t)
-                for sk, sv in st.items():
-                    lac_car_acc[a][sk].append(sv)
+                _set_all_seeds(s)
+                m_cal_lam = XFuse(
+                    backbone=backbone,
+                    stride=stride,
+                    dtype=torch.float32,
+                    loss_fn="compositional_kl",
+                    interpolation_mode="cross_attn",
+                    fusion_method="spatial_mlp",
+                    learn_psf=True,
+                    tv_weight=0.01,
+                    pretrained=pretrained,
+                    lr=1e-2,
+                    device=device,
+                )
+                rep_a_lam = m_cal_lam.fit_predict(
+                    ph_a_lam.hr_image,
+                    ph_a_lam.coarse_guide,
+                    epochs=40,
+                    mode="multiclass",
+                    tta_shifts=(),
+                    tta_flips=True,
+                    guide_normalization=norm,
+                )
+                rep_b_lam = m_cal_lam.predict(
+                    ph_b_lam.hr_image,
+                    coarse_guide=None,
+                    mode="multiclass",
+                    calibrate_to_guide=False,
+                )
+                gt_a_lam_t = torch.from_numpy(ph_a_lam.gt_labels).unsqueeze(0)
+                gt_b_lam_t = torch.from_numpy(ph_b_lam.gt_labels).unsqueeze(0)
+                for a in alphas:
+                    for cal_obj, acc_d in [
+                        (ConformalCalibrator(alpha=a, method="lac"), lac_lam_acc),
+                        (
+                            ConformalCalibrator(
+                                alpha=a,
+                                method="raps",
+                                k_reg=1,
+                                lambda_reg=0.03,
+                                randomized=False,
+                                fit_temperature=True,
+                                spatial_block_size=4,
+                            ),
+                            raps_lam_acc,
+                        ),
+                    ]:
+                        cal_obj.calibrate_labels(rep_a_lam.probabilities, gt_a_lam_t)
+                        ps_b, _ = cal_obj.predict_sets_and_intervals(
+                            rep_b_lam.probabilities, guide_lr=None, mode="multiclass"
+                        )
+                        st = empirical_conformal_coverage(ps_b, gt_b_lam_t)
+                        st["temperature"] = float(cal_obj.temperature)
+                        for sk, sv in st.items():
+                            acc_d[a].setdefault(sk, []).append(sv)
+            exp6_part["lam"] = {
+                "lac": [
+                    {
+                        "alpha": a,
+                        "nominal_coverage": round(1.0 - a, 4),
+                        **{sk: _mean_std(vals) for sk, vals in lac_lam_acc[a].items()},
+                    }
+                    for a in alphas
+                ],
+                "raps": [
+                    {
+                        "alpha": a,
+                        "nominal_coverage": round(1.0 - a, 4),
+                        **{sk: _mean_std(vals) for sk, vals in raps_lam_acc[a].items()},
+                    }
+                    for a in alphas
+                ],
+            }
+            results["_exp6_partial"] = exp6_part
+            _save_state(output_dir, results, vis_cache)
+            print("  [6/6] lamellar conformal done", flush=True)
 
-        results["exp6_uncertainty_and_conformal"] = {
-            "zero_label_ause_lamellar_8x": results.get("_ause_lam_8x", {}),
-            "cross_specimen_lac_lamellar_8x": [
-                {
-                    "alpha": a,
-                    "nominal_coverage": round(1.0 - a, 4),
-                    **{sk: _mean_std(vals) for sk, vals in lac_lam_acc[a].items()},
-                }
-                for a in alphas
-            ],
-            "cross_specimen_lac_cartoon_8x": [
-                {
-                    "alpha": a,
-                    "nominal_coverage": round(1.0 - a, 4),
-                    **{sk: _mean_std(vals) for sk, vals in lac_car_acc[a].items()},
-                }
-                for a in alphas
-            ],
-        }
-        _save_state(output_dir, results, vis_cache)
+        if ({"6", "6b"} & active) and not (resume and "car" in exp6_part):
+            lac_car_acc: dict[float, dict[str, list[float]]] = {a: {} for a in alphas}
+            raps_car_acc: dict[float, dict[str, list[float]]] = {a: {} for a in alphas}
+            for s in seeds:
+                ph_a_car = generate_correlative_phantom_2d(
+                    size=160,
+                    downsample_factor=8,
+                    phase_b_contrast=0.35,
+                    hr_noise_std=0.03,
+                    poisson_counts=300.0,
+                    beam_profile="moffat",
+                    seed=s,
+                )
+                ph_b_car = generate_correlative_phantom_2d(
+                    size=160,
+                    downsample_factor=8,
+                    phase_b_contrast=0.35,
+                    hr_noise_std=0.03,
+                    poisson_counts=300.0,
+                    beam_profile="moffat",
+                    seed=s + 1000,
+                )
+                _set_all_seeds(s)
+                m_cal_car = XFuse(
+                    backbone=backbone,
+                    stride=stride,
+                    dtype=torch.float32,
+                    loss_fn="compositional_kl",
+                    interpolation_mode="cross_attn",
+                    fusion_method="spatial_mlp",
+                    learn_psf=True,
+                    tv_weight=0.005,
+                    pretrained=pretrained,
+                    lr=1e-2,
+                    device=device,
+                )
+                rep_a_car = m_cal_car.fit_predict(
+                    ph_a_car.hr_image,
+                    ph_a_car.coarse_guide,
+                    epochs=35,
+                    mode="multiclass",
+                    tta_shifts=(),
+                    tta_flips=True,
+                    guide_normalization=norm,
+                )
+                rep_b_car = m_cal_car.predict(
+                    ph_b_car.hr_image,
+                    coarse_guide=None,
+                    mode="multiclass",
+                    calibrate_to_guide=False,
+                )
+                gt_a_car_t = torch.from_numpy(ph_a_car.gt_labels).unsqueeze(0)
+                gt_b_car_t = torch.from_numpy(ph_b_car.gt_labels).unsqueeze(0)
+                for a in alphas:
+                    for cal_obj, acc_d in [
+                        (ConformalCalibrator(alpha=a, method="lac"), lac_car_acc),
+                        (
+                            ConformalCalibrator(
+                                alpha=a,
+                                method="raps",
+                                k_reg=1,
+                                lambda_reg=0.03,
+                                randomized=False,
+                                fit_temperature=True,
+                                spatial_block_size=4,
+                            ),
+                            raps_car_acc,
+                        ),
+                    ]:
+                        cal_obj.calibrate_labels(rep_a_car.probabilities, gt_a_car_t)
+                        ps_b, _ = cal_obj.predict_sets_and_intervals(
+                            rep_b_car.probabilities, guide_lr=None, mode="multiclass"
+                        )
+                        st = empirical_conformal_coverage(ps_b, gt_b_car_t)
+                        st["temperature"] = float(cal_obj.temperature)
+                        for sk, sv in st.items():
+                            acc_d[a].setdefault(sk, []).append(sv)
+            exp6_part["car"] = {
+                "lac": [
+                    {
+                        "alpha": a,
+                        "nominal_coverage": round(1.0 - a, 4),
+                        **{sk: _mean_std(vals) for sk, vals in lac_car_acc[a].items()},
+                    }
+                    for a in alphas
+                ],
+                "raps": [
+                    {
+                        "alpha": a,
+                        "nominal_coverage": round(1.0 - a, 4),
+                        **{sk: _mean_std(vals) for sk, vals in raps_car_acc[a].items()},
+                    }
+                    for a in alphas
+                ],
+            }
+            results["_exp6_partial"] = exp6_part
+            _save_state(output_dir, results, vis_cache)
+            print("  [6/6] cartoon conformal done", flush=True)
+
+        if "lam" in exp6_part and "car" in exp6_part:
+            results["exp6_uncertainty_and_conformal"] = {
+                "zero_label_ause_lamellar_8x": results.get("_ause_lam_8x", {}),
+                "cross_specimen_lac_lamellar_8x": exp6_part["lam"]["lac"],
+                "cross_specimen_raps_lamellar_8x": exp6_part["lam"]["raps"],
+                "cross_specimen_lac_cartoon_8x": exp6_part["car"]["lac"],
+                "cross_specimen_raps_cartoon_8x": exp6_part["car"]["raps"],
+            }
+            results.pop("_exp6_partial", None)
+            _save_state(output_dir, results, vis_cache)
 
     results["last_batch_wall_clock_s"] = round(time.perf_counter() - t_suite_start, 2)
     if "plot" in active:

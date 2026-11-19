@@ -126,9 +126,14 @@ def _safe_quantile(tensor: torch.Tensor, q: float) -> torch.Tensor:
     return torch.quantile(flat, float(q))
 
 
-def _conformal_quantile(scores: torch.Tensor, alpha: float) -> float:
+ConformalMethod = Literal["lac", "aps", "raps"]
+
+
+def _conformal_quantile(
+    scores: torch.Tensor, alpha: float, n_effective: int | None = None
+) -> float:
     """Exact finite-sample split-conformal quantile at rank
-    ``ceil((n + 1) * (1 - alpha))`` (1-indexed) on nonconformity ``scores``.
+    ``ceil((n_eff + 1) * (1 - alpha)) / n_eff`` on nonconformity ``scores``.
     """
     flat = torch.nan_to_num(
         scores.detach().float().reshape(-1), nan=1.0, posinf=1.0, neginf=0.0
@@ -141,40 +146,173 @@ def _conformal_quantile(scores: torch.Tensor, alpha: float) -> float:
         flat = flat[::step]
         n = int(flat.numel())
     a_clamped = min(max(float(alpha), 1e-4), 0.999)
-    rank = min(n, max(1, int(math.ceil((n + 1) * (1.0 - a_clamped)))))
+    n_eff = min(n, max(1, int(n_effective))) if n_effective is not None else n
+    q_level = min(1.0, math.ceil((n_eff + 1) * (1.0 - a_clamped)) / float(n_eff))
+    rank = min(n, max(1, int(math.ceil(q_level * n))))
     sorted_vals = torch.sort(flat).values
     return float(sorted_vals[rank - 1].cpu().item())
 
 
+def _fit_temperature_golden_section(
+    probs_flat: torch.Tensor,
+    targets_flat: torch.Tensor,
+    t_min: float = 0.15,
+    t_max: float = 8.0,
+    n_iters: int = 36,
+) -> float:
+    """Fit post-hoc scalar temperature ``T > 0`` minimizing multiclass NLL
+    ``-mean log softmax(log(p) / T)_y`` via exact 1D golden-section search.
+    """
+    if int(targets_flat.numel()) < 4:
+        return 1.0
+    log_p = torch.log(probs_flat.clamp(min=1e-7))
+
+    def _nll(temp: float) -> float:
+        scaled = log_p / max(temp, 1e-3)
+        return float(F.cross_entropy(scaled, targets_flat).cpu().item())
+
+    gr = (math.sqrt(5.0) - 1.0) / 2.0
+    a, b = math.log(t_min), math.log(t_max)
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc, fd = _nll(math.exp(c)), _nll(math.exp(d))
+    for _ in range(n_iters):
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - gr * (b - a)
+            fc = _nll(math.exp(c))
+        else:
+            a, c, fc = c, d, fd
+            d = a + gr * (b - a)
+            fd = _nll(math.exp(d))
+    best_t = math.exp(0.5 * (a + b))
+    return best_t if _nll(best_t) + 1e-5 < _nll(1.0) else 1.0
+
+
 class ConformalCalibrator:
-    """Distribution-free Split Conformal Prediction calibrator supporting both:
+    """Distribution-free Split Conformal Prediction calibrator supporting:
     1. **Supervised / Sparse-Label Calibration (``calibrate_labels``)**: Exact
-       Least-Ambiguous Set-Valued Classifier (LAC) / Adaptive Prediction Sets (APS)
-       achieving finite-sample coverage ``P(Y in C_{1-alpha}(X)) >= 1 - alpha``.
+       LAC, APS, and Regularized Adaptive Prediction Sets (``"raps"``) with
+       optional spatial-block NLL temperature scaling (``fit_temperature=True``).
     2. **Zero-Label Coarse-Physics Calibration (``calibrate_coarse``)**: Calibrates
        locally adaptive coarse physical forward-PSF error intervals and pure-cell
-       phase set thresholds on held-out spatial checkerboard blocks of ``G_LR``,
-       expanding sets automatically where ``physical_residual`` signals missing
-       structural contrast.
+       phase set thresholds on held-out spatial checkerboard blocks of ``G_LR``.
     """
 
     def __init__(
         self,
         alpha: float = 0.10,
-        method: Literal["lac", "aps"] = "lac",
+        method: ConformalMethod = "lac",
         allow_empty_sets: bool = False,
+        k_reg: int = 1,
+        lambda_reg: float = 0.05,
+        randomized: bool = False,
+        fit_temperature: bool = False,
+        spatial_block_size: int = 1,
+        seed: int = 42,
     ) -> None:
         if not (0.0 < alpha < 1.0):
             raise ValueError(
                 f"Conformal miscoverage alpha must be in (0, 1), got {alpha}."
             )
         self.alpha = float(alpha)
-        self.method: Literal["lac", "aps"] = method
+        self.method: ConformalMethod = method
         self.allow_empty_sets = bool(allow_empty_sets)
+        self.k_reg = max(1, int(k_reg))
+        self.lambda_reg = max(0.0, float(lambda_reg))
+        self.randomized = bool(randomized)
+        self.fit_temperature = bool(fit_temperature)
+        self.spatial_block_size = max(1, int(spatial_block_size))
+        self.seed = int(seed)
+        self.temperature: float = 1.0
         self.q_label: float | None = None
         self.q_coarse_per_channel: torch.Tensor | None = None
         self._coarse_scale: torch.Tensor | None = None
         self.n_calibration_points: int = 0
+
+    def _apply_temperature(
+        self, probs: torch.Tensor, multiclass: bool = True
+    ) -> torch.Tensor:
+        if abs(self.temperature - 1.0) <= 1e-4:
+            return probs
+        t = max(self.temperature, 1e-3)
+        if multiclass:
+            log_p = torch.log(probs.clamp(min=1e-7))
+            return F.softmax(log_p / t, dim=1 if probs.ndim >= 3 else -1)
+        logits = torch.logit(probs.clamp(1e-6, 1.0 - 1e-6))
+        return torch.sigmoid(logits / t)
+
+    def _nonconformity_scores(
+        self, p_cal: torch.Tensor, y_cal: torch.Tensor
+    ) -> torch.Tensor:
+        if self.method in ("aps", "raps"):
+            sorted_p, sorted_idx = torch.sort(p_cal, dim=-1, descending=True)
+            cumsum_p = torch.cumsum(sorted_p, dim=-1)
+            prev_cumsum = cumsum_p - sorted_p
+            match = (sorted_idx == y_cal.unsqueeze(-1)).float()
+            ranks = (
+                torch.arange(1, p_cal.shape[-1] + 1, device=p_cal.device)
+                .float()
+                .unsqueeze(0)
+            )
+            reg = (
+                self.lambda_reg * (ranks - float(self.k_reg)).clamp(min=0.0)
+                if self.method == "raps"
+                else torch.zeros_like(ranks)
+            )
+            if self.randomized:
+                gen = torch.Generator(device="cpu").manual_seed(self.seed)
+                u = torch.rand(
+                    (p_cal.shape[0], 1), generator=gen, dtype=torch.float32
+                ).to(p_cal.device)
+            else:
+                u = torch.ones((p_cal.shape[0], 1), device=p_cal.device)
+            return ((prev_cumsum + u * sorted_p + reg) * match).sum(dim=-1)
+
+        true_p = p_cal.gather(1, y_cal.unsqueeze(-1)).squeeze(-1)
+        return 1.0 - true_p
+
+    def _predict_multiclass_sets(
+        self, p_cls: torch.Tensor, q_lbl: float
+    ) -> torch.Tensor:
+        if self.method in ("aps", "raps"):
+            sorted_p, sorted_idx = torch.sort(p_cls, dim=1, descending=True)
+            cumsum_p = torch.cumsum(sorted_p, dim=1)
+            prev_cumsum = cumsum_p - sorted_p
+            n_cls = p_cls.shape[1]
+            ranks = (
+                torch.arange(1, n_cls + 1, device=p_cls.device)
+                .float()
+                .view(1, n_cls, *([1] * (p_cls.ndim - 2)))
+            )
+            reg = (
+                self.lambda_reg * (ranks - float(self.k_reg)).clamp(min=0.0)
+                if self.method == "raps"
+                else torch.zeros_like(ranks)
+            )
+            if self.randomized:
+                gen = torch.Generator(device="cpu").manual_seed(self.seed + 997)
+                u = torch.rand(
+                    (p_cls.shape[0], 1, *p_cls.shape[2:]),
+                    generator=gen,
+                    dtype=torch.float32,
+                ).to(p_cls.device)
+                in_sorted = (prev_cumsum + u * sorted_p + reg) <= q_lbl
+            else:
+                # Romano et al. (2020) deterministic APS/RAPS: include up to the
+                # first rank whose cumulative mass + penalty reaches >= q_lbl.
+                in_sorted = (prev_cumsum + reg) < q_lbl
+            if not self.allow_empty_sets:
+                in_sorted[:, 0] = True
+            pred_sets = torch.zeros_like(p_cls, dtype=torch.bool)
+            pred_sets.scatter_(1, sorted_idx, in_sorted)
+            return pred_sets
+
+        pred_sets = (1.0 - p_cls) <= q_lbl
+        if not self.allow_empty_sets:
+            top1 = p_cls.argmax(dim=1, keepdim=True)
+            pred_sets.scatter_(1, top1, True)
+        return pred_sets
 
     @staticmethod
     def make_spatial_holdout_mask(
@@ -212,6 +350,7 @@ class ConformalCalibrator:
         integer class labels ``targets`` (``(B, H, W)`` or ``(H, W)``).
         """
         self.q_label = None
+        self.temperature = 1.0
         p = probs.detach().float()
         if p.ndim == 3:
             p = p.unsqueeze(0)
@@ -223,31 +362,61 @@ class ConformalCalibrator:
         if y.ndim == 2:
             y = y.unsqueeze(0)
 
-        _, n_classes, _, _ = p.shape
+        bsz, n_classes, height, width = p.shape
         p_flat = p.permute(0, 2, 3, 1).reshape(-1, n_classes)
         y_flat = y.reshape(-1)
         valid = (y_flat >= 0) & (y_flat < n_classes)
         if cal_mask is not None:
             valid = valid & cal_mask.to(p.device).reshape(-1).bool()
 
-        p_cal = p_flat[valid]
-        y_cal = y_flat[valid]
-        self.n_calibration_points = int(y_cal.numel())
-        if self.n_calibration_points == 0:
+        if int(valid.sum().item()) == 0:
+            self.n_calibration_points = 0
             self.q_label = 1.0 - self.alpha
             return self.q_label
 
-        if self.method == "aps":
-            # Romano et al. (2020): cumulative sorted probability up to true class
-            sorted_p, sorted_idx = torch.sort(p_cal, dim=-1, descending=True)
-            cumsum_p = torch.cumsum(sorted_p, dim=-1)
-            match = (sorted_idx == y_cal.unsqueeze(-1)).float()
-            scores = (cumsum_p * match).sum(dim=-1)
+        if self.fit_temperature and int(valid.sum().item()) >= 16:
+            blk = max(self.spatial_block_size, 4)
+            yy = torch.arange(height, device=p.device).view(1, height, 1) // blk
+            xx = torch.arange(width, device=p.device).view(1, 1, width) // blk
+            bb = torch.arange(bsz, device=p.device).view(bsz, 1, 1)
+            checker = (((bb + yy + xx) % 2) == 0).reshape(-1)
+            temp_sel = valid & checker
+            quant_sel = valid & (~checker)
+            if int(temp_sel.sum().item()) < 8 or int(quant_sel.sum().item()) < 8:
+                idx_valid = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+                temp_sel = torch.zeros_like(valid)
+                quant_sel = torch.zeros_like(valid)
+                temp_sel[idx_valid[0::2]] = True
+                quant_sel[idx_valid[1::2]] = True
+            self.temperature = _fit_temperature_golden_section(
+                p_flat[temp_sel], y_flat[temp_sel]
+            )
+            cal_sel = quant_sel
         else:
-            # Sadinle et al. (2019) LAC: 1 - p(true_class)
-            true_p = p_cal.gather(1, y_cal.unsqueeze(-1)).squeeze(-1)
-            scores = 1.0 - true_p
+            cal_sel = valid
 
+        if self.spatial_block_size > 1:
+            b_step = self.spatial_block_size
+            off = b_step // 2
+            y_grid = (
+                torch.arange(height, device=p.device).view(1, height, 1) % b_step
+            ) == off
+            x_grid = (
+                torch.arange(width, device=p.device).view(1, 1, width) % b_step
+            ) == off
+            grid_mask = (y_grid & x_grid).expand(bsz, height, width).reshape(-1)
+            strided_sel = cal_sel & grid_mask
+            if int(strided_sel.sum().item()) >= 16:
+                cal_sel = strided_sel
+
+        p_cal = (
+            self._apply_temperature(p_flat[cal_sel], multiclass=True)
+            if self.fit_temperature
+            else p_flat[cal_sel]
+        )
+        y_cal = y_flat[cal_sel]
+        self.n_calibration_points = int(y_cal.numel())
+        scores = self._nonconformity_scores(p_cal, y_cal)
         self.q_label = _conformal_quantile(scores, self.alpha)
         return self.q_label
 
@@ -268,6 +437,7 @@ class ConformalCalibrator:
         self.q_label = None
         self.q_coarse_per_channel = None
         self._coarse_scale = None
+        self.temperature = 1.0
 
         p = probs_hr.detach().float()
         if p.ndim == 3:
@@ -387,14 +557,7 @@ class ConformalCalibrator:
                     pure_mask
                 ]
                 y_pure = pseudo_cls.reshape(-1)[pure_mask]
-                if self.method == "aps":
-                    sorted_p, sorted_idx = torch.sort(p_pure, dim=-1, descending=True)
-                    cumsum_p = torch.cumsum(sorted_p, dim=-1)
-                    match = (sorted_idx == y_pure.unsqueeze(-1)).float()
-                    scores_cls = (cumsum_p * match).sum(dim=-1)
-                else:
-                    true_p = p_pure.gather(1, y_pure.unsqueeze(-1)).squeeze(-1)
-                    scores_cls = 1.0 - true_p
+                scores_cls = self._nonconformity_scores(p_pure, y_pure)
                 self.q_label = _conformal_quantile(scores_cls, self.alpha)
             else:
                 self.q_label = 1.0 - self.alpha
@@ -402,6 +565,7 @@ class ConformalCalibrator:
         return {
             "conformal_alpha": self.alpha,
             "conformal_method": self.method,
+            "conformal_temperature": round(float(self.temperature), 4),
             "conformal_q_label": round(float(self.q_label), 4),
             "conformal_q_coarse": [round(float(v), 4) for v in q_ch],
             "conformal_n_cal": self.n_calibration_points,
@@ -427,7 +591,7 @@ class ConformalCalibrator:
         q_lbl = self.q_label if self.q_label is not None else (1.0 - self.alpha)
 
         if mode == "multilabel" and p.shape[1] >= 2:
-            p_cls = p.clamp(0.0, 1.0)
+            p_cls = self._apply_temperature(p.clamp(0.0, 1.0), multiclass=False)
             pred_sets = (1.0 - p_cls) <= q_lbl
         else:
             p_cls = (
@@ -435,19 +599,8 @@ class ConformalCalibrator:
                 if p.shape[1] == 1
                 else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
             )
-            if self.method == "aps":
-                sorted_p, sorted_idx = torch.sort(p_cls, dim=1, descending=True)
-                cumsum_p = torch.cumsum(sorted_p, dim=1)
-                prev_cumsum = cumsum_p - sorted_p
-                in_sorted = prev_cumsum <= q_lbl
-                in_sorted[:, 0] = True
-                pred_sets = torch.zeros_like(p_cls, dtype=torch.bool)
-                pred_sets.scatter_(1, sorted_idx, in_sorted)
-            else:
-                pred_sets = (1.0 - p_cls) <= q_lbl
-                if not self.allow_empty_sets:
-                    top1 = p_cls.argmax(dim=1, keepdim=True)
-                    pred_sets.scatter_(1, top1, True)
+            p_cls = self._apply_temperature(p_cls, multiclass=True)
+            pred_sets = self._predict_multiclass_sets(p_cls, q_lbl)
 
         halfwidth: torch.Tensor | None = None
         if guide_lr is not None and self.q_coarse_per_channel is not None:
@@ -526,14 +679,33 @@ class ConformalCalibrator:
         return pred_sets, halfwidth
 
 
+def _detect_label_boundary_mask(y: np.ndarray) -> np.ndarray | None:
+    """Detect ground-truth phase boundaries via ``3 x 3`` neighborhood disagreement
+    when ``y`` is a 2D ``(H, W)`` or batched ``(B, H, W)`` / 3D ``(Z, Y, X)`` grid.
+    """
+    if y.ndim == 2 and min(y.shape) >= 3:
+        pad = np.pad(y, 1, mode="edge")
+        b = np.zeros_like(y, dtype=bool)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                b |= (
+                    pad[1 + dy : 1 + dy + y.shape[0], 1 + dx : 1 + dx + y.shape[1]] != y
+                )
+        return b
+    if y.ndim == 3 and min(y.shape[-2], y.shape[-1]) >= 3:
+        sub = [_detect_label_boundary_mask(y[i]) for i in range(y.shape[0])]
+        return np.stack([m for m in sub if m is not None])
+    return None
+
+
 def empirical_conformal_coverage(
     prediction_sets: np.ndarray | torch.Tensor,
     targets: np.ndarray | torch.Tensor,
 ) -> dict[str, float]:
-    """Evaluate empirical marginal coverage ``P(Y in C(X))`` and average set
-    cardinality ``E[|C(X)|]`` against ground-truth integer labels.
-    Supports full grids ``(B, K, H, W)`` / ``(K, H, W)`` / ``(K, Z, Y, X)`` and
-    masked 1D slices ``(B, K, N)`` / ``(K, N)``.
+    """Evaluate empirical marginal coverage ``P(Y in C(X))``, average set
+    cardinality ``E[|C(X)|]``, and grain-boundary vs. grain-interior set metrics.
     """
     s = (
         prediction_sets.detach().cpu().numpy().astype(bool)
@@ -545,21 +717,20 @@ def empirical_conformal_coverage(
         if isinstance(targets, torch.Tensor)
         else np.asarray(targets, dtype=np.int64)
     )
+    is_spatial_grid = False
     if s.ndim == 2:
-        # Masked (K, N) slice paired with (N,) targets
         n_classes = s.shape[0]
         s_flat = s.T.reshape(-1, n_classes)
     elif s.ndim >= 3 and s.shape[1:] == y.shape:
-        # Unbatched (K, H, W) or (K, Z, Y, X) paired with (H, W) or (Z, Y, X)
         n_classes = s.shape[0]
         s_flat = np.moveaxis(s, 0, -1).reshape(-1, n_classes)
+        is_spatial_grid = True
     elif (
         s.ndim == 3
         and y.ndim == 2
         and s.shape[0] == y.shape[0]
         and s.shape[2] == y.shape[1]
     ):
-        # Batched masked (B, K, N) slice paired with (B, N) targets
         n_classes = s.shape[1]
         s_flat = np.moveaxis(s, 1, -1).reshape(-1, n_classes)
     else:
@@ -567,6 +738,7 @@ def empirical_conformal_coverage(
             s = s[None, ...]
         n_classes = s.shape[1]
         s_flat = np.moveaxis(s, 1, -1).reshape(-1, n_classes)
+        is_spatial_grid = s.shape[2:] == (y.shape[-2:] if y.ndim >= 2 else ())
 
     y_flat = y.reshape(-1)
     valid = (y_flat >= 0) & (y_flat < n_classes)
@@ -575,16 +747,40 @@ def empirical_conformal_coverage(
             "empirical_coverage": 1.0,
             "mean_set_size": 1.0,
             "singleton_fraction": 1.0,
+            "boundary_mean_set_size": 1.0,
+            "interior_mean_set_size": 1.0,
+            "interior_singleton_fraction": 1.0,
         }
     s_v = s_flat[valid]
     y_v = y_flat[valid]
     covered = s_v[np.arange(len(y_v)), y_v]
     sizes = s_v.sum(axis=-1)
-    return {
+
+    res: dict[str, float] = {
         "empirical_coverage": float(np.mean(covered)),
         "mean_set_size": float(np.mean(sizes)),
         "singleton_fraction": float(np.mean(sizes == 1)),
     }
+    b_mask = _detect_label_boundary_mask(y) if is_spatial_grid else None
+    if b_mask is not None and b_mask.size == y_flat.size:
+        b_v = b_mask.reshape(-1)[valid]
+        i_v = ~b_v
+        res["boundary_mean_set_size"] = (
+            float(np.mean(sizes[b_v])) if np.any(b_v) else res["mean_set_size"]
+        )
+        res["interior_mean_set_size"] = (
+            float(np.mean(sizes[i_v])) if np.any(i_v) else res["mean_set_size"]
+        )
+        res["interior_singleton_fraction"] = (
+            float(np.mean(sizes[i_v] == 1))
+            if np.any(i_v)
+            else res["singleton_fraction"]
+        )
+    else:
+        res["boundary_mean_set_size"] = res["mean_set_size"]
+        res["interior_mean_set_size"] = res["mean_set_size"]
+        res["interior_singleton_fraction"] = res["singleton_fraction"]
+    return res
 
 
 def compute_posterior_uncertainty(

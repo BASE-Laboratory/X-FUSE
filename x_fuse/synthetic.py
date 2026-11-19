@@ -183,6 +183,7 @@ def generate_correlative_phantom_3d(
     poisson_counts: float | None = 150.0,
     seed: int = 123,
     shape_zyx: tuple[int, int, int] | None = None,
+    depth_psf_sigma: float = 0.0,
 ) -> CorrelativePhantom3D:
     """Synthesize a 3D multi-phase porous/composite volume ``(Z, Y, X)`` with
     anisotropic or isotropic 3D correlation lengths for benchmarking 2D slice-by-slice
@@ -225,8 +226,12 @@ def generate_correlative_phantom_3d(
     f = downsample_factor
     z_lr, y_lr, x_lr = z_dim // f, y_dim // f, x_dim // f
     coarse_3d = np.zeros((2, z_lr, y_lr, x_lr), dtype=np.float32)
+    sig_xy = 0.45 * f
+    sig_z = max(sig_xy, float(depth_psf_sigma))
     for m in range(2):
-        blurred = gaussian_filter(gt_channels[m], sigma=0.45 * f, mode="nearest")
+        blurred = gaussian_filter(
+            gt_channels[m], sigma=(sig_z, sig_xy, sig_xy), mode="nearest"
+        )
         pooled = blurred.reshape(z_lr, f, y_lr, f, x_lr, f).mean(axis=(1, 3, 5))
         if poisson_counts is not None and poisson_counts > 0:
             pooled = rng.poisson(np.clip(pooled, 0.0, 1.0) * poisson_counts).astype(

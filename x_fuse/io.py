@@ -373,7 +373,7 @@ def load_microscopy_file(
             if suffix in (".tif", ".tiff"):
                 arr = tifffile.imread(in_path).astype(np.float32)
                 return arr, {"format": "tiff", "shape": list(arr.shape)}
-        except ImportError:
+        except (ImportError, ValueError):
             pass
         with Image.open(in_path) as im:
             arr = np.array(im, dtype=np.float32)

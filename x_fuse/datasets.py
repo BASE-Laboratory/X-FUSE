@@ -26,6 +26,7 @@ class OpenCorrelativeDataset:
     zenodo_record_id: str
     doi: str
     description: str
+    default_filenames: tuple[str, ...] | None = None
 
 
 OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
@@ -53,6 +54,7 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
             "Full-resolution BSE micrographs paired with EDAX HDF5 EDS hypermaps "
             "and EBSD phase clustering for multiphase refractory alloys."
         ),
+        default_filenames=("S3_nano.zip",),
     ),
     "ti_rcca_stem_eds": OpenCorrelativeDataset(
         key="ti_rcca_stem_eds",
@@ -65,6 +67,7 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
             "Nanoscale HAADF-STEM structural micrographs paired with Ti, Mo, Ta, "
             "Cr, and Al STEM-EDS elemental TIFF maps."
         ),
+        default_filenames=("Fig3_TEM_STEM.zip",),
     ),
     "cuzn_stem_eels": OpenCorrelativeDataset(
         key="cuzn_stem_eels",
@@ -77,6 +80,7 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
             "Simultaneously acquired HAADF survey image and Cu/Zn L-edge EELS "
             "spectrum image on carbon nanotubes (HyperSpy / eXSpy archive)."
         ),
+        default_filenames=("CuZn_HAADF.hspy", "CuZn_EELS_mapping_tutorial.hspy"),
     ),
     "isis_imat_bragg_edge": OpenCorrelativeDataset(
         key="isis_imat_bragg_edge",
@@ -174,9 +178,14 @@ def fetch_open_dataset(
     dest_root: str | Path | None = None,
     filenames: Iterable[str] | None = None,
     timeout: float = 60.0,
+    use_default_subset: bool = True,
 ) -> list[Path]:
     """Download files for a registered Zenodo dataset with HTTPS, path-traversal,
     timeout, and streaming checksum verification.
+
+    When ``filenames is None`` and ``use_default_subset=True``, automatically
+    restricts downloads to ``meta.default_filenames`` if those files are present
+    in the Zenodo record (avoiding multi-gigabyte unrelated archives).
     """
     if dataset_key not in OPEN_DATASETS:
         raise KeyError(
@@ -196,9 +205,20 @@ def fetch_open_dataset(
     with urllib.request.urlopen(api_url, timeout=min(float(timeout), 30.0)) as resp:
         record = json.loads(resp.read().decode("utf-8"))
 
-    wanted = set(filenames) if filenames is not None else None
+    record_files = record.get("files", [])
+    record_keys = {str(fe.get("key", "")) for fe in record_files}
+    if filenames is not None:
+        wanted: set[str] | None = set(filenames)
+    elif (
+        use_default_subset
+        and meta.default_filenames is not None
+        and any(fn in record_keys for fn in meta.default_filenames)
+    ):
+        wanted = set(meta.default_filenames)
+    else:
+        wanted = None
     downloaded: list[Path] = []
-    for f_entry in record.get("files", []):
+    for f_entry in record_files:
         fname = str(f_entry["key"])
         if wanted is not None and fname not in wanted:
             continue

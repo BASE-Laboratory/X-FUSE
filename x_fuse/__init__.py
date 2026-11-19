@@ -101,6 +101,7 @@ from .transforms import (
 )
 from .uncertainty import (
     ConformalCalibrator,
+    ConformalMethod,
     UncertaintyReport,
     WelfordAccumulator,
     brier_score,
@@ -117,7 +118,9 @@ from .upsamplers import (
     CrossAttentionFeatureUpsampler,
     ForwardPSFDownsampler,
     JointBilateralUpsampler,
+    PSFProfile,
     extract_multiscale_texture_descriptors,
+    extract_structure_tensor_field,
     joint_bilateral_upsample,
 )
 from .utils import downsample_xrdct, get_multiphase, guide_to_tensor, xrd_to_tensor
@@ -167,9 +170,12 @@ __all__ = [
     "CrossAttentionFeatureUpsampler",
     "JointBilateralUpsampler",
     "ForwardPSFDownsampler",
+    "PSFProfile",
     "extract_multiscale_texture_descriptors",
+    "extract_structure_tensor_field",
     "joint_bilateral_upsample",
     "ConformalCalibrator",
+    "ConformalMethod",
     "UncertaintyReport",
     "WelfordAccumulator",
     "compute_posterior_uncertainty",
