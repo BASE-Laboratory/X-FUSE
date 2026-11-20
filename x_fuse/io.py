@@ -16,6 +16,7 @@ from typing import Any
 import h5py
 import numpy as np
 from basecoat import (
+    AxisSpec,
     Volume,
     VolumeSet,
     read_ome_zarr,
@@ -651,6 +652,7 @@ def export_volume_ome_zarr(
     label_names: Mapping[int, str] | None = None,
     active_phase: int = 0,
     export_conformal_bounds: bool = True,
+    extra_uncertainties: Mapping[str, np.ndarray] | None = None,
     multiscale_levels: int = 2,
     overwrite: bool = True,
 ) -> Path:
@@ -660,9 +662,9 @@ def export_volume_ome_zarr(
     Writes a calibrated primary 3D ``Volume`` (``image_volume`` when supplied,
     otherwise ``combined_uncertainty`` or ``float32`` phase field) together with
     mode-downsampled integer ``labels/phase`` (and optional ``labels/phase_lower`` /
-    ``labels/phase_upper`` conformal phase envelopes) so Layer 3 solvers
-    (``OpenImpala``, ``SMS``) and Layer 4 evaluators consume ``X-FUSE`` outputs
-    without bespoke glue.
+    ``labels/phase_upper`` conformal phase envelopes) plus ``uncertainties/*``
+    sidecars so Layer 3 solvers (``OpenImpala``, ``SMS``) and Layer 4 evaluators
+    consume ``X-FUSE`` outputs without bespoke glue.
     """
     act = int(active_phase)
     if not (0 <= act <= 255):
@@ -735,7 +737,53 @@ def export_volume_ome_zarr(
                 provenance={"envelope": "conformal_upper", "active_phase": act},
             )
 
-    vset = VolumeSet(img_vol, labels=labels_map)
+    unc_map: dict[str, Volume] = {}
+    chan_axes = (AxisSpec(name="c", kind="channel", unit="none"), *img_vol.axes)
+    if isinstance(vol_report_or_mask, VolumetricUncertaintyReport):
+        for ukey, uarr in (
+            ("combined_uncertainty", comb_unc_np),
+            (
+                "aleatoric_entropy",
+                vol_report_or_mask.aleatoric_entropy.detach().cpu().float().numpy(),
+            ),
+            (
+                "epistemic_variance",
+                vol_report_or_mask.triplane_variance.detach().cpu().float().numpy(),
+            ),
+            (
+                "physical_residual",
+                vol_report_or_mask.physical_residual.detach().cpu().float().numpy(),
+            ),
+        ):
+            if uarr is not None:
+                unc_map[ukey] = Volume(
+                    np.asarray(uarr, dtype=np.float32),
+                    axes=img_vol.axes,
+                    space=img_vol.space,
+                )
+        if probs_np is not None:
+            unc_map["probabilities"] = Volume(
+                np.asarray(probs_np, dtype=np.float32),
+                axes=chan_axes,
+                space=img_vol.space,
+            )
+        if conf_hw_np is not None:
+            unc_map["conformal_interval_halfwidth"] = Volume(
+                np.asarray(conf_hw_np, dtype=np.float32),
+                axes=chan_axes,
+                space=img_vol.space,
+            )
+
+    if extra_uncertainties is not None:
+        for ukey, uarr in extra_uncertainties.items():
+            arr_f32 = np.asarray(uarr, dtype=np.float32)
+            unc_map[ukey] = Volume(
+                arr_f32,
+                axes=chan_axes if arr_f32.ndim == 4 else img_vol.axes,
+                space=img_vol.space,
+            )
+
+    vset = VolumeSet(img_vol, labels=labels_map, uncertainties=unc_map)
     return write_ome_zarr(
         vset,
         store_path,

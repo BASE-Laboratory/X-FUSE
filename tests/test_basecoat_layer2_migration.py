@@ -87,15 +87,26 @@ def test_export_volume_ome_zarr_with_conformal_envelopes_and_accessor(
     assert vset.image.origin_in("um") == pytest.approx((5.0, 10.0, 15.0))
     assert vset.image.space == "zn13x_0p8125um"
     assert {"phase", "phase_lower", "phase_upper"}.issubset(vset.labels.keys())
+    assert {
+        "combined_uncertainty",
+        "aleatoric_entropy",
+        "epistemic_variance",
+        "physical_residual",
+        "probabilities",
+    }.issubset(vset.uncertainties.keys())
+    assert vset.uncertainties["combined_uncertainty"].shape == (8, 32, 32)
+    assert vset.uncertainties["probabilities"].shape[1:] == (8, 32, 32)
     # Conformal lower envelope for phase 1 is a subset of hard phase 1 / upper envelope
     in_lo = vset.labels["phase_lower"].data == 1
     in_up = vset.labels["phase_upper"].data == 1
     assert np.all(in_lo <= in_up)
 
-    # Coarse multiscale level preserves discrete label values via mode pooling
+    # Coarse level mode-pools discrete labels and mean-pools uncertainties
     vset_l1 = read_ome_zarr(store, level=1, as_set=True)
     assert vset_l1.image.shape == (4, 16, 16)
     assert set(np.unique(vset_l1.labels["phase_upper"].data)).issubset({0, 1})
+    assert vset_l1.uncertainties["combined_uncertainty"].shape == (4, 16, 16)
+    assert vset_l1.uncertainties["probabilities"].shape[1:] == (4, 16, 16)
 
     # VolumeSliceAccessor reads .ome.zarr paths, LazyVolume, and Volume natively
     acc_store = VolumeSliceAccessor(store)
