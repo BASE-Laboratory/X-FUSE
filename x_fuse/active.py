@@ -45,19 +45,32 @@ def suggest_next_slices(
     weights: tuple[float, float, float] = (0.45, 0.45, 0.10),
 ) -> ActiveSliceRecommendation:
     """Recommend the next ``k`` 2D chemical/diffraction slices along ``Z`` to
-    acquire in a 3D structural tomogram.
+    acquire in a 3D structural tomogram using **1D Voronoi expected uncertainty
+    reduction**.
 
     Combines:
     1. Slice-mean **tri-plane / TTA epistemic variance** (structural view disagreement),
     2. Slice-mean **posterior chemical entropy** (phase boundary ambiguity), and
-    3. Dynamic **spatial diversity bonus** (distance from nearest already-acquired
-       or newly scheduled slice) so beamtime isn't spent on redundant adjacent slices.
+    3. **1D Voronoi interval integration + axial correlation discounting** over
+       ``max(0, d_occ(z) - |z - c|)``, ensuring immediate discovery of localized
+       reaction fronts on early picks while bisecting large unvisited bulk slabs
+       on subsequent picks instead of clustering near already-sampled fronts.
     """
     if k < 1:
         raise ValueError(f"k must be >= 1, got {k}.")
 
-    epi_zyx = vol_report.triplane_variance.detach().cpu().float().numpy()
-    ent_zyx = vol_report.aleatoric_entropy.detach().cpu().float().numpy()
+    epi_zyx = np.nan_to_num(
+        vol_report.triplane_variance.detach().cpu().float().numpy(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
+    ent_zyx = np.nan_to_num(
+        vol_report.aleatoric_entropy.detach().cpu().float().numpy(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
     z_dim = int(epi_zyx.shape[0])
 
     epi_z = epi_zyx.mean(axis=(1, 2))
@@ -72,39 +85,52 @@ def suggest_next_slices(
     epi_norm = _norm01(epi_z)
     ent_norm = _norm01(ent_z)
     w_epi, w_ent, w_dist = weights
-    intrinsic = w_epi * epi_norm + w_ent * ent_norm
+    intrinsic = (w_epi * epi_norm + w_ent * ent_norm).astype(np.float32)
 
     known = sorted({int(i) for i in acquired_indices if 0 <= int(i) < z_dim})
     selected: list[int] = []
     all_z = np.arange(z_dim, dtype=np.float32)
+    dist_mat = np.abs(all_z[:, None] - all_z[None, :])  # (Z, Z): |z - c|
+    mid_z = 0.5 * float(max(z_dim - 1, 0))
+    center_tie = 1e-4 * (1.0 - np.abs(all_z - mid_z) / max(mid_z, 1.0)).astype(
+        np.float32
+    )
 
-    # Record initial score profile before greedy updates
-    if known:
-        init_dist = np.min(
-            np.abs(all_z[:, None] - np.asarray(known, dtype=np.float32)[None, :]),
-            axis=1,
+    def _voronoi_step_scores(occupied_list: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        if not occupied_list:
+            min_d_loc = np.full(z_dim, float(z_dim), dtype=np.float32)
+            return (intrinsic + float(w_dist) + center_tie).astype(
+                np.float32
+            ), min_d_loc
+
+        occ_arr = np.asarray(occupied_list, dtype=np.float32)
+        min_d_loc = np.min(np.abs(all_z[:, None] - occ_arr[None, :]), axis=1)
+        corr_len = max(
+            float(max(1, int(min_spacing))),
+            float(z_dim) / float(2 * (len(occupied_list) + 1)),
         )
-        init_dist_norm = _norm01(init_dist)
-    else:
-        init_dist_norm = np.ones(z_dim, dtype=np.float32)
-    initial_scores = (intrinsic + w_dist * init_dist_norm).astype(np.float32)
+        unresolved = (1.0 - np.exp(-min_d_loc / max(corr_len, 1.0))).astype(np.float32)
+        local_peak = intrinsic * unresolved
+
+        # 1D Voronoi distance reduction delta_d[z, c] = max(0, d_occ(z) - |z - c|)
+        delta_d = np.maximum(0.0, min_d_loc[:, None] - dist_mat)
+        geom_scale = float(np.max(np.sum(delta_d, axis=0)))
+        density = local_peak + float(w_dist)
+        voronoi_gain = (density[:, None] * delta_d).sum(axis=0) / max(geom_scale, 1.0)
+        scores = (0.55 * local_peak + 0.45 * voronoi_gain).astype(np.float32)
+        return scores, min_d_loc
+
+    initial_scores, _ = _voronoi_step_scores(known)
 
     max_picks = min(int(k), max(0, z_dim - len(known)))
     for _ in range(max_picks):
         occupied = known + selected
-        if occupied:
-            occ_arr = np.asarray(occupied, dtype=np.float32)
-            min_d = np.min(np.abs(all_z[:, None] - occ_arr[None, :]), axis=1)
-            dist_bonus = _norm01(min_d)
-        else:
-            min_d = np.full(z_dim, float(z_dim), dtype=np.float32)
-            dist_bonus = np.ones(z_dim, dtype=np.float32)
-
-        step_scores = intrinsic + w_dist * dist_bonus
-        # Prefer slices at least min_spacing away; relax to >= 1 if volume is tight
+        step_scores, min_d = _voronoi_step_scores(occupied)
         valid = min_d >= max(1, int(min_spacing))
         if not np.any(valid):
-            valid = min_d >= 1.0
+            max_rem_d = float(np.max(min_d)) if min_d.size > 0 else 0.0
+            if max_rem_d >= 1.0:
+                valid = min_d >= max(1.0, np.floor(max_rem_d))
         if not np.any(valid):
             break
 
@@ -112,7 +138,13 @@ def suggest_next_slices(
         best_idx = int(np.argmax(masked_scores))
         selected.append(best_idx)
 
-    raw_unc_z = 0.5 * epi_norm + 0.5 * ent_norm
+    p99_epi = float(np.quantile(epi_z, 0.99)) if epi_z.size > 0 else 0.0
+    epi_abs = (
+        np.clip(epi_z / max(p99_epi, 1e-6), 0.0, 1.0)
+        if p99_epi > 1e-8
+        else np.zeros_like(epi_z, dtype=np.float32)
+    )
+    raw_unc_z = 0.5 * epi_abs + 0.5 * np.clip(ent_z, 0.0, 1.0)
     if selected:
         gain = float(np.mean(raw_unc_z[selected]))
     else:
@@ -151,8 +183,18 @@ def suggest_2d_rois(
     if k < 1:
         raise ValueError(f"k must be >= 1, got {k}.")
 
-    unc = report.combined_uncertainty[0].detach().cpu().float().numpy()
-    res = report.physical_residual[0].detach().cpu().float().numpy()
+    unc = np.nan_to_num(
+        report.combined_uncertainty[0].detach().cpu().float().numpy(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
+    res = np.nan_to_num(
+        report.physical_residual[0].detach().cpu().float().numpy(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
     height, width = int(unc.shape[0]), int(unc.shape[1])
     win_h = max(1, min(int(roi_size[0]), height))
     win_w = max(1, min(int(roi_size[1]), width))

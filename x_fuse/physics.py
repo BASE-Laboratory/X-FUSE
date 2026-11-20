@@ -296,24 +296,25 @@ class PhysicsForwardModel(nn.Module):
             self.log_flux_scale = nn.Parameter(
                 torch.zeros((1, self.n_channels, 1, 1), dtype=torch.float32)
             )
-            self.raw_background = (
-                nn.Parameter(torch.full((1, obs_ch, 1, 1), -3.0, dtype=torch.float32))
-                if loss_fn == "forward_psf_poisson"
-                else None
-            )
-            if loss_fn != "forward_psf_poisson":
+            if loss_fn == "forward_psf_poisson":
+                self.raw_background = nn.Parameter(
+                    torch.full((1, obs_ch, 1, 1), -3.0, dtype=torch.float32)
+                )
+            else:
                 self.register_parameter("raw_background", None)
             self._scale_initialized = False
         else:
             self.register_parameter("log_flux_scale", None)
             self.register_parameter("raw_background", None)
             self._scale_initialized = True
+        self._force_bg_for_pores: bool = False
 
     def reset_specimen_state(self) -> None:
         """Reset data-dependent scale and simplex flags before fitting a new sample."""
         if self.log_flux_scale is not None:
             self._scale_initialized = False
         self._resolved_bg_simplex = self.simplex_include_background
+        self._force_bg_for_pores = False
 
     @torch.no_grad()
     def maybe_initialize_poisson_scale(
@@ -356,10 +357,19 @@ class PhysicsForwardModel(nn.Module):
         q05 = torch.quantile(flat, 0.05, dim=-1).mean(dim=0)  # (C_obs,)
 
         if self.spectral_dict is not None:
-            tot_scale = (
-                flat.sum(dim=1).quantile(0.90) / max(self.n_channels, 1)
-            ).clamp(min=0.1)
-            self.log_flux_scale.fill_(float(torch.log(tot_scale).item()))
+            abund = self.spectral_dict.project_cube(t)  # (B, M, H_lr, W_lr)
+            if mask_lr is not None and int(mask_lr.sum().item()) >= 4:
+                a_flat = abund[:, :, mask_lr.to(device=t.device, dtype=torch.bool)]
+            else:
+                a_flat = abund.flatten(start_dim=2)
+            a_hi = torch.quantile(a_flat, 0.96, dim=-1).mean(dim=0)
+            a_lo = torch.quantile(a_flat, 0.04, dim=-1).mean(dim=0)
+            flux_spec = (a_hi - a_lo).clamp(min=0.1)
+            self.log_flux_scale.copy_(
+                torch.log(flux_spec)
+                .view(1, self.n_channels, 1, 1)
+                .to(self.log_flux_scale.device)
+            )
         else:
             flux = (q95 - q05).clamp(min=0.25)
             if flux.numel() == self.n_channels:
@@ -382,6 +392,8 @@ class PhysicsForwardModel(nn.Module):
         self._scale_initialized = True
 
     def _use_background_simplex(self, target: torch.Tensor | None = None) -> bool:
+        if self._force_bg_for_pores:
+            return True
         if self.simplex_include_background is not None:
             return self.simplex_include_background
         if self.spectral_dict is not None:
@@ -525,7 +537,12 @@ class PhysicsForwardModel(nn.Module):
             )
             simplex_hr = self.logits_to_simplex_probs(warped.float(), target=ref)
             if self.spectral_dict is not None:
-                pred_spec = self.spectral_dict(self.psf_downsampler(simplex_hr, lr_hw))
+                fg_hr = (
+                    simplex_hr[:, 1:]
+                    if simplex_hr.shape[1] == self.n_channels + 1
+                    else simplex_hr
+                )
+                pred_spec = self.spectral_dict(self.psf_downsampler(fg_hr, lr_hw))
                 tgt_spec = ref.clamp(min=0.0)
                 tgt_norm = tgt_spec / tgt_spec.sum(dim=1, keepdim=True).clamp(min=1e-6)
                 pred_norm = pred_spec / pred_spec.sum(dim=1, keepdim=True).clamp(

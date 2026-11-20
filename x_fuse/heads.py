@@ -315,6 +315,7 @@ class SpatialConvMLPHead(nn.Module):
             spectral_channels=spectral_channels,
             psf_profile=psf_profile,
         )
+        self._spec_prior_cache: tuple[tuple[object, ...], torch.Tensor] | None = None
 
     @property
     def psf_downsampler(self) -> ForwardPSFDownsampler:
@@ -411,14 +412,62 @@ class SpatialConvMLPHead(nn.Module):
             g = g.unsqueeze(0).unsqueeze(0)
         elif g.ndim == 3:
             g = g.unsqueeze(0)
+        projected_spectral = False
         if g.shape[1] != self.out_channels:
             if (
                 self.physics.spectral_dict is not None
                 and g.shape[1] == self.physics.spectral_dict.spectral_channels
             ):
-                g = self.physics.spectral_dict.project_cube(g)
+                spec_key: tuple[object, ...] = (
+                    int(canon_guide.data_ptr()),
+                    tuple(canon_guide.shape),
+                    int(self.out_channels),
+                    round(float(g.sum().item()), 3),
+                    round(float(g.max().item()), 3),
+                )
+                cached = self._spec_prior_cache
+                if (
+                    cached is not None
+                    and cached[0] == spec_key
+                    and cached[1].device == logits_canon.device
+                ):
+                    g = cached[1]
+                else:
+                    g_proj = self.physics.spectral_dict.project_cube(g).clamp(min=0.0)
+                    flat_p = g_proj.flatten(-2)
+                    q_lo = (
+                        torch.quantile(flat_p, 0.02, dim=-1, keepdim=True).unsqueeze(-1)
+                        if flat_p.shape[-1] <= 1_000_000
+                        else g_proj.amin(dim=(-2, -1), keepdim=True)
+                    )
+                    q_hi = (
+                        torch.quantile(flat_p, 0.98, dim=-1, keepdim=True).unsqueeze(-1)
+                        if flat_p.shape[-1] <= 1_000_000
+                        else g_proj.amax(dim=(-2, -1), keepdim=True)
+                    )
+                    g = ((g_proj - q_lo) / (q_hi - q_lo).clamp(min=1e-6)).clamp(
+                        0.0, 1.0
+                    )
+                    self._spec_prior_cache = (spec_key, g.detach())
+                projected_spectral = True
             else:
                 g = g[:, : self.out_channels]
+        if (
+            not projected_spectral
+            and self.loss_fn == "forward_psf_poisson"
+            and float(g.max().item()) > 1.0 + 1e-3
+        ):
+            g_pos = g.clamp(min=0.0)
+            flat_g = g_pos.flatten(-2)
+            if flat_g.shape[-1] <= 1_000_000:
+                q_hi = (
+                    torch.quantile(flat_g, 0.99, dim=-1, keepdim=True)
+                    .unsqueeze(-1)
+                    .clamp(min=1e-6)
+                )
+            else:
+                q_hi = g_pos.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            g = (g_pos / q_hi).clamp(0.0, 1.0)
         full_h, full_w = int(logits_canon.shape[-2]), int(logits_canon.shape[-1])
         oh, ow = valid_hr_hw if valid_hr_hw is not None else (full_h, full_w)
         g_hr = F.interpolate(g, size=(oh, ow), mode="bilinear", align_corners=False)

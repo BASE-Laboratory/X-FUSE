@@ -7,6 +7,7 @@
       members:
         - CorrelativeFuser
         - XFuse
+        - segment_pores_otsu
         - compute_channel_correlation_gates
 
 ::: x_fuse.heads
@@ -113,14 +114,26 @@
 
 ---
 
-## Scientific I/O & Open Datasets (`x_fuse.io`, `x_fuse.datasets`)
+## Scientific I/O, Synchrotron Loaders & Open Datasets (`x_fuse.io`, `x_fuse.loaders`, `x_fuse.datasets`)
 
 ::: x_fuse.io
     options:
       members:
+        - export_for_openimpala
         - save_uncertainty_report
         - load_uncertainty_report
         - load_microscopy_file
+
+::: x_fuse.loaders
+    options:
+      members:
+        - load_xct_subvolume
+        - load_diad_xct_zn13x
+        - load_diad_xrdct
+        - load_xrdct_peak_maps
+        - aggregate_peak_maps
+        - detrend_radial_cupping
+        - remove_polar_rings_conservative
 
 ::: x_fuse.datasets
     options:
@@ -130,3 +143,16 @@
         - fetch_open_dataset
         - get_sample_dataset_path
         - make_experimental_holdout
+
+---
+
+## Synthetic Correlative Phantoms (`x_fuse.synthetic`)
+
+::: x_fuse.synthetic
+    options:
+      members:
+        - generate_correlative_phantom_2d
+        - generate_oriented_lamellar_phantom_2d
+        - generate_correlative_phantom_3d
+        - generate_localized_reaction_phantom_3d
+        - generate_spectral_cube_phantom_2d

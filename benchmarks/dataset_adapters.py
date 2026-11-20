@@ -125,6 +125,49 @@ def _ensure_extracted(paths: list[Path]) -> Path:
     return root
 
 
+def _load_text_matrix(path: Path) -> np.ndarray | None:
+    """Load a numeric 2D array from whitespace, comma, or semicolon delimited text,
+    including Bruker Esprit / ``edxia`` CSVs with trailing row commas, while returning
+    ``None`` for 1D vectors or tabular header/point files (e.g. ``pointsWt.csv``).
+    """
+    try:
+        raw_lines = [
+            ln.strip().rstrip(",;")
+            for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            if ln.strip()
+        ]
+    except OSError:
+        return None
+    if len(raw_lines) < 8:
+        return None
+    for delim in (None, ",", ";"):
+        try:
+            arr = np.loadtxt(raw_lines, dtype=np.float32, delimiter=delim)
+        except ValueError:
+            continue
+        if arr.ndim == 2 and min(arr.shape) >= 8:
+            return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    return None
+
+
+def _matches_elem_token(stem: str, kw: str) -> tuple[bool, bool]:
+    """Return ``(is_exact_token, is_loose_match)`` without letting single-letter
+    elements like ``'S'`` or ``'O'`` false-match ``'BSE Wt_'`` or ``'Si Wt_'``.
+    """
+    import re
+
+    s_low = stem.lower().strip()
+    k_low = kw.lower().strip()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", s_low) if t]
+    if s_low == k_low or (tokens and (tokens[0] == k_low or tokens[-1] == k_low)):
+        return True, True
+    if k_low in tokens:
+        return False, True
+    if len(k_low) >= 2 and k_low in s_low:
+        return False, True
+    return False, False
+
+
 def _discover_hr_and_guides_generic(
     folder: Path,
     hr_keywords: tuple[str, ...],
@@ -173,6 +216,7 @@ def _discover_hr_and_guides_generic(
         if any(kw in f.stem.lower() for kw in hr_keywords)
         and "diffraction" not in f.stem.lower()
         and "saed" not in f.stem.lower()
+        and "points" not in f.stem.lower()
     ]
     if not hr_candidates:
         raise FileNotFoundError(
@@ -187,7 +231,10 @@ def _discover_hr_and_guides_generic(
         hr_file = hr_candidates[0]
 
     if hr_file.suffix.lower() in {".txt", ".csv"}:
-        hr_arr = np.loadtxt(hr_file, dtype=np.float32)
+        hr_loaded = _load_text_matrix(hr_file)
+        if hr_loaded is None:
+            raise ValueError(f"Could not parse 2D matrix from {hr_file}.")
+        hr_arr = hr_loaded
     else:
         hr_arr, _ = load_microscopy_file(hr_file)
     if hr_arr.ndim == 3:
@@ -199,24 +246,23 @@ def _discover_hr_and_guides_generic(
     guide_arrays: list[np.ndarray] = []
     names: list[str] = []
     for kw in elem_keywords:
-        kw_low = kw.lower()
-        exact = [
-            f
-            for f in pool_files
-            if f != hr_file
-            and (
-                f.stem.lower().endswith(f"-{kw_low}")
-                or f.stem.lower().endswith(f"_{kw_low}")
-                or f.stem.lower() == kw_low
-            )
-        ]
-        matches = exact or [
-            f for f in pool_files if f != hr_file and kw_low in f.stem.lower()
-        ]
-        if matches:
-            gf = matches[0]
+        exact: list[Path] = []
+        loose: list[Path] = []
+        for f in pool_files:
+            if f == hr_file or "points" in f.stem.lower():
+                continue
+            is_ex, is_lo = _matches_elem_token(f.stem, kw)
+            if is_ex:
+                exact.append(f)
+            elif is_lo:
+                loose.append(f)
+        matches = exact or loose
+        for gf in matches:
             if gf.suffix.lower() in {".txt", ".csv"}:
-                g_arr = np.loadtxt(gf, dtype=np.float32)
+                g_loaded = _load_text_matrix(gf)
+                if g_loaded is None:
+                    continue
+                g_arr = g_loaded
             else:
                 g_arr, _ = load_microscopy_file(gf)
             if g_arr.ndim == 3:
@@ -227,6 +273,7 @@ def _discover_hr_and_guides_generic(
                 )
             guide_arrays.append(g_arr.astype(np.float32))
             names.append(kw)
+            break
 
     if not guide_arrays:
         raise FileNotFoundError(
@@ -316,12 +363,21 @@ def load_zenodo_correlative_sample(
         folder = _ensure_extracted(list(base.iterdir()))
 
     if dataset_key == "edxia_cement_sem_eds":
+        eff_sub = subpanel if subpanel is not None else "LC3"
         hr, guides, names = _discover_hr_and_guides_generic(
             folder,
             hr_keywords=("bse", "sem"),
             elem_keywords=("Ca", "Si", "Al", "Fe", "Mg", "S"),
-            subpanel=subpanel,
+            subpanel=eff_sub,
         )
+        if crop_clean_roi:
+            h8 = min(512, (hr.shape[0] // 16) * 16)
+            w8 = min(512, (hr.shape[1] // 16) * 16)
+            if h8 >= 64 and w8 >= 64:
+                y0 = (hr.shape[0] - h8) // 2
+                x0 = (hr.shape[1] - w8) // 2
+                hr = hr[y0 : y0 + h8, x0 : x0 + w8]
+                guides = guides[:, y0 : y0 + h8, x0 : x0 + w8]
     elif dataset_key == "ti_rcca_stem_eds":
         hr, guides, names = _discover_hr_and_guides_generic(
             folder,

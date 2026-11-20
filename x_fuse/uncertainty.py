@@ -430,6 +430,7 @@ class ConformalCalibrator:
         downsampler: ForwardPSFDownsampler | None = None,
         aligner: DifferentiableGuideAligner | None = None,
         mode: Literal["multiclass", "multilabel"] = "multiclass",
+        pore_mask_hr: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Zero-label coarse physical split-conformal calibration using held-out
         coarse pixels ``cal_mask_lr`` (or all coarse pixels if ``None``).
@@ -475,7 +476,7 @@ class ConformalCalibrator:
                 .unsqueeze(-1)
                 .clamp(min=1e-6)
             )
-            self._coarse_scale = g_max.detach().clone()
+            self._coarse_scale = g_max.amax(dim=0, keepdim=True).detach().clone()
             g_eval = (g / g_max).clamp(0.0, 1.0)
         else:
             g_eval = g.clamp(0.0, 1.0)
@@ -498,30 +499,59 @@ class ConformalCalibrator:
         )  # (B, 1, H_lr, W_lr)
 
         norm_res = (pred_lr - g_eval).abs() / difficulty_lr
-        mask_flat = (
-            cal_mask_lr.to(p.device).reshape(-1).bool()
-            if cal_mask_lr is not None
-            else torch.ones(h_lr * w_lr, device=p.device, dtype=torch.bool)
-        )
+        bsz = int(p.shape[0])
+        if cal_mask_lr is not None:
+            cm_t = cal_mask_lr.to(p.device).bool()
+            mask_flat = (
+                cm_t.expand(bsz, h_lr, w_lr).reshape(-1)
+                if cm_t.ndim == 2
+                else cm_t.reshape(-1)
+            )
+        else:
+            mask_flat = torch.ones(bsz * h_lr * w_lr, device=p.device, dtype=torch.bool)
         self.n_calibration_points = int(mask_flat.sum().item())
 
         q_ch = []
         for m in range(n_guide):
-            s_m = norm_res[:, m].reshape(norm_res.shape[0], -1)[:, mask_flat]
+            s_m = norm_res[:, m].reshape(-1)[mask_flat]
             q_ch.append(_conformal_quantile(s_m, self.alpha))
         self.q_coarse_per_channel = torch.tensor(
             q_ch, device=p.device, dtype=torch.float32
         )
 
+        f_solid_lr: torch.Tensor | None = None
+        solid_hr_t: torch.Tensor | None = None
+        if pore_mask_hr is not None:
+            pm = pore_mask_hr.to(device=p.device, dtype=torch.bool)
+            if pm.ndim == 2:
+                pm = pm.unsqueeze(0).unsqueeze(0)
+            elif pm.ndim == 3:
+                pm = pm.unsqueeze(1)
+            if pm.shape[-2:] != p.shape[-2:]:
+                pm = F.interpolate(pm.float(), size=p.shape[-2:], mode="nearest") > 0.5
+            solid_hr_t = (~pm).float()
+            f_solid_lr = F.adaptive_avg_pool2d(solid_hr_t, output_size=(h_lr, w_lr))
+
         # Calibrate phase/element set threshold on high-purity coarse superpixels
         purity_fallback = False
         if mode == "multilabel" and p.shape[1] >= 2:
-            p_pool = F.adaptive_avg_pool2d(p.clamp(0.0, 1.0), output_size=(h_lr, w_lr))
+            if solid_hr_t is not None and f_solid_lr is not None:
+                p_pool = F.adaptive_avg_pool2d(
+                    p.clamp(0.0, 1.0) * solid_hr_t, output_size=(h_lr, w_lr)
+                ) / f_solid_lr.clamp(min=1e-4)
+                g_eff = (g_eval / f_solid_lr.clamp(min=0.10)).clamp(0.0, 1.0)
+                solid_cell = (f_solid_lr.reshape(-1) >= 0.10) & mask_flat
+            else:
+                p_pool = F.adaptive_avg_pool2d(
+                    p.clamp(0.0, 1.0), output_size=(h_lr, w_lr)
+                )
+                g_eff = g_eval
+                solid_cell = mask_flat
             p_m = (
-                p_pool[:, :n_guide].permute(0, 2, 3, 1).reshape(-1, n_guide)[mask_flat]
+                p_pool[:, :n_guide].permute(0, 2, 3, 1).reshape(-1, n_guide)[solid_cell]
             )
             g_m = (
-                g_eval[:, :n_guide].permute(0, 2, 3, 1).reshape(-1, n_guide)[mask_flat]
+                g_eff[:, :n_guide].permute(0, 2, 3, 1).reshape(-1, n_guide)[solid_cell]
             )
             hi = g_m >= 0.75
             lo = g_m <= 0.25
@@ -538,20 +568,31 @@ class ConformalCalibrator:
                 if p.shape[1] == 1
                 else p / p.sum(dim=1, keepdim=True).clamp(min=1e-8)
             )
-            p_pool = F.adaptive_avg_pool2d(p_full, output_size=(h_lr, w_lr))
-            if p_full.shape[1] == n_guide + 1:
-                bg_g = (1.0 - g_eval.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
-                g_simplex = torch.cat([bg_g, g_eval], dim=1)
-            elif p_full.shape[1] == 2 and n_guide == 1:
-                g_simplex = torch.cat([1.0 - g_eval, g_eval], dim=1)
+            if solid_hr_t is not None and f_solid_lr is not None:
+                p_pool = F.adaptive_avg_pool2d(
+                    p_full * solid_hr_t, output_size=(h_lr, w_lr)
+                ) / f_solid_lr.clamp(min=1e-4)
+                p_pool = p_pool / p_pool.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                g_solid_norm = (g_eval / f_solid_lr.clamp(min=0.10)).clamp(0.0, 1.0)
+                eff_mask = (f_solid_lr.reshape(-1) >= 0.10) & mask_flat
             else:
-                g_simplex = g_eval
+                p_pool = F.adaptive_avg_pool2d(p_full, output_size=(h_lr, w_lr))
+                g_solid_norm = g_eval
+                eff_mask = mask_flat
+
+            if p_full.shape[1] == n_guide + 1:
+                bg_g = (1.0 - g_solid_norm.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
+                g_simplex = torch.cat([bg_g, g_solid_norm], dim=1)
+            elif p_full.shape[1] == 2 and n_guide == 1:
+                g_simplex = torch.cat([1.0 - g_solid_norm, g_solid_norm], dim=1)
+            else:
+                g_simplex = g_solid_norm
 
             max_frac, pseudo_cls = g_simplex.max(dim=1)  # (B, H_lr, W_lr)
-            pure_mask = (max_frac.reshape(-1) >= 0.75) & mask_flat
+            pure_mask = (max_frac.reshape(-1) >= 0.75) & eff_mask
             if int(pure_mask.sum().item()) < 4:
                 purity_fallback = True
-                pure_mask = (max_frac.reshape(-1) >= 0.55) & mask_flat
+                pure_mask = (max_frac.reshape(-1) >= 0.55) & eff_mask
             if int(pure_mask.sum().item()) >= 4:
                 p_pure = p_pool.permute(0, 2, 3, 1).reshape(-1, p_full.shape[1])[
                     pure_mask
@@ -581,6 +622,7 @@ class ConformalCalibrator:
         mode: Literal["multiclass", "multilabel"] = "multiclass",
         downsampler: ForwardPSFDownsampler | None = None,
         aligner: DifferentiableGuideAligner | None = None,
+        pore_mask_hr: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Construct ``(1 - alpha)`` boolean ``prediction_sets`` ``(B, K, H, W)``
         and optional ``conformal_interval_halfwidth`` ``(B, M, H, W)``.
@@ -675,6 +717,26 @@ class ConformalCalibrator:
                 pred_sets[:, m + offset] = (
                     pred_sets[:, m + offset] | missing_contrast[:, m]
                 )
+
+        if pore_mask_hr is not None:
+            pm = pore_mask_hr.to(device=pred_sets.device, dtype=torch.bool)
+            if pm.ndim == 2:
+                pm = pm.unsqueeze(0).unsqueeze(0)
+            elif pm.ndim == 3:
+                pm = pm.unsqueeze(1)
+            if pm.shape[-2:] != pred_sets.shape[-2:]:
+                pm = (
+                    F.interpolate(pm.float(), size=pred_sets.shape[-2:], mode="nearest")
+                    > 0.5
+                )
+            if mode == "multilabel" and p.shape[1] >= 2:
+                pred_sets = pred_sets & (~pm)
+            else:
+                bg_set = pred_sets[:, :1] | pm
+                fg_set = pred_sets[:, 1:] & (~pm)
+                pred_sets = torch.cat([bg_set, fg_set], dim=1)
+            if halfwidth is not None:
+                halfwidth = torch.where(pm, torch.zeros_like(halfwidth), halfwidth)
 
         return pred_sets, halfwidth
 
@@ -899,6 +961,22 @@ def match_coarse_priors(
         )
         g_ref = g_ref / g_max.clamp(min=1e-6)
     target_mean = g_ref.mean(dim=(-2, -1))
+    if mode != "multiclass":
+        active_solid = (logits[:, : target_mean.shape[1]] > -25.0).float()
+        max_reachable = active_solid.mean(dim=(-2, -1))
+        target_mean = torch.minimum(
+            target_mean[:, : max_reachable.shape[1]], max_reachable * 0.99
+        )
+    elif logits.shape[1] > target_mean.shape[1]:
+        active_fg = (logits[:, 1:] > -25.0).any(dim=1, keepdim=True).float()
+        f_solid = active_fg.mean(dim=(-2, -1))
+        t_sum = target_mean.sum(dim=1, keepdim=True)
+        scale = torch.where(
+            t_sum > f_solid * 0.99 + 1e-4,
+            (f_solid * 0.99 / t_sum.clamp(min=1e-6)).clamp(0.0, 1.0),
+            torch.ones_like(t_sum),
+        )
+        target_mean = target_mean * scale
 
     with torch.enable_grad():
         bias = torch.zeros(
@@ -965,6 +1043,7 @@ def build_uncertainty_report(
     calibrator: ConformalCalibrator | None = None,
     diagnostics: dict[str, Any] | None = None,
     uncertainty_weights: tuple[float, float, float] = (0.45, 0.25, 0.30),
+    pore_mask_hr: torch.Tensor | None = None,
 ) -> UncertaintyReport:
     """Assemble a complete ``UncertaintyReport`` (including optional Split
     Conformal prediction sets & intervals when ``calibrator`` is provided).
@@ -985,24 +1064,50 @@ def build_uncertainty_report(
         fg_probs, guide_lr, downsampler=downsampler, aligner=aligner
     )
 
+    pm_bhw: torch.Tensor | None = None
+    if pore_mask_hr is not None:
+        pm_t = pore_mask_hr.to(device=entropy.device, dtype=torch.bool)
+        if pm_t.ndim == 2:
+            pm_t = pm_t.unsqueeze(0).unsqueeze(0)
+        elif pm_t.ndim == 3:
+            pm_t = pm_t.unsqueeze(1)
+        if pm_t.shape[-2:] != entropy.shape[-2:]:
+            pm_t = (
+                F.interpolate(pm_t.float(), size=entropy.shape[-2:], mode="nearest")
+                > 0.5
+            )
+        pm_bhw = pm_t.squeeze(1)
+
     if epistemic_var is None:
         epi = torch.zeros_like(entropy)
         epi_norm = epi
     else:
         epi = epistemic_var.mean(dim=1) if epistemic_var.ndim == 4 else epistemic_var
         epi = epi.float().to(entropy.device)
-        p99 = _safe_quantile(epi, 0.99).clamp(min=1e-6)
+        if pm_bhw is not None:
+            epi = torch.where(pm_bhw, torch.zeros_like(epi), epi)
+            non_pore = epi[~pm_bhw]
+            p99 = (
+                _safe_quantile(non_pore, 0.99).clamp(min=1e-6)
+                if non_pore.numel() > 0
+                else torch.tensor(1.0, device=epi.device)
+            )
+        else:
+            p99 = _safe_quantile(epi, 0.99).clamp(min=1e-6)
         epi_norm = (epi / p99).clamp(0.0, 1.0)
 
     w_ent, w_epi, w_res = uncertainty_weights
     combined = (w_ent * entropy + w_epi * epi_norm + w_res * phys_res).clamp(0.0, 1.0)
+    if pm_bhw is not None:
+        combined = torch.where(pm_bhw, torch.zeros_like(combined), combined)
     unresolved = phys_res > unresolved_residual_cutoff
     hard = compute_hard_phase_mask(probs_hr, mode=mode)
 
     if abstain_threshold is not None:
-        hard = torch.where(
-            combined > abstain_threshold, torch.full_like(hard, -1), hard
-        )
+        abstain_cond = combined > abstain_threshold
+        if pm_bhw is not None:
+            abstain_cond = abstain_cond & (~pm_bhw)
+        hard = torch.where(abstain_cond, torch.full_like(hard, -1), hard)
 
     pred_sets: torch.Tensor | None = None
     conf_hw: torch.Tensor | None = None
@@ -1014,6 +1119,7 @@ def build_uncertainty_report(
             mode=mode,
             downsampler=downsampler,
             aligner=aligner,
+            pore_mask_hr=pore_mask_hr,
         )
 
     return UncertaintyReport(

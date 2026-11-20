@@ -1593,6 +1593,8 @@ def run_referee_evaluation(
                     fusion_method="spatial_mlp",
                     spectral_channels=16,
                     guide_channels=2,
+                    learn_psf=True,
+                    guide_residual=True,
                     tv_weight=0.008,
                     pretrained=pretrained,
                     lr=1e-2,

@@ -203,12 +203,8 @@ def guide_to_tensor(
     )
 
     if mode == "minmax":
-        flat0 = t.flatten(start_dim=2)
-        mn0 = flat0.min(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
-        mx0 = flat0.max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
-        # Clamp negative FBP sinogram ringing around zero when positive signal exists
-        has_neg_ringing = (mn0 < 0.0) & (mx0 > 0.0)
-        t = torch.where(has_neg_ringing, t.clamp(min=0.0), t)
+        # Clamp negative FBP/ringing baselines so absent-phase noise <= 0 maps to 0.0
+        t = t.clamp(min=0.0)
         flat = t.flatten(start_dim=2)
         mn = flat.min(dim=-1).values.unsqueeze(-1).unsqueeze(-1)
         mx = flat.max(dim=-1).values.unsqueeze(-1).unsqueeze(-1)

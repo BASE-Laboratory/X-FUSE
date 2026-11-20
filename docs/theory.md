@@ -57,6 +57,7 @@ To match real electron, X-ray, and neutron microprobes without Gaussian inverse 
 - **Simplex Mass/Atomic-Fraction Conservation (`loss_fn="compositional_kl"`)**: Enforces $\hat{P}_{\text{HR}} = \mathrm{softmax}(Z_{\text{HR}}) \in \Delta^{K-1}$ ($\sum_{k=1}^K \hat{P}_{k}(x) = 1$ at every pixel) supervised via forward-PSF Kullback–Leibler divergence.
 - **3D Spectral / Diffraction Cube Unmixing (`SpectralUnmixingDictionary`, `spectral_unmix=True`)**: Accepts raw $(E, H_{\text{LR}}, W_{\text{LR}})$ EDS/EELS/XRD cubes directly without external pre-fitting, jointly learning non-negative endmember spectra $S \in \mathbb{R}_{\ge 0}^{M \times E}$ ($\sum_e S_{m,e} = 1$, initialized via Successive Projection Algorithm + multiplicative NMF) alongside super-resolved spatial abundances: $\hat{Y}_{e, u} = \sum_{m=1}^M \alpha_m \hat{G}_{\text{LR}, m, u} S_{m, e} + b_e$.
 - **Cubic B-Spline Non-Rigid Registration (`align_guide="bspline"`)**: Compensates nonlinear SEM/STEM charging drift and scan-coil hysteresis via a bicubic control-point displacement field regularized by thin-plate bending energy $\|\nabla^2 u\|_2^2$ and monitored via minimum Jacobian determinant $\min \det J_{\mathcal{W}}$ for diffeomorphic invertibility.
+- **Fringe-Guarded Porous-Media Void Clamping (`pore_mask="auto_otsu_fringe_guarded"`)**: In porous catalysts and electrodes, structural voids ($M_{\text{pore}} = 1$) contain zero solid phase while coarse diffraction/EDS voxels suffer partial-volume pore dilution. `segment_pores_otsu` damps 1–2 px Fresnel propagation phase-contrast overshoots solely during threshold estimation via a Fourier Tie-homogeneity filter $\mathcal{F}^{-1}\{\mathcal{F}(I_{\text{HR}}) / (1 + \alpha \|\mathbf{k}\|_2^2)\}$ (without blurring $I_{\text{HR}}$) and clamps void logits prior to $\mathcal{D}_\Sigma$, deconvolving solid-framework stoichiometry with zero void leakage.
 
 ---
 
@@ -80,15 +81,15 @@ where $\tilde{\pi}(x; T) = \mathrm{softmax}(\log p(x) / T)$ is fit on half of th
 
 ---
 
-## 4. Active Sparse-Slice & ROI Acquisition Utility
+## 4. 1D Voronoi-Integrated Active Sparse-Slice & ROI Steering
 
-During synchrotron or electron-microscopy beamtime, `suggest_next_slices` ranks candidate unmeasured $z$-slices in a 3D tomogram using a greedy diversity-penalized acquisition score:
+During synchrotron or electron-microscopy beamtime, `suggest_next_slices` ranks candidate unmeasured $z$-slices in a 3D tomogram by combining local axial-correlation-discounted uncertainty $\hat{U}(c \mid \mathcal{S}) = (w_{\text{epi}} \tilde{U}_{\text{epi}}(c) + w_{\text{alea}} \tilde{U}_{\text{alea}}(c))(1 - e^{-d_{\mathcal{S}}(c)/\ell_z})$ with **1D Voronoi distance-reduction integration** across the full axial stack:
 
 $$
-\mathcal{A}(z \mid \mathcal{S}) = w_{\text{epi}} \tilde{U}_{\text{epi}}(z) + w_{\text{alea}} \tilde{U}_{\text{alea}}(z) + w_{\text{dist}} \widetilde{\min_{s \in \mathcal{S}} |z - s|}
+\mathcal{A}(c \mid \mathcal{S}) = 0.55\, \hat{U}(c \mid \mathcal{S}) + \frac{0.45}{Z_{\max}} \sum_{z=1}^{Z} \left(\hat{U}(z \mid \mathcal{S}) + w_{\text{dist}}\right) \max\!\left(0,\, d_{\mathcal{S}}(z) - |z - c|\right)
 $$
 
-subject to a minimum slice spacing $\Delta z_{\min}$, preventing redundant adjacent scans while targeting slices with maximal orthogonal-plane disagreement and phase boundary ambiguity. Similarly, `suggest_2d_rois` evaluates exact $O(HW)$ integral-image sliding-window sums over $(1 - w_r) U_{\text{comb}} + w_r U_{\text{phys}}$ with non-maximum suppression to schedule non-overlapping 2D re-acquisition windows.
+where $d_{\mathcal{S}}(z) = \min_{s \in \mathcal{S}} |z - s|$, subject to minimum slice spacing $\Delta z_{\min}$. This immediately discovers localized reaction fronts on initial scouts while naturally bisecting unvisited bulk intervals as the acquisition budget grows. Similarly, `suggest_2d_rois` evaluates exact $O(HW)$ integral-image sliding-window sums over $(1 - w_r) U_{\text{comb}} + w_r U_{\text{phys}}$ with non-maximum suppression to schedule non-overlapping 2D re-acquisition windows.
 
 ---
 

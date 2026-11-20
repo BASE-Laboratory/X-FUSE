@@ -13,11 +13,11 @@ Across electron, X-ray, and neutron characterization, experimentalists face a fu
 
 ## Core Capabilities
 
-1. **3-Line High-Level API (`XFuse.fit_predict`)**: Automatic structural normalization, spatial padding/cropping, content-hashed frozen TTA feature caching, and multi-channel prior matching + Split Conformal calibration in three lines of Python.
-2. **Megapixel Tiling & Lazy 2.5D Input Slice Streaming**: Raised-cosine Hann-windowed 2D overlapping tile inference (`tile_size=...`) and lazy HDF5 / Zarr / TIFF-stack 2.5D input slice streaming (`VolumeSliceAccessor`) for multi-gigabyte tomogram inputs.
-3. **Multi-Scale ViT Pyramid & Differentiable Co-Registration**: Concatenate early boundary tokens with deep semantic tokens (`layers="multiscale"`), jointly refine sub-pixel guide drift (`align_guide="translation" | "rigid" | "affine"`), and learn per-channel anisotropic interaction-volume PSF widths (`learn_psf=True`).
-4. **Tri-Part Certainty & Active Beamtime Steering**: Separate **chemical entropy**, **online Welford TTA / tri-plane epistemic variance**, and **forward physical PSF residual**, and automatically schedule optimal sparse $z$-slices (`suggest_next_slices`) or 2D re-scan windows (`suggest_2d_rois`).
-5. **Standardized Scientific I/O**: Export and reload uncertainty reports as multi-channel **OME-TIFF** (`.ome.tif`), **HDF5/NeXus** (`.h5`), or **Zarr** (`.zarr`), and read vendor `.emd`, `.dm3`/`.dm4`, `.bcf`, and `.hspy` archives via optional RosettaSciIO (`x-fuse[io]`).
+1. **3-Line High-Level API (`XFuse.fit_predict`)**: Automatic structural normalization, spatial padding/cropping, content-hashed frozen TTA feature caching, Spin-2 `CrossAttentionFeatureUpsampler` + `SpatialConvMLPHead`, `ApositionalFeatureDebiaser`, and Split Conformal RAPS/APS/LAC calibration in three lines of Python.
+2. **Quantitative Forward Physics, Porous-Media Void Clamping & 3D Spectral Cubes**: Train directly via `forward_psf_poisson`, `compositional_kl`, or `forward_psf_bce` with Gaussian / Moffat / Core+Halo PSFs, Fresnel-fringe-guarded structural void clamping (`pore_mask="auto_otsu_fringe_guarded"`), and raw 3D `(E, H_lr, W_lr)` spectral cube unmixing (`spectral_unmix=True`).
+3. **Megapixel Tiling, Out-of-Core Synchrotron Streaming & Differentiable Registration**: Hann-windowed 2D overlapping tile inference (`tile_size=...`), out-of-core Savu HDF5 / DAWN NeXus / Zarr streaming (`load_xct_subvolume`, `load_diad_xrdct`, `VolumeSliceAccessor`), axial depth-PSF 3D deconvolution, and sub-pixel `translation` / `rigid` / `affine` / `bspline` registration.
+4. **Tri-Part Certainty & 1D Voronoi Active Beamtime Steering**: Separate **chemical entropy**, **online Welford TTA / tri-plane epistemic variance**, and **forward physical PSF residual**, and schedule optimal sparse $z$-slices (`suggest_next_slices`) or 2D re-scan windows (`suggest_2d_rois`).
+5. **Standardized Scientific I/O & `OpenImpala` Export**: Export and reload uncertainty reports as **OME-TIFF** (`.ome.tif`), **HDF5/NeXus** (`.h5`), **Zarr** (`.zarr`), or **NumPy** (`.npz`), generate `OpenImpala` AMReX multi-phase geometries + conformal bounds (`export_for_openimpala`), and read vendor `.emd`, `.dm3`/`.dm4`, `.bcf`, and `.hspy` archives (`x-fuse[io]`).
 
 ---
 
@@ -54,6 +54,9 @@ from x_fuse import XFuse, generate_correlative_phantom_2d, save_uncertainty_repo
 phantom = generate_correlative_phantom_2d(size=128, downsample_factor=8)
 model = XFuse(
     backbone="dinov2_vits14",
+    interpolation_mode="cross_attn",
+    fusion_method="spatial_mlp",
+    loss_fn="forward_psf_bce",
     layers="multiscale",
     align_guide="translation",
     learn_psf=True,
@@ -63,4 +66,4 @@ report = model.fit_predict(phantom.hr_image, phantom.coarse_guide, epochs=25)
 save_uncertainty_report(report, "fused_output.ome.tif", pixel_size_um=0.05)
 ```
 
-Continue to [Mathematical Theory](theory.md) for the forward-physics and uncertainty formulation, [Modality Recipes](modalities.md) for domain-specific configurations, or [Tutorials & CLI](tutorials.md) for batch workflows.
+Continue to [Mathematical Theory](theory.md) for the forward-physics and uncertainty formulation, [Benchmarks & Regimes](benchmarks.md) for empirical operating regimes, [Modality Recipes](modalities.md) for domain-specific configurations, or [Tutorials & CLI](tutorials.md) for batch workflows.

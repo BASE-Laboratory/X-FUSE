@@ -11,7 +11,11 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Calum Green", email = "calum.green17@imperial.ac.uk" },
+    { name = "James Le Houx" },
     { name = "BASE Laboratory" },
+]
+maintainers = [
+    { name = "James Le Houx" },
 ]
 keywords = [
     "materials-science",
@@ -40,7 +44,6 @@ dependencies = [
     "h5py>=3.10",
     "matplotlib>=3.7",
     "numpy>=1.24",
-    "opencv-python-headless>=4.8,<5",
     "pillow>=9.4",
     "scikit-image>=0.21",
     "scikit-learn>=1.3",
@@ -67,7 +70,7 @@ io = [
     "zarr>=2.16",
 ]
 docs = [
-    "mkdocs>=1.6",
+    "mkdocs>=1.6,<2",
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.26",
 ]
@@ -79,14 +82,16 @@ sam = [
 ]
 cuda = [
     "torch>=2.1",
-    "xformers>=0.0.27",
+    "xformers>=0.0.27; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 cpu = [
     "torch>=2.1",
 ]
 notebooks = [
     "ipykernel>=6.25",
+    "ipywidgets>=8.0",
     "jupyter>=1.0",
+    "jupyterlab>=4.0",
 ]
 dev = [
     "mypy>=1.11",

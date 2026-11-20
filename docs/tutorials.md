@@ -10,9 +10,10 @@ Installing `x-fuse` registers the `xfuse` command-line tool for environment veri
 # Print JSON runtime summary (Python, PyTorch, CUDA availability)
 xfuse info
 
-# List registered open-access correlative datasets on Zenodo
+# List or download registered open-access correlative datasets on Zenodo
 xfuse datasets
 xfuse datasets --json
+xfuse datasets --fetch edxia_cement_sem_eds --dest ./zenodo_cache
 ```
 
 ### 2. Self-Contained Synthetic Smoke Benchmark
@@ -21,9 +22,9 @@ xfuse datasets --json
 xfuse demo --epochs 15 --output demo_metrics.json
 ```
 
-### 3. Batch Correlative Fusion (`xfuse fuse`)
+### 3. Batch 2D & Sparse-Slice 3D Correlative Fusion (`xfuse fuse` / `xfuse fuse-3d`)
 
-Fuse a high-resolution structural micrograph (`.tif`, `.png`, `.npy`, `.emd`, `.dm4`, `.hspy`) with one or more coarse physical guide maps and export a calibrated multi-channel report to **OME-TIFF**, **HDF5**, or **Zarr**:
+Fuse a high-resolution 2D structural micrograph (`.tif`, `.png`, `.npy`, `.emd`, `.dm4`, `.hspy`) with one or more coarse physical guide maps and export a calibrated multi-channel report to **OME-TIFF**, **HDF5**, or **Zarr**:
 
 ```bash
 xfuse fuse \
@@ -31,37 +32,53 @@ xfuse fuse \
   --guide data/samples/Zn13X/low_4.tiff \
   --output zn13x_fused.ome.tif \
   --backbone dinov2_vits14 \
-  --layers multiscale \
-  --align-guide translation \
+  --fusion-method spatial_mlp \
+  --upsampler cross_attn \
+  --psf-profile moffat \
   --learn-psf \
+  --guide-residual \
+  --pore-mask auto_otsu_fringe_guarded \
+  --conformal-alpha 0.10 \
+  --conformal-method raps \
   --pixel-size-um 0.5
+```
+
+Or propagate sparse 2D chemical/diffraction slices across a 3D structural tomogram with axial interaction-volume PSF deconvolution, active next-slice beamtime steering, and `OpenImpala` AMReX multi-phase geometry export:
+
+```bash
+xfuse fuse-3d \
+  --hr-volume xct_tomogram.h5 \
+  --guide-slice 4:xrd_z04.tif 28:xrd_z28.tif \
+  --output fused_3d_report.h5 \
+  --pore-mask auto_otsu_fringe_guarded \
+  --axial-psf-sigma 1.8 \
+  --learn-axial-psf \
+  --triplane \
+  --suggest-next 3 \
+  --export-openimpala-dir ./openimpala_geom
 ```
 
 ---
 
-## Reproducible Paper Benchmarks & Figures
+## Reproducible Paper Benchmarks, Ablations & LaTeX Tables
 
-X-FUSE ships two reproducible benchmark suites under `benchmarks/`:
+X-FUSE ships reproducible benchmark suites and a deterministic LaTeX table generator under `benchmarks/`:
 
 ```bash
 # 1. Core synthetic super-resolution, contrast-to-zero failure, ECE/AUSE & 2.5D suite
 uv run python -m benchmarks.run_synthetic_suite --quick
 
-# 2. Full paper ablation suite + publication PDF/PNG figure generator
-#    (Multi-scale ViT ablation, sub-pixel drift/PSF recovery, active beamtime curve,
-#     bundled Zn13X & tiled MOR-GIS synchrotron benchmarks)
-uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir benchmarks/outputs/paper_quick
-```
+# 2. Referee operating-regime evaluation (Regime A / B1 / C, Zn13X, Poisson & RAPS UQ)
+uv run python -m benchmarks.run_referee_evaluation --output-dir benchmarks/outputs/referee_evaluation
 
-On a GPU workstation with internet access, run the full pretrained DINOv2 + Zenodo hold-out evaluation:
+# 3. Staged v1.0.0 architectural, volumetric active-steering & tri-modality Zenodo ablations
+uv run python -m benchmarks.run_design_ablations --output-dir benchmarks/outputs/design_ablations
 
-```bash
-uv run python -m benchmarks.run_paper_benchmarks \
-  --backbone dinov2_vitb14_reg \
-  --pretrained \
-  --device cuda \
-  --download-zenodo \
-  --output-dir benchmarks/outputs/paper_full
+# 4. Multi-length K11 DIAD Zn-13X XCT + XRD-CT coupling, VoDaSuRe gap & OpenImpala export
+uv run python -m benchmarks.run_zn13x_multiscale_couplings --output-dir benchmarks/outputs/zn13x_multiscale
+
+# 5. Export ready-to-compile booktabs LaTeX manuscript tables from benchmark JSONs
+uv run python -m benchmarks.export_latex_tables --out-dir benchmarks/outputs/tables
 ```
 
 ---

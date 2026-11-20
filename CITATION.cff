@@ -3,6 +3,7 @@ title: "X-FUSE: Physics-Guided Foundation-Model Feature Fusion & Conformal Uncer
 message: "If you use X-FUSE in your research, please cite this software."
 type: software
 version: 1.0.0
+date-released: "2026-11-20"
 license: MIT
 repository-code: "https://github.com/BASE-Laboratory/X-FUSE"
 url: "https://github.com/BASE-Laboratory/X-FUSE"
@@ -10,6 +11,9 @@ authors:
   - family-names: Green
     given-names: Calum
     affiliation: Imperial College London
+  - family-names: Le Houx
+    given-names: James
+    affiliation: BASE Laboratory
   - name: "BASE Laboratory"
 keywords:
   - correlative microscopy

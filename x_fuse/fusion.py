@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .backbones import HighResBackbone, Interpolation, LayerSelection
+from .backbones import HighResBackbone, Interpolation, LayerSelection, MinInputSizeSpec
 from .debias import ApositionalFeatureDebiaser
 from .heads import (
     FusionOptions,
@@ -40,6 +40,7 @@ from .heads import (
     WindowedGuideCrossAttentionHead,
     XRDCrossAttention as XRDCrossAttention,
 )
+from .loaders import detrend_radial_cupping
 from .physics import GuideNormalization, LossOptions, PhysicsForwardModel
 from .registration import AlignMode, DifferentiableGuideAligner
 from .tiling import run_tiled_2d
@@ -66,6 +67,117 @@ from .upsamplers import (
 )
 from .utils import guide_to_tensor
 from .vit_patch import AttentionOptions
+
+PoreMaskSpec = (
+    np.ndarray | torch.Tensor | Literal["auto_otsu", "auto_otsu_fringe_guarded"] | None
+)
+
+
+def _otsu_threshold_1d(values: np.ndarray, n_bins: int = 256) -> float:
+    """Compute exact 1D Otsu threshold maximizing inter-class variance."""
+    finite = values[np.isfinite(values)]
+    if finite.size < 2:
+        return float(finite[0]) if finite.size == 1 else 0.0
+    lo, hi = float(np.min(finite)), float(np.max(finite))
+    if hi - lo < 1e-12:
+        return lo
+    hist, bin_edges = np.histogram(finite, bins=n_bins, range=(lo, hi))
+    prob = hist.astype(np.float64) / max(float(hist.sum()), 1.0)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    omega = np.cumsum(prob)
+    mu = np.cumsum(prob * centers)
+    mu_t = mu[-1]
+    denom = omega * (1.0 - omega)
+    sigma_b2 = np.where(
+        denom > 1e-12, ((mu_t * omega - mu) ** 2) / np.maximum(denom, 1e-12), -1.0
+    )
+    best_idx = int(np.argmax(sigma_b2))
+    return float(centers[best_idx])
+
+
+def _tie_homogeneity_filter_2d(img_2d: np.ndarray, alpha_vox2: float) -> np.ndarray:
+    """Apply Paganin/Tie-homogeneity Fourier damping ``1 / (1 + alpha * |k|^2)``
+    with reflect padding to suppress 1–2 px Fresnel phase-contrast overshoots
+    along pore walls before Otsu binarization.
+    """
+    if alpha_vox2 <= 0.0:
+        return img_2d
+    h, w = img_2d.shape
+    pad_y = min(8, max(1, h // 4))
+    pad_x = min(8, max(1, w // 4))
+    padded = np.pad(
+        img_2d.astype(np.float32), ((pad_y, pad_y), (pad_x, pad_x)), mode="reflect"
+    )
+    ph, pw = padded.shape
+    ky = (2.0 * np.pi * np.fft.fftfreq(ph)).astype(np.float32)[:, None]
+    kx = (2.0 * np.pi * np.fft.rfftfreq(pw)).astype(np.float32)[None, :]
+    filt = 1.0 / (1.0 + float(alpha_vox2) * (ky * ky + kx * kx))
+    reg = np.fft.irfft2(np.fft.rfft2(padded) * filt, s=(ph, pw)).astype(np.float32)
+    return reg[pad_y : pad_y + h, pad_x : pad_x + w]
+
+
+def segment_pores_otsu(
+    high_res: np.ndarray | torch.Tensor,
+    *,
+    tie_homogeneity_alpha_vox2: float = 0.0,
+    detrend_cupping: bool = False,
+    roi_mask: np.ndarray | None = None,
+    dark_pores: bool = True,
+) -> np.ndarray:
+    """Derive a boolean structural void/pore mask ``M_pore`` from a 2D ``(H, W)``
+    micrograph or 3D ``(Z, Y, X)`` tomogram without blurring ``high_res`` itself.
+
+    When ``tie_homogeneity_alpha_vox2 > 0`` (e.g. ``0.6``), applies a Fourier
+    Tie-homogeneity phase-retrieval filter solely to compute a Fresnel-fringe-free
+    segmentation threshold, preventing bright/dark Ram-Lak edge overshoots from
+    punching false pinholes in solid walls or leaving 1-px chemical shells in pores.
+    """
+    arr = (
+        high_res.detach().cpu().float().numpy()
+        if isinstance(high_res, torch.Tensor)
+        else np.asarray(high_res, dtype=np.float32)
+    )
+    if arr.ndim not in (2, 3):
+        raise ValueError(
+            f"segment_pores_otsu expects 2D (H, W) or 3D (Z, Y, X), got {arr.shape}."
+        )
+
+    finite_mask = np.isfinite(arr)
+    eff_roi = (
+        (np.asarray(roi_mask, dtype=bool) & finite_mask)
+        if roi_mask is not None
+        else finite_mask
+    )
+    finite_vals = arr[finite_mask]
+    if finite_vals.size == 0:
+        return np.zeros(arr.shape, dtype=bool)
+    f_min = float(np.min(finite_vals))
+    f_max = float(np.max(finite_vals))
+    f_med = float(np.median(finite_vals))
+    arr_work = np.nan_to_num(arr, nan=f_med, posinf=f_max, neginf=f_min)
+
+    if detrend_cupping:
+        arr_work = detrend_radial_cupping(arr_work, valid_mask=eff_roi)
+
+    alpha = float(max(0.0, tie_homogeneity_alpha_vox2))
+    if alpha > 0.0:
+        if arr_work.ndim == 2:
+            arr_work = _tie_homogeneity_filter_2d(arr_work, alpha)
+        else:
+            arr_work = np.stack(
+                [
+                    _tie_homogeneity_filter_2d(arr_work[z], alpha)
+                    for z in range(arr_work.shape[0])
+                ],
+                axis=0,
+            )
+
+    sample_vals = arr_work[eff_roi] if np.any(eff_roi) else arr_work
+    thresh = _otsu_threshold_1d(sample_vals)
+    pore_bool = (arr_work < thresh) if dark_pores else (arr_work > thresh)
+    if roi_mask is not None:
+        pore_bool = pore_bool & np.asarray(roi_mask, dtype=bool)
+    return np.asarray(pore_bool, dtype=bool)
 
 
 def _tensor_content_digest(x: torch.Tensor) -> tuple[tuple[int, ...], int]:
@@ -310,7 +422,7 @@ class CorrelativeFuser(nn.Module):
         pca_dim: int = -1,
         track_grad: bool = False,
         dtype: torch.dtype | int | None = None,
-        loss_fn: LossOptions = "bce",
+        loss_fn: LossOptions | None = None,
         guide_channels: int = 1,
         interpolation_mode: Interpolation = "nearest-exact",
         pretrained: bool = True,
@@ -339,13 +451,28 @@ class CorrelativeFuser(nn.Module):
         guide_residual: bool = False,
         tile_size: int | None = None,
         tile_overlap: int = 64,
+        min_input_size: MinInputSizeSpec = "auto",
+        pore_mask: PoreMaskSpec = None,
+        pore_homogeneity_alpha_vox2: float = 0.0,
+        pore_detrend_cupping: bool = False,
         cache_features: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         resolved_backbone = backbone or dino_name or "dinov2_vits14"
         resolved_fusion: FusionOptions = (
-            fusion_method or xrd_fuse_method or "learned_gating"
+            fusion_method
+            or xrd_fuse_method
+            or ("spatial_mlp" if guide_residual else "learned_gating")
+        )
+        resolved_loss: LossOptions = (
+            loss_fn
+            if loss_fn is not None
+            else (
+                "forward_psf_bce"
+                if (learn_psf or psf_profile != "gaussian" or pore_mask is not None)
+                else "bce"
+            )
         )
         resolved_interp: Interpolation = upsampler or interpolation_mode
         device = kwargs.get("device", None)
@@ -373,13 +500,14 @@ class CorrelativeFuser(nn.Module):
             learned_upsampler=learned_upsampler,
             upsampler_orientation=upsampler_orientation,
             upsampler_subtoken=upsampler_subtoken,
+            min_input_size=min_input_size,
             **kwargs,
         )
 
         self.backbone_name: str = resolved_backbone
         self.fusion_method: FusionOptions = resolved_fusion
         self.xrd_fuse_method: FusionOptions = resolved_fusion
-        self.loss_fn: LossOptions = loss_fn
+        self.loss_fn: LossOptions = resolved_loss
         self.guide_channels: int = max(1, int(guide_channels))
         self.spectral_channels: int | None = spectral_channels
         self.lr: float = float(lr)
@@ -393,6 +521,10 @@ class CorrelativeFuser(nn.Module):
         self.upsampler_subtoken: bool = bool(upsampler_subtoken)
         self.tv_weight: float = float(tv_weight)
         self.guide_residual: bool = bool(guide_residual)
+        self.pore_mask_spec: PoreMaskSpec = pore_mask
+        self.pore_homogeneity_alpha_vox2: float = float(pore_homogeneity_alpha_vox2)
+        self.pore_detrend_cupping: bool = bool(pore_detrend_cupping)
+        self._active_pore_mask_hr: torch.Tensor | None = None
         self.cache_features: bool = bool(cache_features)
         self.conformal_alpha: float | None = conformal_alpha
         self.conformal_method: ConformalMethod = conformal_method
@@ -504,6 +636,15 @@ class CorrelativeFuser(nn.Module):
         self.clear_feature_cache()
 
     @property
+    def min_input_size(self) -> MinInputSizeSpec:
+        return self.backbone_extractor.min_input_size
+
+    @min_input_size.setter
+    def min_input_size(self, value: MinInputSizeSpec) -> None:
+        self.backbone_extractor.min_input_size = value
+        self.clear_feature_cache()
+
+    @property
     def interpolation_mode(self) -> Interpolation:
         return self.backbone_extractor.interpolation_mode
 
@@ -550,6 +691,13 @@ class CorrelativeFuser(nn.Module):
         self, transformed_img: torch.Tensor, attn_choice: AttentionOptions = "none"
     ) -> torch.Tensor:
         return self.backbone_extractor.extract_patch_tokens(
+            transformed_img, attn_choice=attn_choice
+        )
+
+    def extract_patch_grid(
+        self, transformed_img: torch.Tensor, attn_choice: AttentionOptions = "none"
+    ) -> torch.Tensor:
+        return self.backbone_extractor.extract_patch_grid(
             transformed_img, attn_choice=attn_choice
         )
 
@@ -817,6 +965,7 @@ class CorrelativeFuser(nn.Module):
             deb.degree,
             deb.r2_threshold,
             self.tile_size,
+            self.backbone_extractor.resolved_min_input_size,
             want_hr,
         )
 
@@ -853,15 +1002,8 @@ class CorrelativeFuser(nn.Module):
                 def _single_tr_tile(tile_chw: torch.Tensor) -> torch.Tensor:
                     t_in = tile_chw.unsqueeze(0)
                     _, th, tw = tile_chw.shape
-                    nph, npw = self.get_n_patches(th, tw)
                     with torch.no_grad():
-                        tok = self.extract_patch_tokens(t_in, attn_choice="none")
-                        perm = (
-                            tok.squeeze(0)
-                            .reshape(nph, npw, self.feat_dim)
-                            .permute(2, 0, 1)
-                            .unsqueeze(0)
-                        )
+                        perm = self.extract_patch_grid(t_in, attn_choice="none")
                     return self._upsample_patch_map(
                         perm.float(), (th, tw), guidance_img=t_in
                     )
@@ -882,19 +1024,12 @@ class CorrelativeFuser(nn.Module):
                     self._tta_cache.popitem(last=False)
             return ("hr", hr_views)
 
-        n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
         out_views: list[torch.Tensor] = []
         kind = "hr" if cache_hr else "patch"
         for i in range(n_transforms):
             transformed_img = img_batch[i].unsqueeze(0)
             with torch.no_grad():
-                feats = self.extract_patch_tokens(transformed_img, attn_choice="none")
-                permuted = (
-                    feats.squeeze(0)
-                    .reshape(n_patch_h, n_patch_w, self.feat_dim)
-                    .permute(2, 0, 1)
-                    .unsqueeze(0)
-                )
+                permuted = self.extract_patch_grid(transformed_img, attn_choice="none")
                 debiased = self.backbone_extractor.debiaser(permuted.float())
             if cache_hr:
                 with torch.no_grad():
@@ -966,21 +1101,13 @@ class CorrelativeFuser(nn.Module):
         x_in = x.to(self.dtype) if self.dtype != torch.float32 else x.clone()
         img_batch = self.get_transformed_input_batch(x_in, self.transforms)
         _, img_h, img_w = x_in.shape
-        n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
 
         welford = WelfordAccumulator()
         n_transforms = len(self.transforms)
 
         for i in range(n_transforms):
             transformed_img = img_batch[i].unsqueeze(0)
-            feats = self.extract_patch_tokens(transformed_img, attn_choice=attn_choice)
-            channels = int(feats.shape[-1])
-            permuted = (
-                feats.squeeze(0)
-                .reshape(n_patch_h, n_patch_w, channels)
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-            )
+            permuted = self.extract_patch_grid(transformed_img, attn_choice=attn_choice)
             permuted = self.backbone_extractor.debiaser(permuted)
             fused_img = self.xrd_fusion_module.forward_xrd(
                 permuted,
@@ -998,6 +1125,167 @@ class CorrelativeFuser(nn.Module):
         mean_f32, var_f32 = welford.finalize()
         return mean_f32.to(self.dtype), var_f32
 
+    # ── Porous-Media Void Clamping Helpers ──────────────────────────────────
+
+    def _resolve_pore_mask_2d(
+        self,
+        hr_source: np.ndarray | torch.Tensor,
+        padded_hw: tuple[int, int],
+        orig_hw: tuple[int, int],
+        spec_override: PoreMaskSpec = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor | None:
+        eff_spec = spec_override if spec_override is not None else self.pore_mask_spec
+        if eff_spec is None:
+            return None
+        dev = device if device is not None else next(self.dinov2.parameters()).device
+        orig_h, orig_w = orig_hw
+        pad_h, pad_w = padded_hw
+
+        if isinstance(eff_spec, str):
+            if eff_spec == "auto_otsu_fringe_guarded":
+                alpha = (
+                    self.pore_homogeneity_alpha_vox2
+                    if self.pore_homogeneity_alpha_vox2 > 0.0
+                    else 0.6
+                )
+            elif eff_spec == "auto_otsu":
+                alpha = self.pore_homogeneity_alpha_vox2
+            else:
+                raise ValueError(
+                    f"Unsupported pore_mask='{eff_spec}'; expected 'auto_otsu', "
+                    "'auto_otsu_fringe_guarded', a boolean mask, or None."
+                )
+            hr_np = (
+                hr_source.detach().cpu().float().numpy()
+                if isinstance(hr_source, torch.Tensor)
+                else np.asarray(hr_source, dtype=np.float32)
+            )
+            while hr_np.ndim > 3 and hr_np.shape[0] == 1:
+                hr_np = hr_np[0]
+            if hr_np.ndim == 3:
+                if hr_np.shape[0] in (1, 3, 4) and tuple(hr_np.shape[1:]) == (
+                    orig_h,
+                    orig_w,
+                ):
+                    hr_2d = (
+                        hr_np[1] if hr_np.shape[0] == 3 else np.mean(hr_np[:3], axis=0)
+                    )
+                elif hr_np.shape[-1] in (1, 3, 4):
+                    hr_2d = np.mean(hr_np[..., :3], axis=-1)
+                else:
+                    hr_2d = hr_np[hr_np.shape[0] // 2]
+            else:
+                hr_2d = hr_np
+            mask_np = segment_pores_otsu(
+                hr_2d,
+                tie_homogeneity_alpha_vox2=alpha,
+                detrend_cupping=self.pore_detrend_cupping,
+            )
+        else:
+            raw_m = (
+                eff_spec.detach().cpu().numpy()
+                if isinstance(eff_spec, torch.Tensor)
+                else np.asarray(eff_spec)
+            )
+            while raw_m.ndim > 2 and raw_m.shape[0] == 1:
+                raw_m = raw_m[0]
+            if raw_m.ndim == 3 and raw_m.shape[-1] in (1, 3, 4):
+                raw_m = np.mean(raw_m[..., :3], axis=-1)
+            elif raw_m.ndim == 3 and raw_m.shape[0] in (3, 4):
+                raw_m = np.mean(raw_m[:3], axis=0)
+            if raw_m.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D pore_mask for 2D fusion, got shape {raw_m.shape}."
+                )
+            mask_np = raw_m > 0.5
+
+        m_t = torch.from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))[
+            None, None, ...
+        ].to(dev)
+        if tuple(m_t.shape[-2:]) != (orig_h, orig_w):
+            m_t = F.interpolate(m_t, size=(orig_h, orig_w), mode="nearest")
+        if (pad_h, pad_w) != (orig_h, orig_w):
+            m_t = F.pad(m_t, (0, pad_w - orig_w, 0, pad_h - orig_h), mode="replicate")
+        return m_t > 0.5
+
+    def _apply_pore_mask_to_logits_and_guide(
+        self,
+        logits: torch.Tensor,
+        guide_lr: torch.Tensor,
+        pore_mask_hr: torch.Tensor | None,
+        valid_hr_hw: tuple[int, int] | None = None,
+        allow_guide_porosity_cap: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if pore_mask_hr is None:
+            return logits, guide_lr
+        pm = pore_mask_hr.to(device=logits.device, dtype=torch.bool)
+        if pm.shape[-2:] != logits.shape[-2:]:
+            pm = (
+                F.interpolate(pm.float(), size=tuple(logits.shape[-2:]), mode="nearest")
+                > 0.5
+            )
+
+        phys = self._active_physics()
+        if phys is not None and phys.loss_fn == "compositional_kl":
+            phys._force_bg_for_pores = True
+            phys._resolved_bg_simplex = True
+
+        clamped_logits = torch.where(pm, torch.full_like(logits, -30.0), logits)
+
+        if (
+            allow_guide_porosity_cap
+            and self.spectral_channels is None
+            and self.loss_fn != "forward_psf_poisson"
+            and (self.guide_channels >= 2 or self.loss_fn == "compositional_kl")
+        ):
+            solid_hr = (~pm).float()
+            if valid_hr_hw is not None:
+                solid_hr = solid_hr[:, :, : valid_hr_hw[0], : valid_hr_hw[1]]
+            lr_hw = (int(guide_lr.shape[-2]), int(guide_lr.shape[-1]))
+            ds = self._active_downsampler()
+            with torch.no_grad():
+                if self.align_guide != "none":
+                    solid_hr = self.guide_aligner(solid_hr, lr_hw).clamp(0.0, 1.0)
+                if ds is not None:
+                    f_solid_lr = ds(
+                        solid_hr.expand(-1, ds.n_channels, -1, -1), lr_hw
+                    ).mean(dim=1, keepdim=True)
+                else:
+                    f_solid_lr = F.adaptive_avg_pool2d(solid_hr, output_size=lr_hw)
+                g_sum = guide_lr.sum(dim=1, keepdim=True)
+                scale = torch.where(
+                    g_sum > f_solid_lr + 1e-4,
+                    (f_solid_lr / g_sum.clamp(min=1e-6)).clamp(0.0, 1.0),
+                    torch.ones_like(g_sum),
+                )
+            guide_lr = guide_lr * scale
+        return clamped_logits, guide_lr
+
+    def _enforce_pore_probs(
+        self,
+        probs: torch.Tensor,
+        pore_mask_hr: torch.Tensor | None,
+        is_multiclass: bool,
+    ) -> torch.Tensor:
+        if pore_mask_hr is None:
+            return probs
+        pm = pore_mask_hr.to(device=probs.device, dtype=torch.bool)
+        if pm.shape[-2:] != probs.shape[-2:]:
+            pm = (
+                F.interpolate(pm.float(), size=tuple(probs.shape[-2:]), mode="nearest")
+                > 0.5
+            )
+        if is_multiclass:
+            if probs.shape[1] == self.guide_channels + 1:
+                bg = torch.where(pm, torch.ones_like(probs[:, :1]), probs[:, :1])
+                fg = torch.where(pm, torch.zeros_like(probs[:, 1:]), probs[:, 1:])
+                return torch.cat([bg, fg], dim=1)
+            bg_new = pm.to(dtype=probs.dtype)
+            fg_new = torch.where(pm, torch.zeros_like(probs), probs)
+            return torch.cat([bg_new, fg_new], dim=1)
+        return torch.where(pm, torch.zeros_like(probs), probs)
+
     # ── Optimization Step ────────────────────────────────────────────────────
 
     def train_fusion_step(
@@ -1006,6 +1294,7 @@ class CorrelativeFuser(nn.Module):
         update_aligner: bool = True,
         valid_hr_hw: tuple[int, int] | None = None,
         loss_mask_lr: torch.Tensor | None = None,
+        pore_mask_hr: torch.Tensor | None = None,
     ) -> float:
         """Optimize the active fusion head (+ optional trainable cross-attention
         upsampler, ``DifferentiableGuideAligner``, learnable PSF, and spectral
@@ -1024,6 +1313,7 @@ class CorrelativeFuser(nn.Module):
         self.train()
         self.dinov2.eval()
 
+        eff_pm = pore_mask_hr if pore_mask_hr is not None else self._active_pore_mask_hr
         _, img_h, img_w = x.shape
         want_hr = (
             self.loss_fn
@@ -1039,6 +1329,7 @@ class CorrelativeFuser(nn.Module):
             or self.spectral_channels is not None
             or valid_hr_hw is not None
             or loss_mask_lr is not None
+            or eff_pm is not None
         )
         kind, cached_views = self._extract_tta_views(x, want_hr=want_hr)
         img_batch: torch.Tensor | None = None
@@ -1114,20 +1405,36 @@ class CorrelativeFuser(nn.Module):
                     logits_canon = head_mod.apply_guide_residual(
                         logits_canon, canon_guide, valid_hr_hw=valid_hr_hw
                     )
+                    logits_canon, target_guide = (
+                        self._apply_pore_mask_to_logits_and_guide(
+                            logits_canon,
+                            canon_guide,
+                            eff_pm,
+                            valid_hr_hw=valid_hr_hw,
+                        )
+                    )
                     loss = head_mod.compute_loss_from_logits(
                         logits_canon,
-                        xrd_map=canon_guide,
-                        coarse_target=canon_guide,
+                        xrd_map=target_guide,
+                        coarse_target=target_guide,
                         aligner=aligner_arg,
                         guidance_hr=x.unsqueeze(0),
                         valid_hr_hw=valid_hr_hw,
                         loss_mask_lr=loss_mask_lr,
                     )
                 else:
+                    logits_canon, target_guide = (
+                        self._apply_pore_mask_to_logits_and_guide(
+                            logits_canon,
+                            canon_guide,
+                            eff_pm,
+                            valid_hr_hw=valid_hr_hw,
+                        )
+                    )
                     loss = head_mod.compute_loss_from_logits(
                         logits_canon,
-                        xrd_map=canon_guide,
-                        coarse_target=canon_guide,
+                        xrd_map=target_guide,
+                        coarse_target=target_guide,
                         aligner=aligner_arg,
                         valid_hr_hw=valid_hr_hw,
                         loss_mask_lr=loss_mask_lr,
@@ -1158,10 +1465,19 @@ class CorrelativeFuser(nn.Module):
                     logits_canon = self.spatial_attention.predict_logits(
                         feat_canon, canon_guide
                     )
+                    pm_crop = eff_pm[:, :, :oh, :ow] if eff_pm is not None else None
+                    logits_canon, target_guide = (
+                        self._apply_pore_mask_to_logits_and_guide(
+                            logits_canon,
+                            canon_guide,
+                            pm_crop,
+                            valid_hr_hw=None,
+                        )
+                    )
                     loss = self.spatial_attention.compute_loss_from_logits(
                         logits_canon,
-                        guide_map=canon_guide,
-                        coarse_target=canon_guide,
+                        guide_map=target_guide,
+                        coarse_target=target_guide,
                         aligner=aligner_arg,
                         valid_hr_hw=None,
                         loss_mask_lr=loss_mask_lr,
@@ -1181,10 +1497,18 @@ class CorrelativeFuser(nn.Module):
                             align_corners=False,
                         )
                     logits_canon = self.inverse_transforms[i](logits_tr)
+                    logits_canon, target_guide = (
+                        self._apply_pore_mask_to_logits_and_guide(
+                            logits_canon,
+                            canon_guide,
+                            eff_pm,
+                            valid_hr_hw=valid_hr_hw,
+                        )
+                    )
                     loss = self.spatial_attention.compute_loss_from_logits(
                         logits_canon,
-                        guide_map=canon_guide,
-                        coarse_target=canon_guide,
+                        guide_map=target_guide,
+                        coarse_target=target_guide,
                         aligner=aligner_arg,
                         valid_hr_hw=valid_hr_hw,
                         loss_mask_lr=loss_mask_lr,
@@ -1217,6 +1541,7 @@ class CorrelativeFuser(nn.Module):
     def _build_diagnostics(
         self, hr_hw: tuple[int, int], lr_hw: tuple[int, int]
     ) -> dict[str, Any]:
+        up_fac = self.backbone_extractor.small_fov_upscale_factor(hr_hw[0], hr_hw[1])
         diag: dict[str, Any] = {
             "backbone": self.backbone_name,
             "fusion_method": self.xrd_fuse_method,
@@ -1227,6 +1552,12 @@ class CorrelativeFuser(nn.Module):
             "interpolation_mode": self.interpolation_mode,
             "debias_positional": self.debias_positional,
         }
+        if up_fac > 1:
+            diag["small_fov_upscale_factor"] = up_fac
+        if self._active_pore_mask_hr is not None:
+            pm_crop = self._active_pore_mask_hr[:, :, : hr_hw[0], : hr_hw[1]]
+            diag["pore_mask_active"] = True
+            diag["porosity_fraction"] = round(float(pm_crop.float().mean().item()), 4)
         diag.update(self.guide_aligner.diagnostics(hr_hw=hr_hw, lr_hw=lr_hw))
         phys = self._active_physics()
         if phys is not None:
@@ -1340,14 +1671,7 @@ class CorrelativeFuser(nn.Module):
                 )
             else:
                 assert transformed_img is not None
-                n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
-                feats = self.extract_patch_tokens(transformed_img, attn_choice="none")
-                permuted = (
-                    feats.squeeze(0)
-                    .reshape(n_patch_h, n_patch_w, self.feat_dim)
-                    .permute(2, 0, 1)
-                    .unsqueeze(0)
-                )
+                permuted = self.extract_patch_grid(transformed_img, attn_choice="none")
                 patch_debiased = (
                     self.backbone_extractor.debiaser(permuted.float())
                     if _allow_cache
@@ -1453,14 +1777,7 @@ class CorrelativeFuser(nn.Module):
                     def _single_tr_tile(tile_chw: torch.Tensor) -> torch.Tensor:
                         t_in = tile_chw.unsqueeze(0)
                         _, th, tw = tile_chw.shape
-                        nph, npw = self.get_n_patches(th, tw)
-                        tok = self.extract_patch_tokens(t_in, attn_choice="none")
-                        perm = (
-                            tok.squeeze(0)
-                            .reshape(nph, npw, self.feat_dim)
-                            .permute(2, 0, 1)
-                            .unsqueeze(0)
-                        )
+                        perm = self.extract_patch_grid(t_in, attn_choice="none")
                         return self._upsample_patch_map(
                             perm.float(), (th, tw), guidance_img=t_in
                         )
@@ -1562,10 +1879,13 @@ class CorrelativeFuser(nn.Module):
                     abund = self._unmixed_guide_lr
                 else:
                     return g[:, : self.guide_channels]
+            ref_norm: GuideNormalization = (
+                "global_max" if self.loss_fn == "compositional_kl" else "minmax"
+            )
             return guide_to_tensor(
                 abund,
                 device=guide_lr.device,
-                normalization="global_max",
+                normalization=ref_norm,
             )
         return g
 
@@ -1582,12 +1902,14 @@ class CorrelativeFuser(nn.Module):
         unguided_transfer: bool = False,
         use_aligner: bool = True,
         valid_hr_hw: tuple[int, int] | None = None,
+        pore_mask_hr: torch.Tensor | None = None,
     ) -> UncertaintyReport:
         """Produce calibrated high-resolution phase/element probabilities, tri-part
         pixel certainty, and optional Split Conformal ``prediction_sets``.
         """
         self.eval()
         _, img_h, img_w = x.shape
+        eff_pm = pore_mask_hr if pore_mask_hr is not None else self._active_pore_mask_hr
 
         if unguided_transfer:
             assert self.xrd_fusion_module is not None, (
@@ -1606,6 +1928,14 @@ class CorrelativeFuser(nn.Module):
                 override_tr_guide=prior_query,
                 valid_hr_hw=valid_hr_hw,
             )
+            if eff_pm is not None:
+                mean_logits, _ = self._apply_pore_mask_to_logits_and_guide(
+                    mean_logits,
+                    prior_query,
+                    eff_pm,
+                    valid_hr_hw=valid_hr_hw,
+                    allow_guide_porosity_cap=False,
+                )
             phys = self._active_physics()
             if self.loss_fn == "compositional_kl" and phys is not None:
                 probs = phys.logits_to_simplex_probs(mean_logits, target=None)
@@ -1622,6 +1952,9 @@ class CorrelativeFuser(nn.Module):
             eff_mode: Literal["multiclass", "multilabel"] = (
                 "multiclass" if probs.shape[1] >= 2 and mode == "multiclass" else mode
             )
+            probs = self._enforce_pore_probs(
+                probs, eff_pm, is_multiclass=(eff_mode == "multiclass")
+            )
             entropy, margin = compute_posterior_uncertainty(probs, mode=eff_mode)
             epi = (
                 (
@@ -1632,16 +1965,34 @@ class CorrelativeFuser(nn.Module):
                 .float()
                 .to(entropy.device)
             )
-            p99 = _safe_quantile(epi, 0.99).clamp(min=1e-6)
+            pm_3d: torch.Tensor | None = None
+            if eff_pm is not None:
+                pm_4d = eff_pm.to(device=entropy.device, dtype=torch.bool)
+                if pm_4d.shape[-2:] != entropy.shape[-2:]:
+                    pm_4d = (
+                        F.interpolate(
+                            pm_4d.float(),
+                            size=tuple(entropy.shape[-2:]),
+                            mode="nearest",
+                        )
+                        > 0.5
+                    )
+                pm_3d = pm_4d.squeeze(1) if pm_4d.ndim == 4 else pm_4d
+                epi = torch.where(pm_3d, torch.zeros_like(epi), epi)
+            epi_ref = epi[~pm_3d] if (pm_3d is not None and (~pm_3d).any()) else epi
+            p99 = _safe_quantile(epi_ref, 0.99).clamp(min=1e-6)
             epi_norm = (epi / p99).clamp(0.0, 1.0)
             phys_res = torch.zeros_like(entropy)
             combined = (0.65 * entropy + 0.35 * epi_norm).clamp(0.0, 1.0)
+            if pm_3d is not None:
+                combined = torch.where(pm_3d, torch.zeros_like(combined), combined)
             unresolved = torch.zeros_like(entropy, dtype=torch.bool)
             hard = compute_hard_phase_mask(probs, mode=eff_mode, channel_dim=1)
             if abstain_threshold is not None:
-                hard = torch.where(
-                    combined > abstain_threshold, torch.full_like(hard, -1), hard
-                )
+                abstain_cond = combined > abstain_threshold
+                if pm_3d is not None:
+                    abstain_cond = abstain_cond & (~pm_3d)
+                hard = torch.where(abstain_cond, torch.full_like(hard, -1), hard)
             pred_sets: torch.Tensor | None = None
             conf_hw: torch.Tensor | None = None
             if self.calibrator is not None:
@@ -1650,6 +2001,7 @@ class CorrelativeFuser(nn.Module):
                     guide_lr=None,
                     epistemic_var_hr=epi,
                     mode=eff_mode,
+                    pore_mask_hr=eff_pm,
                 )
             lr_hw = (int(train_ref.shape[-2]), int(train_ref.shape[-1]))
             diag = self._build_diagnostics((img_h, img_w), lr_hw)
@@ -1687,14 +2039,24 @@ class CorrelativeFuser(nn.Module):
                 mean_logits, guide_lr, valid_hr_hw=valid_hr_hw
             )
 
+        mean_logits, ref_guide_eff = self._apply_pore_mask_to_logits_and_guide(
+            mean_logits,
+            ref_guide,
+            eff_pm,
+            valid_hr_hw=valid_hr_hw,
+            allow_guide_porosity_cap=(
+                mode == "multiclass" or self.loss_fn == "compositional_kl"
+            ),
+        )
+
         phys = self._active_physics()
         if self.loss_fn == "compositional_kl" and phys is not None:
-            probs = phys.logits_to_simplex_probs(mean_logits, target=ref_guide)
-            if calibrate_to_guide and probs.shape[1] == ref_guide.shape[1] + 1:
+            probs = phys.logits_to_simplex_probs(mean_logits, target=ref_guide_eff)
+            if calibrate_to_guide and probs.shape[1] == ref_guide_eff.shape[1] + 1:
                 bg_log = torch.zeros_like(mean_logits[:, :1])
                 probs = match_coarse_priors(
                     torch.cat([bg_log, mean_logits], dim=1),
-                    ref_guide,
+                    ref_guide_eff,
                     mode="multiclass",
                 )
         elif mode == "multiclass":
@@ -1705,28 +2067,36 @@ class CorrelativeFuser(nn.Module):
             )
             full_logits = torch.cat([bg_logit, mean_logits], dim=1)
             probs = (
-                match_coarse_priors(full_logits, ref_guide, mode="multiclass")
+                match_coarse_priors(full_logits, ref_guide_eff, mode="multiclass")
                 if calibrate_to_guide
                 else F.softmax(full_logits, dim=1)
             )
         else:
             probs = (
-                match_coarse_priors(mean_logits, ref_guide, mode="multilabel")
+                match_coarse_priors(mean_logits, ref_guide_eff, mode="multilabel")
                 if calibrate_to_guide
                 else torch.sigmoid(mean_logits)
             )
 
-        lr_hw = (int(ref_guide.shape[-2]), int(ref_guide.shape[-1]))
+        out_mode: Literal["multiclass", "multilabel"] = (
+            "multiclass" if probs.shape[1] >= 2 and mode == "multiclass" else mode
+        )
+        probs = self._enforce_pore_probs(
+            probs, eff_pm, is_multiclass=(out_mode == "multiclass")
+        )
+
+        lr_hw = (int(ref_guide_eff.shape[-2]), int(ref_guide_eff.shape[-1]))
         return build_uncertainty_report(
             probs_hr=probs,
-            guide_lr=ref_guide,
+            guide_lr=ref_guide_eff,
             epistemic_var=epistemic_prob_var,
-            mode="multiclass" if probs.shape[1] >= 2 and mode == "multiclass" else mode,
+            mode=out_mode,
             abstain_threshold=abstain_threshold,
             downsampler=self._active_downsampler(),
             aligner=(self.guide_aligner if use_aligner else None),
             calibrator=self.calibrator,
             diagnostics=self._build_diagnostics((img_h, img_w), lr_hw),
+            pore_mask_hr=eff_pm,
         )
 
     # ── High-Level 3-Line Pythonic API ───────────────────────────────────────
@@ -1805,6 +2175,7 @@ class CorrelativeFuser(nn.Module):
         n_components: int | None = None,
         spectral_unmix: bool = False,
         *,
+        pore_mask: PoreMaskSpec = None,
         max_steps: int | None = None,
         tol: float = 1e-6,
         reset_weights: bool = True,
@@ -1817,7 +2188,15 @@ class CorrelativeFuser(nn.Module):
         """
         dev = next(self.dinov2.parameters()).device
         hr_prepared, (orig_h, orig_w) = self._prepare_high_level_hr(hr_image)
+        pad_h, pad_w = int(hr_prepared.shape[-2]), int(hr_prepared.shape[-1])
         self._fit_hr_sig = _tensor_content_digest(hr_prepared[:, :orig_h, :orig_w])
+        self._active_pore_mask_hr = self._resolve_pore_mask_2d(
+            hr_image,
+            padded_hw=(pad_h, pad_w),
+            orig_hw=(orig_h, orig_w),
+            spec_override=pore_mask,
+            device=dev,
+        )
 
         norm_mode = (
             "preserve_counts"
@@ -1886,12 +2265,7 @@ class CorrelativeFuser(nn.Module):
             self._last_loss_history = []
             return []
 
-        valid_hw = (
-            (orig_h, orig_w)
-            if (orig_h, orig_w)
-            != (int(hr_prepared.shape[-2]), int(hr_prepared.shape[-1]))
-            else None
-        )
+        valid_hw = (orig_h, orig_w) if (orig_h, orig_w) != (pad_h, pad_w) else None
         n_epochs = max(1, int(max_steps if max_steps is not None else epochs))
         warmup_steps = (
             int(round(warmup_fraction * n_epochs)) if self.align_guide != "none" else 0
@@ -1903,6 +2277,7 @@ class CorrelativeFuser(nn.Module):
                 update_aligner=(ep >= warmup_steps),
                 valid_hr_hw=valid_hw,
                 loss_mask_lr=train_mask_lr,
+                pore_mask_hr=self._active_pore_mask_hr,
             )
             prev_loss = losses[-1] if losses else None
             losses.append(loss_val)
@@ -1945,6 +2320,11 @@ class CorrelativeFuser(nn.Module):
                 )
             mean_logits = mean_logits[:, :, :orig_h, :orig_w]
             epi_var = epi_var[:, :, :orig_h, :orig_w]
+            pm_cal = (
+                self._active_pore_mask_hr[:, :, :orig_h, :orig_w]
+                if self._active_pore_mask_hr is not None
+                else None
+            )
             n_g = int(ref_g.shape[1])
             phys_cal = self._active_physics()
             cal_mode: Literal["multiclass", "multilabel"] = (
@@ -1952,28 +2332,47 @@ class CorrelativeFuser(nn.Module):
                 if n_g >= 2 or self.loss_fn == "compositional_kl"
                 else "multilabel"
             )
+            mean_logits, ref_g_eff = self._apply_pore_mask_to_logits_and_guide(
+                mean_logits,
+                ref_g,
+                pm_cal,
+                valid_hr_hw=None,
+                allow_guide_porosity_cap=(cal_mode == "multiclass"),
+            )
             if self.loss_fn == "compositional_kl" and phys_cal is not None:
-                probs_cal = phys_cal.logits_to_simplex_probs(mean_logits, target=ref_g)
+                probs_cal = phys_cal.logits_to_simplex_probs(
+                    mean_logits, target=ref_g_eff
+                )
                 if probs_cal.shape[1] == n_g + 1:
                     bg_l = torch.zeros_like(mean_logits[:, :1])
                     probs_cal = match_coarse_priors(
-                        torch.cat([bg_l, mean_logits], dim=1), ref_g, mode="multiclass"
+                        torch.cat([bg_l, mean_logits], dim=1),
+                        ref_g_eff,
+                        mode="multiclass",
                     )
             elif cal_mode == "multiclass":
                 bg_l = torch.zeros_like(mean_logits[:, :1])
                 probs_cal = match_coarse_priors(
-                    torch.cat([bg_l, mean_logits], dim=1), ref_g, mode="multiclass"
+                    torch.cat([bg_l, mean_logits], dim=1),
+                    ref_g_eff,
+                    mode="multiclass",
                 )
             else:
-                probs_cal = match_coarse_priors(mean_logits, ref_g, mode="multilabel")
+                probs_cal = match_coarse_priors(
+                    mean_logits, ref_g_eff, mode="multilabel"
+                )
+            probs_cal = self._enforce_pore_probs(
+                probs_cal, pm_cal, is_multiclass=(cal_mode == "multiclass")
+            )
             self.calibrator.calibrate_coarse(
                 probs_hr=probs_cal,
-                guide_lr=ref_g,
+                guide_lr=ref_g_eff,
                 epistemic_var_hr=epi_var,
                 cal_mask_lr=cal_mask_lr,
                 downsampler=self._active_downsampler(),
                 aligner=self.guide_aligner,
                 mode=cal_mode,
+                pore_mask_hr=pm_cal,
             )
 
         return losses
@@ -1988,20 +2387,33 @@ class CorrelativeFuser(nn.Module):
         abstain_threshold: float | None = None,
         top_k: int | None = None,
         guide_normalization: GuideNormalization | None = None,
+        *,
+        pore_mask: PoreMaskSpec = None,
     ) -> UncertaintyReport:
         """High-level inference entrypoint: predicts calibrated probabilities and
         an ``UncertaintyReport`` automatically cropped back to ``hr_image`` shape.
         """
         dev = next(self.dinov2.parameters()).device
         hr_prepared, (orig_h, orig_w) = self._prepare_high_level_hr(hr_image)
-        valid_hw = (
-            (orig_h, orig_w)
-            if (orig_h, orig_w)
-            != (int(hr_prepared.shape[-2]), int(hr_prepared.shape[-1]))
-            else None
-        )
+        pad_h, pad_w = int(hr_prepared.shape[-2]), int(hr_prepared.shape[-1])
+        valid_hw = (orig_h, orig_w) if (orig_h, orig_w) != (pad_h, pad_w) else None
         cur_hr_sig = _tensor_content_digest(hr_prepared[:, :orig_h, :orig_w])
         same_specimen = self._fit_hr_sig is not None and cur_hr_sig == self._fit_hr_sig
+
+        if (
+            pore_mask is not None
+            or not same_specimen
+            or self._active_pore_mask_hr is None
+        ):
+            resolved_pm = self._resolve_pore_mask_2d(
+                hr_image,
+                padded_hw=(pad_h, pad_w),
+                orig_hw=(orig_h, orig_w),
+                spec_override=pore_mask,
+                device=dev,
+            )
+        else:
+            resolved_pm = self._active_pore_mask_hr
 
         guide_t: torch.Tensor | None = None
         unguided_transfer = False
@@ -2050,21 +2462,27 @@ class CorrelativeFuser(nn.Module):
             if mode == "auto"
             else mode
         )
-        report = self.predict_with_uncertainty(
-            hr_prepared,
-            guide_lr=guide_t,
-            mode=resolved_mode,
-            calibrate_to_guide=calibrate_to_guide,
-            abstain_threshold=abstain_threshold,
-            top_k=top_k,
-            unguided_transfer=unguided_transfer,
-            use_aligner=(same_specimen or self._fit_hr_sig is None),
-            valid_hr_hw=valid_hw,
-        )
-        cropped = report.crop_spatial(orig_h, orig_w)
-        if ref_g is not None:
-            lr_hw = (int(ref_g.shape[-2]), int(ref_g.shape[-1]))
-            cropped.diagnostics = self._build_diagnostics((orig_h, orig_w), lr_hw)
+        prev_pm = self._active_pore_mask_hr
+        self._active_pore_mask_hr = resolved_pm
+        try:
+            report = self.predict_with_uncertainty(
+                hr_prepared,
+                guide_lr=guide_t,
+                mode=resolved_mode,
+                calibrate_to_guide=calibrate_to_guide,
+                abstain_threshold=abstain_threshold,
+                top_k=top_k,
+                unguided_transfer=unguided_transfer,
+                use_aligner=(same_specimen or self._fit_hr_sig is None),
+                valid_hr_hw=valid_hw,
+                pore_mask_hr=resolved_pm,
+            )
+            cropped = report.crop_spatial(orig_h, orig_w)
+            if ref_g is not None:
+                lr_hw = (int(ref_g.shape[-2]), int(ref_g.shape[-1]))
+                cropped.diagnostics = self._build_diagnostics((orig_h, orig_w), lr_hw)
+        finally:
+            self._active_pore_mask_hr = prev_pm
         return cropped
 
     def fit_predict(
@@ -2081,6 +2499,7 @@ class CorrelativeFuser(nn.Module):
         n_components: int | None = None,
         spectral_unmix: bool = False,
         *,
+        pore_mask: PoreMaskSpec = None,
         max_steps: int | None = None,
         tol: float = 1e-6,
         reset_weights: bool = True,
@@ -2097,6 +2516,7 @@ class CorrelativeFuser(nn.Module):
             guide_normalization=guide_normalization,
             n_components=n_components,
             spectral_unmix=spectral_unmix,
+            pore_mask=pore_mask,
             max_steps=max_steps,
             tol=tol,
             reset_weights=reset_weights,
@@ -2108,6 +2528,7 @@ class CorrelativeFuser(nn.Module):
             calibrate_to_guide=calibrate_to_guide,
             abstain_threshold=abstain_threshold,
             guide_normalization=guide_normalization,
+            pore_mask=pore_mask,
         )
 
 

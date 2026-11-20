@@ -40,6 +40,7 @@ from x_fuse import (
     empirical_conformal_coverage,
     generate_correlative_phantom_2d,
     generate_correlative_phantom_3d,
+    generate_localized_reaction_phantom_3d,
     generate_oriented_lamellar_phantom_2d,
     jbu_guided_baseline,
     make_experimental_holdout,
@@ -99,14 +100,96 @@ def _install_ram_backbone_cache() -> None:
                     return feat_memo[f_key].to(x.device, dtype=x.dtype)
                 out_f = cls_ff(self_m, x)
                 feat_memo[f_key] = out_f.detach().cpu()
-                while len(feat_memo) > 96:
+                while len(feat_memo) > 512:
                     feat_memo.popitem(last=False)
                 return out_f
 
             cloned.forward_features = MethodType(_memo_ff, cloned)
         return cloned.to(device) if device is not None else cloned
 
+    orig_extract = _xf_backbones.HighResBackbone.extract_patch_tokens
+    tok_memo: OrderedDict[tuple[Any, ...], torch.Tensor] = OrderedDict()
+
+    def _memo_extract(
+        self_b: Any,
+        transformed_img: torch.Tensor,
+        attn_choice: Any = "none",
+    ) -> torch.Tensor:
+        if getattr(self_b, "track_grad", False) or transformed_img.requires_grad:
+            return orig_extract(self_b, transformed_img, attn_choice=attn_choice)
+        dig = hashlib.blake2b(
+            transformed_img.detach().cpu().contiguous().numpy().tobytes(),
+            digest_size=16,
+        ).digest()
+        t_key = (
+            getattr(self_b, "dino_name", ""),
+            bool(self_b.pretrained),
+            tuple(self_b.stride),
+            tuple(self_b.layer_indices or ()),
+            str(attn_choice),
+            tuple(transformed_img.shape),
+            dig,
+        )
+        if t_key in tok_memo:
+            tok_memo.move_to_end(t_key)
+            return tok_memo[t_key].to(
+                transformed_img.device, dtype=transformed_img.dtype
+            )
+        with torch.no_grad():
+            out_t = orig_extract(self_b, transformed_img, attn_choice=attn_choice)
+        tok_memo[t_key] = out_t.detach().cpu()
+        while len(tok_memo) > 384:
+            tok_memo.popitem(last=False)
+        return out_t
+
+    orig_upsample = _xf_backbones.HighResBackbone._upsample_patch_map
+    up_memo: OrderedDict[tuple[Any, ...], torch.Tensor] = OrderedDict()
+
+    def _memo_upsample(
+        self_b: Any,
+        patch_map: torch.Tensor,
+        target_hw: tuple[int, int],
+        guidance_img: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        ca_mod = getattr(self_b, "cross_attn_upsampler", None)
+        ca_grad = ca_mod is not None and any(
+            p.requires_grad for p in ca_mod.parameters()
+        )
+        if patch_map.requires_grad or ca_grad or guidance_img is None:
+            return orig_upsample(
+                self_b, patch_map, target_hw, guidance_img=guidance_img
+            )
+        g_dig = hashlib.blake2b(
+            guidance_img.detach().cpu().contiguous().numpy().tobytes(),
+            digest_size=12,
+        ).digest()
+        p_dig = hashlib.blake2b(
+            patch_map.detach().cpu().contiguous().numpy().tobytes(),
+            digest_size=12,
+        ).digest()
+        u_key = (
+            str(self_b.interpolation_mode),
+            bool(getattr(self_b, "upsampler_orientation", True)),
+            tuple(target_hw),
+            tuple(patch_map.shape),
+            g_dig,
+            p_dig,
+        )
+        if u_key in up_memo:
+            up_memo.move_to_end(u_key)
+            return up_memo[u_key].to(patch_map.device, dtype=patch_map.dtype)
+        with torch.no_grad():
+            out_u = orig_upsample(
+                self_b, patch_map, target_hw, guidance_img=guidance_img
+            )
+        up_memo[u_key] = out_u.detach().cpu()
+        while len(up_memo) > 160:
+            up_memo.popitem(last=False)
+        return out_u
+
     _xf_backbones.load_backbone = _cached_loader  # type: ignore[assignment]
+    _xf_backbones.HighResBackbone.extract_patch_tokens = _memo_extract  # type: ignore[method-assign]
+    _xf_backbones.HighResBackbone._upsample_patch_map = _memo_upsample  # type: ignore[method-assign]
 
 
 def _set_seeds(seed: int) -> None:
@@ -414,6 +497,7 @@ def run_stage_c_volumetric(
                 backbone=backbone,
                 stride=stride,
                 pretrained=pretrained,
+                min_input_size=None,
                 fusion_method="spatial_mlp",
                 loss_fn="compositional_kl",
                 interpolation_mode="cross_attn",
@@ -530,6 +614,120 @@ def run_stage_c_volumetric(
             k: {m: _mean_std(v[m]) for m in v} for k, v in acc.items()
         },
         "active_slice_steering": {k: _mean_std(v) for k, v in act_acc.items()},
+    }
+
+
+def run_stage_c2_active_curve(
+    seeds: tuple[int, ...],
+    backbone: str,
+    pretrained: bool,
+    stride: int,
+    device: str,
+) -> dict[str, Any]:
+    """C2: Multi-budget (k = 2, 3, 4, 6, 8) active slice steering on Z=48 volume
+    with a localized reaction-front phase confined to z in [26, 38).
+    """
+    budgets = (2, 3, 4, 6, 8)
+    curve_acc: dict[str, dict[str, dict[str, list[float]]]] = {
+        strat: {str(k): {"mIoU_3d": [], "phase_c_iou": []} for k in budgets}
+        for strat in ("active_steering", "equispaced")
+    }
+    for s in seeds:
+        ph_loc = generate_localized_reaction_phantom_3d(
+            shape=(48, 32, 32),
+            downsample_factor=4,
+            reaction_z_band=(26, 38),
+            depth_psf_sigma=1.6,
+            seed=s + 200,
+        )
+        gt_flat = ph_loc.gt_labels_3d.reshape(48 * 32, 32)
+        gt_c = ph_loc.gt_labels_3d == 3
+
+        def _eval_3d_set(
+            slice_map: dict[int, np.ndarray],
+            seed_val: int,
+            ph_ref: Any = ph_loc,
+            gt_f: np.ndarray = gt_flat,
+            gt_c_mask: np.ndarray = gt_c,
+        ) -> tuple[Any, float, float]:
+            _set_seeds(seed_val)
+            xf_c2 = XFuse(
+                backbone=backbone,
+                stride=stride,
+                pretrained=pretrained,
+                min_input_size=None,
+                device=device,
+                loss_fn="compositional_kl",
+                interpolation_mode="cross_attn",
+                fusion_method="spatial_mlp",
+                guide_channels=3,
+                learn_psf=True,
+                guide_residual=True,
+                tv_weight=0.01,
+                lr=1e-2,
+            )
+            vf_c2 = VolumetricFuser(xf_c2, tta_shifts=None, tta_flips=False)
+            vf_c2.fit_sparse_slices(
+                ph_ref.hr_volume,
+                slice_map,
+                epochs=10,
+                depth_psf_sigma=1.6,
+                learn_depth_psf=True,
+                triplane_consistency_weight=0.0,
+            )
+            rp_c2 = vf_c2.predict_volume(
+                ph_ref.hr_volume,
+                mode="2.5d_slab",
+                sparse_guides=slice_map,
+                pred_mode="multiclass",
+            )
+            hm_c2 = rp_c2.hard_mask.cpu().numpy()
+            miou_all = compute_segmentation_metrics(hm_c2.reshape(48 * 32, 32), gt_f)[
+                "iou"
+            ]
+            pred_c = hm_c2 == 3
+            inter_c = float(np.logical_and(pred_c, gt_c_mask).sum())
+            union_c = float(np.logical_or(pred_c, gt_c_mask).sum())
+            iou_c = inter_c / max(union_c, 1.0)
+            return rp_c2, miou_all, iou_c
+
+        # Active iterative steering starting from 2 boundary scout slices [3, 44]
+        act_slices: dict[int, np.ndarray] = {
+            3: ph_loc.coarse_guide_3d[:, 3],
+            44: ph_loc.coarse_guide_3d[:, 44],
+        }
+        cur_rep: Any | None = None
+        for k in budgets:
+            while len(act_slices) < k:
+                assert cur_rep is not None
+                add_n = k - len(act_slices)
+                rec_plan = suggest_next_slices(
+                    cur_rep,
+                    acquired_indices=sorted(act_slices.keys()),
+                    k=add_n,
+                    min_spacing=3,
+                )
+                for z_new in rec_plan.recommended_indices:
+                    act_slices[int(z_new)] = ph_loc.coarse_guide_3d[:, int(z_new)]
+            cur_rep, m_act, c_act = _eval_3d_set(act_slices, s)
+            curve_acc["active_steering"][str(k)]["mIoU_3d"].append(m_act)
+            curve_acc["active_steering"][str(k)]["phase_c_iou"].append(c_act)
+
+            if k == 2:
+                m_eq, c_eq = m_act, c_act
+            else:
+                eq_idx = [int(round(v)) for v in np.linspace(3, 44, k)]
+                eq_slices = {zi: ph_loc.coarse_guide_3d[:, zi] for zi in eq_idx}
+                _, m_eq, c_eq = _eval_3d_set(eq_slices, s)
+            curve_acc["equispaced"][str(k)]["mIoU_3d"].append(m_eq)
+            curve_acc["equispaced"][str(k)]["phase_c_iou"].append(c_eq)
+
+    return {
+        strat: {
+            bk: {mk: _mean_std(vals) for mk, vals in md.items()}
+            for bk, md in bd.items()
+        }
+        for strat, bd in curve_acc.items()
     }
 
 
@@ -907,6 +1105,7 @@ def run_stage_e_real_em(
             spectral_channels=int(cube_lr.shape[0]),
             guide_channels=2,
             learn_psf=True,
+            guide_residual=True,
             tv_weight=0.006,
             lr=1e-2,
         )
@@ -925,6 +1124,91 @@ def run_stage_e_real_em(
             for ck in ("pearson_r", "psnr_db", "support_iou"):
                 e2_acc[mk_name][ck].append(cm2[ck])
 
+    # E3: EPFL edxia LC3 Cement SEM-BSE + 6-element Calibrated wt% EDS (8x Core+Halo
+    # interaction-volume hold-out; Georget et al., Cem. Concr. Res. 2021)
+    s_edxia = load_zenodo_correlative_sample(
+        "edxia_cement_sem_eds", dest_root=zenodo_root
+    )
+    hr_edx, simp_edx, dom_edx = _prep_ti_rcca_simplex(s_edxia, y0=120, size=168)
+    _, coarse_edx, _ = make_experimental_holdout(
+        hr_edx, simp_edx[1:], factor=8, psf_sigma=2.2, beam_profile="core_halo"
+    )
+    e3_acc = {
+        m: {"mIoU": [], "BF1": [], "pearson_r": [], "psnr_db": [], "support_iou": []}
+        for m in e1_methods
+    }
+    hw_edx = (int(hr_edx.shape[0]), int(hr_edx.shape[1]))
+
+    for s in seeds:
+        reps_e3: dict[str, Any] = {
+            "otsu": otsu_threshold_baseline(
+                hr_edx, coarse_edx, mode="multiclass", guide_normalization=norm
+            ),
+            "bicubic": bicubic_upsample_baseline(
+                coarse_edx, hw_edx, mode="multiclass", guide_normalization=norm
+            ),
+            "jbu": jbu_guided_baseline(
+                hr_edx, coarse_edx, mode="multiclass", guide_normalization=norm
+            ),
+            "cnmf": cnmf_pansharpen_baseline(
+                hr_edx,
+                coarse_edx,
+                mode="multiclass",
+                n_iters=35,
+                device=device,
+                guide_normalization=norm,
+            ),
+            "guided_tv": guided_variational_sr_baseline(
+                hr_edx,
+                coarse_edx,
+                mode="multiclass",
+                n_steps=55,
+                device=device,
+                guide_normalization=norm,
+            ),
+            "siren_inr": coordinate_inr_baseline(
+                hr_edx,
+                coarse_edx,
+                mode="multiclass",
+                hidden_dim=48,
+                epochs=60,
+                seed=s,
+                device=device,
+                guide_normalization=norm,
+            ),
+        }
+        _set_seeds(s)
+        xf3 = XFuse(
+            backbone=backbone,
+            stride=stride,
+            pretrained=pretrained,
+            device=device,
+            loss_fn="compositional_kl",
+            interpolation_mode="cross_attn",
+            fusion_method="spatial_mlp",
+            psf_profile="core_halo",
+            learn_psf=True,
+            guide_residual=True,
+            tv_weight=0.008,
+            lr=1e-2,
+        )
+        reps_e3["xfuse"] = xf3.fit_predict(
+            hr_edx,
+            coarse_edx,
+            epochs=28,
+            mode="multiclass",
+            tta_shifts=(),
+            tta_flips=False,
+            guide_normalization=norm,
+        )
+        for mk_name, rp in reps_e3.items():
+            sm3 = compute_segmentation_metrics(rp.hard_mask[0], dom_edx)
+            cm3 = _continuous_channel_metrics(rp.probabilities[0], simp_edx)
+            e3_acc[mk_name]["mIoU"].append(sm3["iou"])
+            e3_acc[mk_name]["BF1"].append(sm3["boundary_f1"])
+            for ck in ("pearson_r", "psnr_db", "support_iou"):
+                e3_acc[mk_name][ck].append(cm3[ck])
+
     return {
         "ti_rcca_5elem_stem_eds_8x": {
             "elements": s_b.channel_names,
@@ -938,7 +1222,16 @@ def run_stage_e_real_em(
             "native_si_hw": [int(hw_cz[0]), int(hw_cz[1])],
             "coarse_si_hw": [int(cube_lr.shape[1]), int(cube_lr.shape[2])],
             "continuum_stripped_after_coarse_binning": True,
+            "guide_residual": True,
+            "small_fov_min_input_size": 112,
             "methods": {k: {m: _mean_std(v[m]) for m in v} for k, v in e2_acc.items()},
+        },
+        "edxia_lc3_6elem_sem_eds_8x": {
+            "elements": s_edxia.channel_names,
+            "source_type": "calibrated_wt_pct_csv_simplex_normalized",
+            "guide_residual": True,
+            "psf_profile": "core_halo",
+            "methods": {k: {m: _mean_std(v[m]) for m in v} for k, v in e3_acc.items()},
         },
     }
 
@@ -1111,37 +1404,74 @@ def render_ablation_figure(
     ax = axes[1, 1]
     if "stage_e_real_em" in results:
         se1 = results["stage_e_real_em"]["ti_rcca_5elem_stem_eds_8x"]["methods"]
+        se3 = (
+            results["stage_e_real_em"]
+            .get("edxia_lc3_6elem_sem_eds_8x", {})
+            .get("methods")
+        )
         mkeys = ["otsu", "bicubic", "jbu", "cnmf", "guided_tv", "siren_inr", "xfuse"]
         mlbls = ["Otsu", "Bicub", "JBU", "CNMF", "TV", "SIREN", "X-FUSE"]
         x = np.arange(len(mkeys))
-        w = 0.36
         r_m = [se1[k]["pearson_r"]["mean"] for k in mkeys]
         r_s = [se1[k]["pearson_r"]["std"] for k in mkeys]
         iou_m = [se1[k]["mIoU"]["mean"] for k in mkeys]
         iou_s = [se1[k]["mIoU"]["std"] for k in mkeys]
-        ax.bar(
-            x - 0.5 * w,
-            r_m,
-            w,
-            yerr=r_s,
-            capsize=2.5,
-            label="5-Elem Pearson r",
-            color="#1f77b4",
-        )
-        ax.bar(
-            x + 0.5 * w,
-            iou_m,
-            w,
-            yerr=iou_s,
-            capsize=2.5,
-            label="5-Phase mIoU",
-            color="#d62728",
-        )
+        if se3 is not None:
+            w = 0.26
+            e_m = [se3[k]["pearson_r"]["mean"] for k in mkeys]
+            e_s = [se3[k]["pearson_r"]["std"] for k in mkeys]
+            ax.bar(
+                x - w,
+                r_m,
+                w,
+                yerr=r_s,
+                capsize=2.2,
+                label="Ti-RCCA STEM-EDS (r)",
+                color="#1f77b4",
+            )
+            ax.bar(
+                x,
+                e_m,
+                w,
+                yerr=e_s,
+                capsize=2.2,
+                label="edxia SEM-EDS (r)",
+                color="#ff7f0e",
+            )
+            ax.bar(
+                x + w,
+                iou_m,
+                w,
+                yerr=iou_s,
+                capsize=2.2,
+                label="Ti-RCCA 5-Phase mIoU",
+                color="#d62728",
+            )
+        else:
+            w = 0.36
+            ax.bar(
+                x - 0.5 * w,
+                r_m,
+                w,
+                yerr=r_s,
+                capsize=2.5,
+                label="5-Elem Pearson r",
+                color="#1f77b4",
+            )
+            ax.bar(
+                x + 0.5 * w,
+                iou_m,
+                w,
+                yerr=iou_s,
+                capsize=2.5,
+                label="5-Phase mIoU",
+                color="#d62728",
+            )
         ax.set_xticks(x, mlbls, rotation=20)
         ax.set_ylabel("Score")
-        ax.set_ylim(0.0, 1.02)
-        ax.legend(frameon=False, loc="upper left")
-    ax.set_title("(e) Real Ti-RCCA 5-Element STEM-EDS (8x)")
+        ax.set_ylim(0.0, 1.08)
+        ax.legend(frameon=False, loc="upper left", fontsize=7.2)
+    ax.set_title("(e) Real STEM-EDS & SEM-EDS (8x Hold-Out)")
 
     # Panel E2: Real CuZn 3D Core-Loss EELS Spectral Cube (4x)
     ax = axes[1, 2]
@@ -1239,14 +1569,32 @@ def run_design_ablations(
         )
         _save_json(output_dir, results)
 
-    if "C" in active and not (resume and "stage_c_volumetric" in results):
+    if ("C" in active or "C1" in active) and not (
+        resume
+        and "stage_c_volumetric" in results
+        and "volumetric_variants" in results["stage_c_volumetric"]
+    ):
         print(
-            "[Stage C] Running 3D Volumetric Depth-PSF & Tri-Plane Ablation...",
+            "[Stage C1] Running 3D Volumetric Depth-PSF & Tri-Plane Ablation...",
             flush=True,
         )
-        results["stage_c_volumetric"] = run_stage_c_volumetric(
-            seeds, backbone, pretrained, stride, device
+        c1_out = run_stage_c_volumetric(seeds, backbone, pretrained, stride, device)
+        results.setdefault("stage_c_volumetric", {}).update(c1_out)
+        _save_json(output_dir, results)
+
+    if ("C" in active or "C2" in active) and not (
+        resume
+        and "stage_c_volumetric" in results
+        and "localized_reaction_active_curve_z48" in results["stage_c_volumetric"]
+    ):
+        print(
+            "[Stage C2] Running Z=48 Active Tomography Steering Curve...",
+            flush=True,
         )
+        c2_out = run_stage_c2_active_curve(seeds, backbone, pretrained, stride, device)
+        results.setdefault("stage_c_volumetric", {})[
+            "localized_reaction_active_curve_z48"
+        ] = c2_out
         _save_json(output_dir, results)
 
     if "D" in active and not (resume and "stage_d_conformal" in results):

@@ -13,6 +13,7 @@ format: ## Format code and sort imports with Ruff
 lint: ## Check formatting, lint rules, and stripped notebooks
 	uv run ruff check x_fuse tests benchmarks
 	uv run ruff format --check x_fuse tests benchmarks
+	uv run nbstripout --verify notebooks/*.ipynb
 
 typecheck: ## Run static type checking with Mypy
 	uv run mypy x_fuse

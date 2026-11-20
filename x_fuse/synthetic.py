@@ -247,6 +247,117 @@ def generate_correlative_phantom_3d(
     )
 
 
+def generate_localized_reaction_phantom_3d(
+    shape: tuple[int, int, int] = (48, 48, 48),
+    downsample_factor: int = 4,
+    reaction_z_band: tuple[int, int] = (26, 38),
+    depth_psf_sigma: float = 2.0,
+    hr_noise_std: float = 0.04,
+    poisson_counts: float | None = 220.0,
+    seed: int = 42,
+) -> CorrelativePhantom3D:
+    """Synthesize a 4-class 3D tomogram ``(Z, Y, X)`` with a spatially localized
+    intermetallic/reaction-front phase (``label = 3``) confined strictly to
+    ``z in [reaction_z_band[0], reaction_z_band[1])``.
+
+    ``coarse_guide_3d`` has shape
+    ``(3, Z, Y // downsample_factor, X // downsample_factor)``
+    so any candidate slice index ``z in [0, Z)`` recommended during active beamtime
+    steering can be queried directly with realistic axial PSF blur.
+    """
+    f = max(1, int(downsample_factor))
+    z_dim = max(8, int(shape[0]))
+    y_dim = max(f, (int(shape[1]) // f) * f)
+    x_dim = max(f, (int(shape[2]) // f) * f)
+    z0 = max(0, min(z_dim - 1, int(reaction_z_band[0])))
+    z1 = max(z0 + 1, min(z_dim, int(reaction_z_band[1])))
+    rng = np.random.default_rng(seed)
+
+    field_a = gaussian_filter(
+        rng.standard_normal((z_dim, y_dim, x_dim)).astype(np.float32),
+        sigma=(5.0, 4.5, 4.5),
+        mode="nearest",
+    )
+    field_b = gaussian_filter(
+        rng.standard_normal((z_dim, y_dim, x_dim)).astype(np.float32),
+        sigma=(4.5, 4.0, 4.0),
+        mode="nearest",
+    )
+    field_c = gaussian_filter(
+        rng.standard_normal((z_dim, y_dim, x_dim)).astype(np.float32),
+        sigma=(2.2, 3.2, 3.2),
+        mode="nearest",
+    )
+
+    mask_a = field_a >= float(np.quantile(field_a, 0.72))
+    mask_b = (field_b >= float(np.quantile(field_b, 0.72))) & (~mask_a)
+
+    in_band = np.zeros((z_dim, 1, 1), dtype=bool)
+    in_band[z0:z1] = True
+    band_vals = field_c[z0:z1]
+    thresh_c = float(np.quantile(band_vals, 0.42))
+    mask_c = in_band & (field_c >= thresh_c)
+
+    mask_a = mask_a & (~mask_c)
+    mask_b = mask_b & (~mask_c)
+
+    gt_labels = np.zeros((z_dim, y_dim, x_dim), dtype=np.int64)
+    gt_labels[mask_a] = 1
+    gt_labels[mask_b] = 2
+    gt_labels[mask_c] = 3
+    gt_channels = np.stack(
+        [
+            mask_a.astype(np.float32),
+            mask_b.astype(np.float32),
+            mask_c.astype(np.float32),
+        ],
+        axis=0,
+    )
+
+    # Phase C sits at intermediate attenuation (0.60) with fine cellular contrast
+    # so models trained only on end-cap slices exhibit peak entropy + tri-plane
+    # variance across the unvisited reaction zone.
+    yy, xx = np.meshgrid(
+        np.arange(y_dim, dtype=np.float32),
+        np.arange(x_dim, dtype=np.float32),
+        indexing="ij",
+    )
+    fine_tex = 0.09 * (
+        np.sin(2.0 * np.pi * yy / 4.0) * np.cos(2.0 * np.pi * xx / 4.0)
+    ).astype(np.float32)
+
+    hr_vol = np.full((z_dim, y_dim, x_dim), 0.12, dtype=np.float32)
+    hr_vol[mask_a] = 0.88
+    hr_vol[mask_b] = 0.36
+    hr_vol[mask_c] = (0.61 + np.broadcast_to(fine_tex, hr_vol.shape))[mask_c]
+    hr_vol = hr_vol + rng.normal(0.0, hr_noise_std, size=hr_vol.shape).astype(
+        np.float32
+    )
+    hr_vol = np.clip(hr_vol, 0.0, 1.0)
+
+    y_lr, x_lr = y_dim // f, x_dim // f
+    coarse_3d = np.zeros((3, z_dim, y_lr, x_lr), dtype=np.float32)
+    sig_xy = 0.45 * f
+    sig_z = max(0.0, float(depth_psf_sigma))
+    for m in range(3):
+        blurred = gaussian_filter(
+            gt_channels[m], sigma=(sig_z, sig_xy, sig_xy), mode="nearest"
+        )
+        pooled = blurred.reshape(z_dim, y_lr, f, x_lr, f).mean(axis=(2, 4))
+        if poisson_counts is not None and poisson_counts > 0:
+            pooled = rng.poisson(np.clip(pooled, 0.0, 1.0) * poisson_counts).astype(
+                np.float32
+            ) / float(poisson_counts)
+        coarse_3d[m] = np.clip(pooled, 0.0, 1.0)
+
+    return CorrelativePhantom3D(
+        hr_volume=hr_vol,
+        coarse_guide_3d=coarse_3d,
+        gt_labels_3d=gt_labels,
+        gt_phase_channels_3d=gt_channels,
+    )
+
+
 @dataclass
 class SpectralCubePhantom2D:
     """Paired 2D structural micrograph + coarse 3D Poisson spectral/diffraction cube."""
