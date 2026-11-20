@@ -1,6 +1,6 @@
 # AGENTS.md — `X-FUSE` (Layer 2: Image Tools)
 
-Read [`ECOSYSTEM.md`](./ECOSYSTEM.md) before modifying repository boundaries, I/O contracts, or cross-package dependencies.
+Read [`ECOSYSTEM.md`](https://github.com/BASE-Laboratory/basecoat/blob/main/ECOSYSTEM.md) before modifying repository boundaries, I/O contracts, or cross-package dependencies.
 
 ## Architectural Role & Licence
 - **Layer:** Layer 2 — Image tools (`BASE-Laboratory` 4-layer software architecture).
