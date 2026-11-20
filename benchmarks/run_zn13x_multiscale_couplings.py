@@ -747,7 +747,7 @@ def main() -> int:
     parser.add_argument(
         "--zenodo-cache",
         type=Path,
-        default=Path("/home/antigravity/.cache-xfuse/zenodo"),
+        default=Path.home() / ".cache-xfuse" / "zenodo",
     )
     parser.add_argument("--cleaned-xrdct-dir", type=Path, default=None)
     parser.add_argument("--cleaned-xct-path", type=Path, default=None)

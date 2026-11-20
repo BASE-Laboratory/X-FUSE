@@ -41,6 +41,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    # Swap to "basecoat>=0.2.0,<0.3.0" once PyPI Trusted Publisher is enabled on BASE-Laboratory/basecoat
+    "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.2.0",
     "h5py>=3.10",
     "matplotlib>=3.7",
     "numpy>=1.24",
@@ -107,6 +109,9 @@ dev = [
     "zarr>=2.16",
 ]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["x_fuse"]
 
@@ -118,6 +123,8 @@ include = [
     "/notebooks",
     "/docs",
     "/mkdocs.yml",
+    "/AGENTS.md",
+    "/ECOSYSTEM.md",
     "/README.md",
     "/INSTALL.md",
     "/CHANGELOG.md",
@@ -167,4 +174,15 @@ exclude_lines = [
     "pragma: no cover",
     "if __name__ == .__main__.:",
     "raise NotImplementedError",
+]
+
+[tool.basecoat.layers]
+layer = 2
+source_dirs = ["x_fuse"]
+banned_imports = [
+    "multimodal_benchmark",
+    "openimpala",
+    "openlsrx",
+    "braggtrack",
+    "numcodecs",
 ]

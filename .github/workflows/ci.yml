@@ -26,6 +26,7 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
+          python-version: "3.12"
 
       - name: Install developer & docs dependencies
         run: >-
@@ -38,6 +39,9 @@ jobs:
 
       - name: Check code formatting (Ruff)
         run: uv run ruff format --check x_fuse tests benchmarks
+
+      - name: Check Layer 2 architectural import boundaries (basecoat)
+        run: uv run python -m basecoat.layers
 
       - name: Static type check (Mypy)
         run: uv run mypy x_fuse
@@ -115,6 +119,7 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
+          python-version: "3.12"
 
       - name: Build sdist and wheel
         run: uv build

@@ -21,7 +21,12 @@ from .backbones import Interpolation, LayerSelection
 from .datasets import fetch_open_dataset, list_open_datasets
 from .fusion import PoreMaskSpec, XFuse
 from .heads import FusionOptions
-from .io import export_for_openimpala, load_microscopy_file, save_uncertainty_report
+from .io import (
+    export_for_openimpala,
+    export_volume_ome_zarr,
+    load_microscopy_file,
+    save_uncertainty_report,
+)
 from .physics import LossOptions
 from .registration import AlignMode
 from .segment import compute_segmentation_metrics, jbu_guided_baseline
@@ -299,9 +304,19 @@ def _cmd_fuse(
 
 
 def _save_volumetric_report(
-    rep: VolumetricUncertaintyReport, output_path: Path
+    rep: VolumetricUncertaintyReport,
+    output_path: Path,
+    voxel_size_um: float | None = None,
+    active_phase: int = 0,
 ) -> Path:
-    return save_uncertainty_report(rep, output_path)
+    if output_path.name.lower().endswith(".ome.zarr"):
+        return export_volume_ome_zarr(
+            rep,
+            output_path,
+            voxel_size_um=voxel_size_um,
+            active_phase=active_phase,
+        )
+    return save_uncertainty_report(rep, output_path, pixel_size_um=voxel_size_um)
 
 
 def _parse_guide_slice_spec(spec: str) -> tuple[int, Path]:
@@ -347,6 +362,8 @@ def _cmd_fuse_3d(
     device: str = "cpu",
     pore_mask_raw: str | None = None,
     export_openimpala_dir: Path | None = None,
+    export_ome_zarr_path: Path | None = None,
+    voxel_size_um: float | None = None,
     conformal_alpha: float | None = None,
     conformal_method: ConformalMethod = "raps",
     openimpala_phase: int = 0,
@@ -360,6 +377,8 @@ def _cmd_fuse_3d(
         raise ValueError(f"--axial-psf-sigma must be >= 0, got {axial_psf_sigma}.")
     if suggest_next < 0:
         raise ValueError(f"--suggest-next must be >= 0, got {suggest_next}.")
+    if voxel_size_um is not None and voxel_size_um <= 0.0:
+        raise ValueError(f"--voxel-size-um must be > 0, got {voxel_size_um}.")
     if conformal_alpha is not None and not (0.0 < conformal_alpha < 1.0):
         raise ValueError(
             f"--conformal-alpha must lie strictly in (0, 1), got {conformal_alpha}."
@@ -434,7 +453,12 @@ def _cmd_fuse_3d(
         pred_mode=pred_mode,
         pore_mask=pore_spec,
     )
-    saved = _save_volumetric_report(rep, output_path)
+    saved = _save_volumetric_report(
+        rep,
+        output_path,
+        voxel_size_um=voxel_size_um,
+        active_phase=openimpala_phase,
+    )
     recommended: list[int] = []
     if suggest_next > 0:
         plan = suggest_next_slices(
@@ -451,6 +475,14 @@ def _cmd_fuse_3d(
         "suggested_next_slices": recommended,
         "diagnostics": rep.diagnostics,
     }
+    if export_ome_zarr_path is not None:
+        zarr_store = export_volume_ome_zarr(
+            rep,
+            export_ome_zarr_path,
+            voxel_size_um=voxel_size_um,
+            active_phase=openimpala_phase,
+        )
+        summary["ome_zarr_store"] = str(zarr_store)
     if export_openimpala_dir is not None:
         imp_name = _clean_openimpala_stem(output_path, export_openimpala_dir)
         imp_tif, imp_in = export_for_openimpala(
@@ -710,22 +742,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional 3D void mask file, 'auto_otsu', or 'auto_otsu_fringe_guarded'.",
     )
     p_f3d.add_argument(
+        "--export-ome-zarr",
+        type=Path,
+        default=None,
+        help=(
+            "Optional OME-Zarr v0.4 store path exporting calibrated phase "
+            "and conformal labels."
+        ),
+    )
+    p_f3d.add_argument(
+        "--voxel-size-um",
+        type=float,
+        default=None,
+        help=(
+            "Optional isotropic physical voxel spacing in micrometres for 3D output."
+        ),
+    )
+    p_f3d.add_argument(
         "--export-openimpala-dir",
         type=Path,
         default=None,
-        help="Optional directory to export OpenImpala uint8 .tif + AMReX .inputs.",
+        help=(
+            "(Deprecated) Directory to export legacy OpenImpala uint8 .tif "
+            "and AMReX .inputs."
+        ),
     )
     p_f3d.add_argument(
         "--openimpala-phase",
         type=int,
         default=0,
-        help="Active phase ID for OpenImpala tortuosity deck (default: 0 = pore).",
+        help="Active phase ID for phase/conformal envelope export (default: 0 = pore).",
     )
     p_f3d.add_argument(
         "--openimpala-direction",
         choices=["x", "y", "z"],
         default="x",
-        help="Transport axis ('x', 'y', or 'z') for OpenImpala tortuosity deck.",
+        help="Transport axis ('x', 'y', or 'z') for legacy OpenImpala deck.",
     )
     p_f3d.add_argument("--stride", type=int, default=4)
     p_f3d.add_argument("--epochs", type=int, default=12)
@@ -800,6 +852,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             device=args.device,
             pore_mask_raw=args.pore_mask,
             export_openimpala_dir=args.export_openimpala_dir,
+            export_ome_zarr_path=args.export_ome_zarr,
+            voxel_size_um=args.voxel_size_um,
             conformal_alpha=args.conformal_alpha,
             conformal_method=args.conformal_method,
             openimpala_phase=args.openimpala_phase,

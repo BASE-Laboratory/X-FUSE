@@ -1526,10 +1526,13 @@ def render_ablation_figure(
     return out_png
 
 
+_DEFAULT_ZENODO_ROOT = Path.home() / ".cache-xfuse" / "zenodo"
+
+
 def run_design_ablations(
     output_dir: Path,
     artifact_dir: Path | None = None,
-    zenodo_root: Path = Path("/home/antigravity/.cache-xfuse/zenodo"),
+    zenodo_root: Path = _DEFAULT_ZENODO_ROOT,
     backbone: str = "dinov2_vits14",
     pretrained: bool = True,
     stride: int = 7,
@@ -1635,7 +1638,7 @@ def main() -> None:
     p.add_argument(
         "--zenodo-root",
         type=Path,
-        default=Path("/home/antigravity/.cache-xfuse/zenodo"),
+        default=Path.home() / ".cache-xfuse" / "zenodo",
     )
     p.add_argument("--backbone", default="dinov2_vits14")
     p.add_argument("--no-pretrained", action="store_true")

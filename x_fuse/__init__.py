@@ -50,6 +50,7 @@ from .heads import (
 )
 from .io import (
     export_for_openimpala,
+    export_volume_ome_zarr,
     load_microscopy_file,
     load_uncertainty_report,
     save_uncertainty_report,
@@ -214,6 +215,7 @@ __all__ = [
     "suggest_next_slices",
     "suggest_2d_rois",
     "export_for_openimpala",
+    "export_volume_ome_zarr",
     "save_uncertainty_report",
     "load_uncertainty_report",
     "load_microscopy_file",

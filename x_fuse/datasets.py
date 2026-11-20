@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+from basecoat import ChecksumError, fetch_file
 from scipy.ndimage import gaussian_filter
 
 
@@ -326,6 +327,31 @@ def fetch_open_dataset(
             )
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        algo_l = ""
+        expected_hex = ""
+        if ":" in checksum:
+            algo_raw, expected_hex = checksum.split(":", 1)
+            algo_l = algo_raw.lower()
+
+        if (
+            urllib.request.urlretrieve is _ORIG_URLRETRIEVE
+            and algo_l == "sha256"
+            and len(expected_hex.strip()) == 64
+        ):
+            try:
+                fetch_file(
+                    dl_url,
+                    sha256=expected_hex.strip(),
+                    filename=out_path.name,
+                    cache_dir=out_path.parent,
+                    timeout_s=float(timeout),
+                )
+            except ChecksumError as exc:
+                out_path.unlink(missing_ok=True)
+                raise RuntimeError(str(exc)) from exc
+            downloaded.append(out_path)
+            continue
+
         if not out_path.exists():
             part_path = out_path.with_name(out_path.name + ".part")
             try:
@@ -348,17 +374,14 @@ def fetch_open_dataset(
                 part_path.unlink(missing_ok=True)
                 raise
 
-        if ":" in checksum:
-            algo, expected_hex = checksum.split(":", 1)
-            algo_l = algo.lower()
-            if algo_l in ("md5", "sha256"):
-                actual_hex = _stream_hash(out_path, algorithm=algo_l)
-                if actual_hex.lower() != expected_hex.lower():
-                    out_path.unlink(missing_ok=True)
-                    raise RuntimeError(
-                        f"{algo.upper()} mismatch for {fname}: "
-                        f"{expected_hex} != {actual_hex}"
-                    )
+        if algo_l in ("md5", "sha256"):
+            actual_hex = _stream_hash(out_path, algorithm=algo_l)
+            if actual_hex.lower() != expected_hex.lower():
+                out_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"{algo_l.upper()} mismatch for {fname}: "
+                    f"{expected_hex} != {actual_hex}"
+                )
         downloaded.append(out_path)
     return downloaded
 
