@@ -13,17 +13,41 @@ X-FUSE uses a single modality-neutral interface across X-ray, electron, and neut
 
 ```python
 import h5py
-from x_fuse import XFuse, VolumetricFuser, suggest_next_slices
+from x_fuse import XFuse, VolumetricFuser, export_for_openimpala, suggest_next_slices
 
-base = XFuse(backbone="dinov2_vits14", layers="multiscale", stride=4)
+base = XFuse(
+    backbone="dinov2_vits14",
+    layers="multiscale",
+    stride=4,
+    pore_mask="auto_otsu_fringe_guarded",
+    conformal_alpha=0.10,
+    conformal_method="raps",
+)
 vol_fuser = VolumetricFuser(base)
 
 with h5py.File("xct_tomogram.h5", "r") as hf:
     xct_lazy = hf["entry/reconstruction/data"]  # Streamed slice-by-slice!
-    vol_fuser.fit_sparse_slices(xct_lazy, sparse_guides={10: xrd_z10, 50: xrd_z50}, epochs=20)
-    vol_report = vol_fuser.predict_volume(xct_lazy, mode="triplane")
+    vol_fuser.fit_sparse_slices(
+        xct_lazy,
+        sparse_guides={10: xrd_z10, 50: xrd_z50},
+        epochs=20,
+        pore_mask="auto_otsu_fringe_guarded",
+        depth_psf_sigma=1.8,
+        learn_depth_psf=True,
+        triplane_consistency_weight=0.15,
+    )
+    vol_report = vol_fuser.predict_volume(
+        xct_lazy,
+        mode="triplane",
+        sparse_guides={10: xrd_z10, 50: xrd_z50},
+        pred_mode="multiclass",
+        pore_mask="auto_otsu_fringe_guarded",
+    )
 
-# Recommend the next 3 XRD-CT z-slices to scan during live beamtime:
+# Export multi-phase uint8 geometry + conformal envelopes for OpenImpala AMReX PDE transport:
+export_for_openimpala(vol_report, "./openimpala_geom", name="zeolite_pellet", active_phase=0)
+
+# Recommend the next 3 XRD-CT z-slices to scan during live beamtime (1D Voronoi steering):
 plan = suggest_next_slices(vol_report, acquired_indices=[10, 50], k=3, min_spacing=8)
 print("Next XRD-CT slices:", plan.recommended_indices)
 ```
@@ -32,9 +56,10 @@ print("Next XRD-CT slices:", plan.recommended_indices)
 
 ## 2. SEM-BSE + Multi-Element EDS / EBSD
 
-- **Physical Regime**: Backscattered electron micrograph ($I_{\text{HR}}$, $5\text{–}20\,\text{nm}$ pixel) paired with $15\text{–}20\,\text{kV}$ EDS elemental maps ($G_{\text{LR}}$, $\sim 1\text{–}2\,\mu\text{m}$ pear-shaped interaction volume) where higher-energy lines (e.g., Fe-K$\alpha$, Ca-K$\alpha$) have wider effective excitation volumes than low-energy lines (Mg-K$\alpha$, Si-K$\alpha$).
+- **Physical Regime**: Backscattered electron micrograph ($I_{\text{HR}}$, $5\text{–}20\,\text{nm}$ pixel) paired with $15\text{–}20\,\text{kV}$ EDS elemental maps ($G_{\text{LR}}$, $\sim 1\text{–}2\,\mu\text{m}$ pear-shaped interaction volume) where a narrow primary beam core is surrounded by a wide backscattered X-ray excitation skirt, and higher-energy lines (e.g., Fe-K$\alpha$, Ca-K$\alpha$) excite wider volumes than low-energy lines (Mg-K$\alpha$, Si-K$\alpha$).
 - **Recommended Setup**:
-  - Set `learn_psf=True` so `ForwardPSFDownsampler` learns per-element Gaussian interaction-volume widths automatically.
+  - Set `psf_profile="core_halo"` and `learn_psf=True` so `ForwardPSFDownsampler` models both the narrow primary beam core and wide backscattered excitation halo per element.
+  - Set `loss_fn="compositional_kl"` with `guide_residual=True` when fusing calibrated wt%/at% EDS maps on the simplex.
   - Set `tile_size=512` for large-area stitched SEM mosaics ($2048^2\text{–}8192^2$).
 
 ```python
@@ -42,8 +67,13 @@ from x_fuse import XFuse
 
 model = XFuse(
     backbone="dinov2_vitb14_reg",
+    interpolation_mode="cross_attn",
+    fusion_method="spatial_mlp",
     layers="multiscale",
+    loss_fn="compositional_kl",
+    psf_profile="core_halo",
     learn_psf=True,
+    guide_residual=True,
     align_guide="translation",
     tile_size=512,
     tile_overlap=64,
@@ -56,11 +86,11 @@ print("Learned per-element PSF sigmas:", report.diagnostics["psf_sigma_yx_hr_px"
 
 ## 3. HAADF-STEM + Dose-Limited STEM-EDS / Core-Loss EELS
 
-- **Physical Regime**: Rapid, low-dose HAADF survey image ($I_{\text{HR}}$) paired with a coarse-step STEM-EDS or EELS spectrum image ($G_{\text{LR}}$) susceptible to **sample stage drift** during long dwell times.
+- **Physical Regime**: Rapid, low-dose HAADF survey image ($I_{\text{HR}}$) paired with a coarse-step STEM-EDS or 3D core-loss EELS spectrum image ($G_{\text{LR}}$) susceptible to **sample stage drift** and small nanoscale fields of view (`<112 px`).
 - **Recommended Setup**:
   - Load `.emd`, `.dm4`, or `.hspy` vendor files directly via `load_microscopy_file` (`pip install x-fuse[io]`).
-  - Set `align_guide="rigid"` or `"translation"` to compensate sub-pixel specimen drift between the HAADF survey and chemical scan.
-  - Run `suggest_2d_rois` on the resulting `UncertaintyReport` to target high-uncertainty precipitates for fine-step EELS re-acquisition.
+  - For raw 3D `(E, H_lr, W_lr)` EELS/EDS cubes, enable `loss_fn="forward_psf_poisson"`, `spectral_unmix=True`, and `guide_residual=True`; `min_input_size="auto"` automatically bicubic-upscales small nanoscale survey crops before ViT extraction to prevent token starvation.
+  - Set `align_guide="rigid"` or `"translation"` to compensate sub-pixel specimen drift, and run `suggest_2d_rois` to target high-uncertainty precipitates for fine-step EELS re-acquisition.
 
 ```python
 from x_fuse import XFuse, load_microscopy_file, suggest_2d_rois
@@ -69,7 +99,18 @@ haadf, _ = load_microscopy_file("survey_haadf.dm4")
 ti_map, _ = load_microscopy_file("eds_Ti.emd")
 mo_map, _ = load_microscopy_file("eds_Mo.emd")
 
-model = XFuse(backbone="dinov2_vits14", align_guide="rigid", learn_psf=True)
+model = XFuse(
+    backbone="dinov2_vits14",
+    interpolation_mode="cross_attn",
+    fusion_method="spatial_mlp",
+    loss_fn="forward_psf_bce",
+    align_guide="rigid",
+    psf_profile="moffat",
+    learn_psf=True,
+    guide_residual=True,
+    conformal_alpha=0.10,
+    conformal_method="raps",
+)
 report = model.fit_predict(haadf, [ti_map, mo_map], epochs=25)
 
 rois = suggest_2d_rois(report, roi_size=(64, 64), k=3)

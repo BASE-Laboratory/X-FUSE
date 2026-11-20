@@ -165,6 +165,8 @@ def save_uncertainty_report(
             "physical_residual",
             "combined_uncertainty",
         ]
+        if "confidence_margin" in arrays:
+            extra_keys.append("confidence_margin")
         if "unresolved_mask" in arrays:
             extra_keys.append("unresolved_mask")
 
@@ -252,9 +254,17 @@ def save_uncertainty_report(
             )
             return out_path
 
+    if suffix == ".npz":
+        npz_payload: dict[str, Any] = {
+            **arrays,
+            "metadata_json": np.array(json.dumps(meta)),
+        }
+        np.savez_compressed(str(out_path), **npz_payload)
+        return out_path
+
     raise ValueError(
         f"Unsupported output extension for '{out_path}'. "
-        "Supported: .ome.tif, .tif, .h5, .hdf5, .nxs, .zarr."
+        "Supported: .ome.tif, .tif, .h5, .hdf5, .nxs, .zarr, .npz."
     )
 
 
@@ -269,10 +279,23 @@ def _normalize_loaded_arrays(out: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
-    """Load an exported X-FUSE report from ``.h5``, ``.zarr``, or ``.ome.tif``."""
+    """Load an exported X-FUSE report (``.h5``, ``.zarr``, ``.npz``, ``.ome.tif``)."""
     in_path = Path(path)
     suffix = in_path.suffix.lower()
     lower_name = in_path.name.lower()
+
+    if suffix == ".npz":
+        with np.load(in_path, allow_pickle=False) as npz:
+            out_npz: dict[str, Any] = {
+                k: np.asarray(npz[k]) for k in npz.files if k != "metadata_json"
+            }
+            raw_meta_npz = (
+                str(npz["metadata_json"].item())
+                if "metadata_json" in npz.files
+                else "{}"
+            )
+            out_npz["metadata"] = json.loads(raw_meta_npz)
+        return _normalize_loaded_arrays(out_npz)
 
     if suffix in (".h5", ".hdf5", ".nxs"):
         with h5py.File(in_path, "r") as hf:
@@ -326,14 +349,21 @@ def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
                     meta_dict = json.loads(unesc)
 
         spatial_shape = meta_dict.get("spatial_shape")
-        if (
-            isinstance(spatial_shape, list)
-            and len(spatial_shape) == 3
-            and stack.ndim == 3
-            and spatial_shape[0] == 1
-        ):
-            # Restore Z=1 axis squeezed by OME-TIFF reader on single-slice 3D reports
-            stack = stack[:, np.newaxis, :, :]
+        if isinstance(spatial_shape, list) and len(spatial_shape) == 3:
+            z_s, y_s, x_s = (
+                int(spatial_shape[0]),
+                int(spatial_shape[1]),
+                int(spatial_shape[2]),
+            )
+            if stack.ndim == 3 and z_s == 1:
+                stack = stack[:, np.newaxis, :, :]
+            elif (
+                stack.ndim == 3
+                and z_s > 1
+                and stack.shape[0] % z_s == 0
+                and tuple(stack.shape[1:]) == (y_s, x_s)
+            ):
+                stack = stack.reshape(stack.shape[0] // z_s, z_s, y_s, x_s)
 
         result: dict[str, Any] = {"stack": stack, "metadata": meta_dict}
         layout = meta_dict.get("stack_layout")
@@ -351,8 +381,9 @@ def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
 def load_microscopy_file(
     path: str | Path, signal_index: int = 0
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Load a microscopy dataset (``.tif``, ``.npy``, ``.h5``, or vendor formats
-    such as ``.emd``, ``.dm3``/``.dm4``, ``.bcf``, ``.hspy`` via RosettaSciIO).
+    """Load a microscopy dataset (``.tif``, ``.npy``, ``.npz``, ``.h5``/``.nxs``,
+    or vendor formats such as ``.emd``, ``.dm3``/``.dm4``, ``.bcf``, ``.hspy``
+    via RosettaSciIO).
 
     Returns:
         ``(data_float32, metadata_dict)``.
@@ -366,6 +397,49 @@ def load_microscopy_file(
         arr = np.load(in_path).astype(np.float32)
         return arr, {"format": "npy", "shape": list(arr.shape)}
 
+    if suffix == ".npz":
+        with np.load(in_path, allow_pickle=False) as npz:
+            arr_keys = [k for k in npz.files if k != "metadata_json"]
+            if not arr_keys:
+                raise ValueError(f"No array entries found in {in_path}.")
+            chosen_k = arr_keys[max(0, min(int(signal_index), len(arr_keys) - 1))]
+            arr = np.asarray(npz[chosen_k], dtype=np.float32)
+        return arr, {"format": "npz", "key": chosen_k, "shape": list(arr.shape)}
+
+    if suffix in (".h5", ".hdf5", ".nxs"):
+        with h5py.File(in_path, "r") as hf:
+            preferred = ("data", "entry/data", "xfuse_report/probabilities")
+            if int(signal_index) == 0:
+                for pk in preferred:
+                    if (
+                        pk in hf
+                        and isinstance(hf[pk], h5py.Dataset)
+                        and hf[pk].ndim >= 2
+                    ):
+                        arr = np.asarray(hf[pk], dtype=np.float32)
+                        return arr, {
+                            "format": suffix.lstrip("."),
+                            "dataset": pk,
+                            "shape": list(arr.shape),
+                        }
+            ds_list: list[tuple[str, h5py.Dataset]] = []
+
+            def _collect(name: str, obj: Any) -> None:
+                if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
+                    ds_list.append((name, obj))
+
+            hf.visititems(_collect)
+            if not ds_list:
+                raise ValueError(f"No >=2D dataset found in HDF5 file: {in_path}")
+            idx_c = max(0, min(int(signal_index), len(ds_list) - 1))
+            ds_name, ds_obj = ds_list[idx_c]
+            arr = np.asarray(ds_obj, dtype=np.float32)
+        return arr, {
+            "format": suffix.lstrip("."),
+            "dataset": ds_name,
+            "shape": list(arr.shape),
+        }
+
     if suffix in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
         try:
             import tifffile  # type: ignore[import-not-found]
@@ -373,7 +447,7 @@ def load_microscopy_file(
             if suffix in (".tif", ".tiff"):
                 arr = tifffile.imread(in_path).astype(np.float32)
                 return arr, {"format": "tiff", "shape": list(arr.shape)}
-        except ImportError:
+        except (ImportError, ValueError):
             pass
         with Image.open(in_path) as im:
             arr = np.array(im, dtype=np.float32)
@@ -423,3 +497,164 @@ def _import_rsciio_reader(suffix: str) -> Any:
             f"Reading '{suffix}' files requires RosettaSciIO. "
             "Install optional microscopy I/O dependencies via `pip install x-fuse[io]`."
         ) from exc
+
+
+def _write_uncompressed_uint8_3d_tiff(path: Path, vol_u8: np.ndarray) -> None:
+    try:
+        import tifffile  # type: ignore[import-not-found]
+
+        tifffile.imwrite(
+            path,
+            vol_u8,
+            photometric="minisblack",
+            compression=None,
+        )
+    except ImportError:
+        frames = [Image.fromarray(vol_u8[z], mode="L") for z in range(vol_u8.shape[0])]
+        frames[0].save(path, save_all=True, append_images=frames[1:], compression=None)
+
+
+def export_for_openimpala(
+    vol_report_or_mask: Any,
+    output_dir: str | Path,
+    name: str = "sample",
+    active_phase: int = 0,
+    direction: str = "x",
+    max_grid_size: int = 64,
+    export_conformal_bounds: bool = True,
+) -> tuple[Path, Path]:
+    """Export a 3D multi-phase chemical segmentation volume (plus optional
+    ``(1 - alpha)`` conformal lower/upper phase-envelope geometries) as an
+    uncompressed ``uint8`` 3D TIFF and AMReX ``ParmParse`` ``.inputs`` deck
+    directly compatible with ``OpenImpala`` (matching ``OpenLSR-X`` conventions).
+    """
+    import math
+
+    import torch
+
+    if direction not in ("x", "y", "z"):
+        raise ValueError(f"direction must be 'x', 'y', or 'z'; got '{direction}'.")
+    act = int(active_phase)
+    if not (0 <= act <= 255):
+        raise ValueError(f"active_phase must lie in [0, 255], got {active_phase}.")
+
+    probs_np: np.ndarray | None = None
+    conf_hw_np: np.ndarray | None = None
+    if isinstance(vol_report_or_mask, VolumetricUncertaintyReport):
+        raw_mask = vol_report_or_mask.hard_mask.detach().cpu().numpy()
+        # Map negative abstained voxels (-1) to 255 rather than 0 (pore/void)
+        labeled = np.where(raw_mask < 0, 255, np.clip(raw_mask, 0, 255)).astype(
+            np.uint8
+        )
+        probs_np = vol_report_or_mask.probabilities.detach().cpu().float().numpy()
+        pred_sets = (
+            vol_report_or_mask.prediction_sets.detach().cpu().numpy().astype(bool)
+            if vol_report_or_mask.prediction_sets is not None
+            else None
+        )
+        conf_hw_np = (
+            vol_report_or_mask.conformal_interval_halfwidth.detach()
+            .cpu()
+            .float()
+            .numpy()
+            if vol_report_or_mask.conformal_interval_halfwidth is not None
+            else None
+        )
+    elif isinstance(vol_report_or_mask, torch.Tensor):
+        raw_mask = vol_report_or_mask.detach().cpu().numpy()
+        labeled = np.where(raw_mask < 0, 255, np.clip(raw_mask, 0, 255)).astype(
+            np.uint8
+        )
+        pred_sets = None
+    else:
+        raw_mask = np.asarray(vol_report_or_mask)
+        labeled = np.where(raw_mask < 0, 255, np.clip(raw_mask, 0, 255)).astype(
+            np.uint8
+        )
+        pred_sets = None
+
+    if labeled.ndim != 3:
+        raise ValueError(
+            f"Expected 3D (D, H, W) volume for OpenImpala export, got {labeled.shape}."
+        )
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tiff_path = out_dir / f"{name}.tif"
+    inputs_path = out_dir / f"{name}_openimpala.inputs"
+
+    _write_uncompressed_uint8_3d_tiff(tiff_path, labeled)
+
+    d_sz, h_sz, w_sz = (
+        int(labeled.shape[0]),
+        int(labeled.shape[1]),
+        int(labeled.shape[2]),
+    )
+    blocking = max(1, math.gcd(math.gcd(w_sz, h_sz), math.gcd(d_sz, 8)))
+    eff_max_grid = max(blocking, (max(1, int(max_grid_size)) // blocking) * blocking)
+
+    deck_lines = [
+        "# Auto-generated by X-FUSE for OpenImpala v5.0 (AMReX / HYPRE)",
+        'eb2.geom_type = "tiff"',
+        f'torteff.tiff_filename = "{tiff_path.name}"',
+        f"torteff.phase = {act}",
+        f'torteff.direction = "{direction}"',
+        f"amr.n_cell = {w_sz} {h_sz} {d_sz}",
+        f"amr.blocking_factor = {blocking}",
+        f"amr.max_grid_size = {eff_max_grid}",
+        "torteff.verbose = 1",
+    ]
+
+    if export_conformal_bounds and pred_sets is not None:
+        is_multiclass = (
+            probs_np is not None
+            and probs_np.shape[0] >= 2
+            and pred_sets.shape[0] == probs_np.shape[0]
+            and float(np.max(np.abs(np.sum(probs_np, axis=0) - 1.0))) < 1e-3
+        )
+        in_lower: np.ndarray | None = None
+        in_upper: np.ndarray | None = None
+        if is_multiclass and act < pred_sets.shape[0]:
+            set_sizes = pred_sets.sum(axis=0)
+            in_lower = pred_sets[act] & (set_sizes == 1)
+            in_upper = pred_sets[act]
+        elif not is_multiclass and act <= pred_sets.shape[0]:
+            # Multilabel: hard_mask uses 0=background/pore and 1..M=channel m+1
+            if act == 0:
+                in_lower = ~np.any(pred_sets, axis=0)
+                if (
+                    probs_np is not None
+                    and conf_hw_np is not None
+                    and conf_hw_np.shape == probs_np.shape
+                ):
+                    in_upper = np.all((probs_np - conf_hw_np) < 0.5, axis=0)
+                else:
+                    in_upper = in_lower | (labeled == 0)
+            else:
+                ch_idx = act - 1
+                in_upper = pred_sets[ch_idx]
+                if (
+                    probs_np is not None
+                    and conf_hw_np is not None
+                    and ch_idx < conf_hw_np.shape[0]
+                ):
+                    in_lower = (
+                        (probs_np[ch_idx] - conf_hw_np[ch_idx]) >= 0.5
+                    ) & in_upper
+                else:
+                    in_lower = in_upper & (labeled == act)
+
+        if in_lower is not None and in_upper is not None:
+            complement_val = np.uint8(1 if act == 0 else 0)
+            act_val = np.uint8(act)
+            lower_u8 = np.where(in_lower, act_val, complement_val).astype(np.uint8)
+            upper_u8 = np.where(in_upper, act_val, complement_val).astype(np.uint8)
+            lower_tif = out_dir / f"{name}_phase{act}_lower.tif"
+            upper_tif = out_dir / f"{name}_phase{act}_upper.tif"
+            _write_uncompressed_uint8_3d_tiff(lower_tif, lower_u8)
+            _write_uncompressed_uint8_3d_tiff(upper_tif, upper_u8)
+            deck_lines.append(f'# Conformal lower envelope: "{lower_tif.name}"')
+            deck_lines.append(f'# Conformal upper envelope: "{upper_tif.name}"')
+
+    inputs_path.write_text("\n".join(deck_lines) + "\n", encoding="utf-8")
+    return tiff_path, inputs_path

@@ -13,9 +13,12 @@ jobs:
   verify:
     name: Verify Quality Gates & Version Match
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -29,13 +32,19 @@ jobs:
           --index-strategy unsafe-best-match
           --extra-index-url https://download.pytorch.org/whl/cpu
 
-      - name: Check tag matches x_fuse.__version__
+      - name: Check tag matches x_fuse.__version__, pyproject.toml & CITATION.cff
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG_VER="${GITHUB_REF_NAME#v}"
-          PKG_VER="$(uv run python -c 'import x_fuse; print(x_fuse.__version__)')"
-          echo "Tag version: ${TAG_VER}, Package version: ${PKG_VER}"
-          test "${TAG_VER}" = "${PKG_VER}"
+          uv run python -c '
+          import importlib.metadata, pathlib, re, sys, x_fuse
+          tag = sys.argv[1]
+          meta_v = importlib.metadata.version("x-fuse")
+          cff_m = re.search(r"^version:\s*(\S+)", pathlib.Path("CITATION.cff").read_text(), re.M)
+          cff_v = cff_m.group(1).strip("\"'") if cff_m else ""
+          print(f"Tag={tag}, __version__={x_fuse.__version__}, metadata={meta_v}, CITATION.cff={cff_v}")
+          assert tag == x_fuse.__version__ == meta_v == cff_v
+          ' "${TAG_VER}"
 
       - name: Run Ruff, Mypy, Docs & Coverage Test Gates
         run: |
@@ -49,6 +58,11 @@ jobs:
     name: Build Distributions
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +72,18 @@ jobs:
 
       - name: Build sdist and wheel
         run: uv build
+
+      - name: Smoke-test built wheel outside repo
+        run: |
+          uv venv /tmp/xfuse-rel-wheel
+          uv pip install --python /tmp/xfuse-rel-wheel \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --index-strategy unsafe-best-match \
+            dist/*.whl
+          cd /tmp
+          /tmp/xfuse-rel-wheel/bin/xfuse --version
+          /tmp/xfuse-rel-wheel/bin/xfuse info
+          /tmp/xfuse-rel-wheel/bin/xfuse demo --epochs 2
 
       - uses: actions/upload-artifact@v4
         with:
@@ -101,6 +127,4 @@ jobs:
 
       - name: Publish distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
 

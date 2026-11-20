@@ -28,7 +28,10 @@ jobs:
           enable-cache: true
 
       - name: Install documentation dependencies
-        run: uv sync --extra cpu --extra io --extra docs
+        run: >-
+          uv sync --extra cpu --extra io --extra docs
+          --index-strategy unsafe-best-match
+          --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Verify strict documentation build
         run: uv run mkdocs build --strict

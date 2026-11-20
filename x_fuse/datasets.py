@@ -5,10 +5,12 @@ experimental hold-out downsampling utilities for quantitative benchmarking.
 import hashlib
 import json
 import os
+import urllib.error
 import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from scipy.ndimage import gaussian_filter
@@ -25,6 +27,7 @@ class OpenCorrelativeDataset:
     zenodo_record_id: str
     doi: str
     description: str
+    default_filenames: tuple[str, ...] | None = None
 
 
 OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
@@ -33,13 +36,14 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
         title="EPFL edxia Cementitious Microstructure SEM-BSE + EDS Hypermaps",
         hr_modality="SEM-BSE",
         guide_modality="Multi-Element EDS (Ca, Si, Al, Fe, Mg, S)",
-        zenodo_record_id="3686067",
-        doi="10.5281/zenodo.3686067",
+        zenodo_record_id="3862958",
+        doi="10.5281/zenodo.3862958",
         description=(
-            "Aligned backscattered electron (BSE) micrographs and multi-element "
-            "EDS maps of cementitious materials; benchmarked against Joint "
+            "Aligned backscattered electron (BSE) micrographs and calibrated wt% "
+            "multi-element EDS maps (LC3 cement) benchmarked against Joint "
             "Bilateral Filtering in Georget et al., Cem. Concr. Res. (2021)."
         ),
+        default_filenames=("edxia_examples.zip",),
     ),
     "refractory_alloy_bse_eds_ebsd": OpenCorrelativeDataset(
         key="refractory_alloy_bse_eds_ebsd",
@@ -52,6 +56,7 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
             "Full-resolution BSE micrographs paired with EDAX HDF5 EDS hypermaps "
             "and EBSD phase clustering for multiphase refractory alloys."
         ),
+        default_filenames=("S3_nano.zip",),
     ),
     "ti_rcca_stem_eds": OpenCorrelativeDataset(
         key="ti_rcca_stem_eds",
@@ -64,6 +69,7 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
             "Nanoscale HAADF-STEM structural micrographs paired with Ti, Mo, Ta, "
             "Cr, and Al STEM-EDS elemental TIFF maps."
         ),
+        default_filenames=("Fig3_TEM_STEM.zip",),
     ),
     "cuzn_stem_eels": OpenCorrelativeDataset(
         key="cuzn_stem_eels",
@@ -76,19 +82,66 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
             "Simultaneously acquired HAADF survey image and Cu/Zn L-edge EELS "
             "spectrum image on carbon nanotubes (HyperSpy / eXSpy archive)."
         ),
+        default_filenames=("CuZn_HAADF.hspy", "CuZn_EELS_mapping_tutorial.hspy"),
     ),
     "isis_imat_bragg_edge": OpenCorrelativeDataset(
         key="isis_imat_bragg_edge",
-        title="ISIS IMAT Multi-Metal Rod Phantom ToF Neutron Bragg-Edge CT",
-        hr_modality="White-Beam Neutron Attenuation CT",
+        title="ISIS IMAT Multi-Metal Rod Phantom White-Beam Neutron Sinograms",
+        hr_modality="White-Beam Neutron Attenuation Sinograms / CT",
         guide_modality=(
-            "Wavelength-Resolved ToF Bragg-Edge Phase Maps (Al, Fe, Cu, Ni, Zn)"
+            "Multi-Metal Rod Phantom (Al, Fe, Cu, Ni, Zn) Attenuation Projections"
         ),
         zenodo_record_id="4273969",
         doi="10.5281/zenodo.4273969",
         description=(
-            "Time-of-flight neutron tomography of high-purity Al, Fe, Cu, Ni, and "
-            "Zn cylinders at ISIS IMAT (Jørgensen, Burca, Ametova et al., 2021)."
+            "Golden-ratio white-beam neutron projections of high-purity Al, Fe, Cu, "
+            "Ni, and Zn cylinders at ISIS IMAT (Jørgensen, Burca, Ametova et al., "
+            "2021)."
+        ),
+        default_filenames=("imat_rod_phantom_white_beam.zip",),
+    ),
+    "diad_zn13x_xrdct": OpenCorrelativeDataset(
+        key="diad_zn13x_xrdct",
+        title="Diamond Light Source K11 DIAD Multi-Length Zn-13X Zeolite XRD-CT",
+        hr_modality="Synchrotron XCT (0.54–2.6 µm)",
+        guide_modality=(
+            "Multi-Length XRD-CT (20 × 50 µm Volume + 4 × 25 µm ROI, Na-13X & Zn-13X)"
+        ),
+        zenodo_record_id="13329639",
+        doi="10.5281/zenodo.13329639",
+        description=(
+            "Correlative multi-beamsize K11 DIAD XRD-CT reconstructions (20 scans at "
+            "50 µm across the full ion-exchange reaction front + 4 paired ROI scans "
+            "at 25 µm for real hardware validation) of partially Zn-exchanged Na-13X "
+            "zeolite pellets."
+        ),
+        default_filenames=tuple(
+            f"output_{sid}_{ph}.nxs"
+            for sid in (
+                *range(43322, 43326),
+                *range(43336, 43348),
+                *range(43393, 43401),
+            )
+            for ph in ("na", "zn")
+        ),
+    ),
+    "diad_zn13x_powder_xrd": OpenCorrelativeDataset(
+        key="diad_zn13x_powder_xrd",
+        title="Zn-13X & Na-13X Zeolite High-Resolution Cu-Kα Powder XRD References",
+        hr_modality="High-Resolution Cu-Kα Powder Diffraction",
+        guide_modality="Reference Bragg Profiles (Na-13X, Zn-13X, Empty Capillary)",
+        zenodo_record_id="13329670",
+        doi="10.5281/zenodo.13329670",
+        description=(
+            "Rigaku high-resolution 2-Theta/Omega powder XRD patterns of pure Na-13X, "
+            "Zn-exchanged 13X, and empty capillary background for phase dictionary "
+            "and continuum calibration."
+        ),
+        default_filenames=(
+            "13Xhighres_2-Theta_Omega.asc",
+            "Zn13X15minhighres_2-Theta_Omega.asc",
+            "Zn13Xhighres_2-Theta_Omega.asc",
+            "empty_cap_2-Theta_Omega.asc",
         ),
     ),
 }
@@ -140,7 +193,12 @@ def get_sample_dataset_path(name: str = "Zn13X") -> Path:
     search_roots = []
     if "XFUSE_DATA_DIR" in os.environ:
         search_roots.append((_user_data_root() / "samples").resolve())
-    search_roots.append((get_repo_root() / "data" / "samples").resolve())
+    repo_root = get_repo_root()
+    repo_samples = (repo_root / "data" / "samples").resolve()
+    if "site-packages" not in repo_root.parts and (
+        _is_source_checkout() or repo_samples.exists()
+    ):
+        search_roots.append(repo_samples)
     user_samples = (_user_data_root() / "samples").resolve()
     if user_samples not in search_roots:
         search_roots.append(user_samples)
@@ -173,9 +231,14 @@ def fetch_open_dataset(
     dest_root: str | Path | None = None,
     filenames: Iterable[str] | None = None,
     timeout: float = 60.0,
+    use_default_subset: bool = True,
 ) -> list[Path]:
     """Download files for a registered Zenodo dataset with HTTPS, path-traversal,
     timeout, and streaming checksum verification.
+
+    When ``filenames is None`` and ``use_default_subset=True``, automatically
+    restricts downloads to ``meta.default_filenames`` if those files are present
+    in the Zenodo record (avoiding multi-gigabyte unrelated archives).
     """
     if dataset_key not in OPEN_DATASETS:
         raise KeyError(
@@ -191,13 +254,54 @@ def fetch_open_dataset(
     target_dir.mkdir(parents=True, exist_ok=True)
     target_dir_resolved = target_dir.resolve()
 
+    expected_local = (
+        list(filenames)
+        if filenames is not None
+        else (
+            list(meta.default_filenames)
+            if (use_default_subset and meta.default_filenames is not None)
+            else []
+        )
+    )
     api_url = f"https://zenodo.org/api/records/{meta.zenodo_record_id}"
-    with urllib.request.urlopen(api_url, timeout=min(float(timeout), 30.0)) as resp:
-        record = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(api_url, timeout=min(float(timeout), 30.0)) as resp:
+            record = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError:
+        if expected_local:
+            cached: list[Path] = []
+            for fn in expected_local:
+                rel_p = Path(fn)
+                if rel_p.is_absolute() or ".." in rel_p.parts:
+                    raise ValueError(f"Unsafe cached filename '{fn}'.") from None
+                cand_p = (target_dir_resolved / rel_p).resolve()
+                if cand_p.is_relative_to(target_dir_resolved) and cand_p.is_file():
+                    cached.append(cand_p)
+            if len(cached) == len(expected_local):
+                return cached
+        existing = sorted(
+            p
+            for p in target_dir_resolved.iterdir()
+            if p.is_file() and not p.name.endswith(".part")
+        )
+        if existing and not expected_local:
+            return existing
+        raise
 
-    wanted = set(filenames) if filenames is not None else None
+    record_files = record.get("files", [])
+    record_keys = {str(fe.get("key", "")) for fe in record_files}
+    if filenames is not None:
+        wanted: set[str] | None = set(filenames)
+    elif (
+        use_default_subset
+        and meta.default_filenames is not None
+        and any(fn in record_keys for fn in meta.default_filenames)
+    ):
+        wanted = set(meta.default_filenames)
+    else:
+        wanted = None
     downloaded: list[Path] = []
-    for f_entry in record.get("files", []):
+    for f_entry in record_files:
         fname = str(f_entry["key"])
         if wanted is not None and fname not in wanted:
             continue
@@ -266,6 +370,7 @@ def make_experimental_holdout(
     psf_sigma: float | None = None,
     poisson_counts: float | None = None,
     seed: int = 0,
+    beam_profile: Literal["gaussian", "moffat", "core_halo", "boxcar"] = "gaussian",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create a realistic coarse-guide input from a full-resolution experimental
     chemical/crystallographic map (e.g., STEM-EDS, SEM-EDS, EELS, Bragg-edge) so
@@ -276,18 +381,30 @@ def make_experimental_holdout(
         hr_image: High-resolution structural image ``(H, W)`` or ``(C, H, W)``.
         full_guide_map: Full-resolution guide map ``(H, W)`` or ``(M, H, W)``.
         factor: Spatial binning / coarse step ratio (>= 1).
-        psf_sigma: Gaussian interaction-volume / probe blur sigma in HR pixels
+        psf_sigma: Characteristic probe / interaction-volume blur width in HR pixels
             (defaults to ``0.5 * factor``).
         poisson_counts: Optional mean photon/electron count per coarse pixel to
             simulate low-dose shot noise.
         seed: Random seed for reproducible Poisson noise.
+        beam_profile: Physical probe kernel shape: ``"gaussian"`` (default),
+            ``"moffat"`` (heavy-tailed Lorentzian/Moffat synchrotron/EDS wings
+            ``(1 + r^2 / alpha^2)^(-beta)``), ``"core_halo"`` (two-Gaussian primary
+            core + wide backscattered SEM/EDS halo), or ``"boxcar"`` (pure flat
+            detector/slit integration without pre-blur).
 
     Returns:
         Tuple ``(hr_cropped, coarse_guide, gt_guide_cropped)`` where spatial
         dimensions are cropped to exact multiples of ``factor``.
     """
+    from scipy.ndimage import convolve
+
     if factor < 1:
         raise ValueError(f"factor must be >= 1, got {factor}")
+    if beam_profile not in ("gaussian", "moffat", "core_halo", "boxcar"):
+        raise ValueError(
+            f"Unsupported beam_profile {beam_profile!r}; "
+            "expected 'gaussian', 'moffat', 'core_halo', or 'boxcar'."
+        )
 
     guide = np.asarray(full_guide_map, dtype=np.float32)
     squeeze_guide = False
@@ -311,12 +428,28 @@ def make_experimental_holdout(
 
     sigma = 0.5 * factor if psf_sigma is None and factor > 1 else (psf_sigma or 0.0)
     blurred = np.empty_like(guide_crop)
-    for m in range(guide_crop.shape[0]):
-        blurred[m] = (
-            gaussian_filter(guide_crop[m], sigma=sigma, mode="nearest")
-            if sigma > 0
-            else guide_crop[m]
+    if beam_profile == "boxcar" or sigma <= 0:
+        blurred[:] = guide_crop
+    elif beam_profile == "moffat":
+        rad = max(1, int(round(3.0 * sigma)))
+        yy, xx = np.meshgrid(
+            np.arange(-rad, rad + 1, dtype=np.float32),
+            np.arange(-rad, rad + 1, dtype=np.float32),
+            indexing="ij",
         )
+        alpha_m = max(float(sigma) * 0.85, 0.25)
+        kern = (1.0 + (yy**2 + xx**2) / (alpha_m**2)) ** (-1.75)
+        kern = (kern / kern.sum()).astype(np.float32)
+        for m in range(guide_crop.shape[0]):
+            blurred[m] = convolve(guide_crop[m], kern, mode="nearest")
+    elif beam_profile == "core_halo":
+        for m in range(guide_crop.shape[0]):
+            core = gaussian_filter(guide_crop[m], sigma=sigma, mode="nearest")
+            halo = gaussian_filter(guide_crop[m], sigma=3.0 * sigma, mode="nearest")
+            blurred[m] = 0.72 * core + 0.28 * halo
+    else:
+        for m in range(guide_crop.shape[0]):
+            blurred[m] = gaussian_filter(guide_crop[m], sigma=sigma, mode="nearest")
 
     # Physical box-integration / average-pooling onto coarse dwell grid
     n_m = blurred.shape[0]

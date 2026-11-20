@@ -1,22 +1,17 @@
-"""End-to-end paper benchmark & ablation runner for X-FUSE (v0.5 / v1.0).
+"""End-to-end paper benchmark & ablation runner for X-FUSE.
 
-Executes:
-1. **Multi-Scale & Layer-Pyramid Super-Resolution Ablation** (Bicubic vs.
-   Classical JBU vs. ViT+K-Means vs. X-FUSE Last-Layer vs. X-FUSE Multi-Scale).
-2. **Sub-Pixel Drift & Learnable Anisotropic PSF Recovery** (evaluating
-   ``DifferentiableGuideAligner`` + ``learn_psf=True`` under controlled shifts).
-3. **Closed-Loop Active Sparse-Slice Tomography** (Random vs. Uniform vs.
-   X-FUSE ``suggest_next_slices`` beamtime efficiency curve).
-4. **Bundled Synchrotron Benchmarks** (``Zn13X`` slices 4 & 9, plus tiled
-   ``MOR-GIS`` hold-out evaluation) and optional **Zenodo Open-Dataset Suite**.
-
-Usage:
-    # Fast offline CPU verification + vector PDF/PNG figure generation:
-    uv run python -m benchmarks.run_paper_benchmarks --quick
-
-    # Full GPU pretrained paper sweep:
-    uv run python -m benchmarks.run_paper_benchmarks \\
-        --backbone dinov2_vitb14_reg --pretrained --device cuda --download-zenodo
+Executes fair, scale-preserving (`guide_normalization="preserve_counts"`),
+mismatched-PSF (`beam_profile="moffat"`) comparisons across the complete
+baseline suite (Otsu, Bicubic, JBU, Gram-Schmidt, CNMF, Guided TV, SIREN INR,
+and X-FUSE):
+1. **Resolution-Gap Super-Resolution Sweep** (reporting both mIoU and BF1 for
+   every baseline).
+2. **Sub-Pixel Drift & Learnable Anisotropic PSF Recovery**.
+3. **Closed-Loop Active Sparse-Slice Tomography**.
+4. **Oriented Lamellar Microstructure, FIB Artifact Corruption, Poisson
+   Spectral Unmixing, & Cross-Specimen LAC Conformal Calibration**.
+5. **Quantitative Real Synchrotron Validation on Diamond DIAD `Zn13X`**
+   (16x Moffat hold-out super-resolution + zero-shot cross-slice transfer).
 """
 
 from __future__ import annotations
@@ -28,6 +23,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.ndimage import shift as nd_shift
 
 from x_fuse import (
@@ -38,13 +34,13 @@ from x_fuse import (
     bicubic_upsample_baseline,
     brier_score,
     compute_segmentation_metrics,
-    dino_kmeans_baseline,
     empirical_conformal_coverage,
     expected_calibration_error,
+    generate_artifact_corrupted_phantom_2d,
     generate_correlative_phantom_2d,
     generate_correlative_phantom_3d,
+    generate_oriented_lamellar_phantom_2d,
     generate_spectral_cube_phantom_2d,
-    generate_textured_isointensity_phantom_2d,
     jbu_guided_baseline,
     make_experimental_holdout,
     sparsification_curve,
@@ -73,7 +69,7 @@ def _inject_shifted_coarse_guide(
     psf_sigma_hr: float,
 ) -> np.ndarray:
     """Shift ground-truth HR phase maps by ``shift_x_hr_px`` along +X, then apply
-    physical PSF downsampling to simulate beam/stage drift in ``G_LR``.
+    mismatched Moffat PSF downsampling to simulate beam/stage drift in ``G_LR``.
     """
     shifted = np.stack(
         [
@@ -84,7 +80,11 @@ def _inject_shifted_coarse_guide(
     )
     dummy_hr = np.zeros(gt_phase_channels.shape[1:], dtype=np.float32)
     _, coarse, _ = make_experimental_holdout(
-        dummy_hr, shifted, factor=factor, psf_sigma=psf_sigma_hr
+        dummy_hr,
+        shifted,
+        factor=factor,
+        psf_sigma=psf_sigma_hr,
+        beam_profile="moffat",
     )
     return coarse
 
@@ -99,10 +99,11 @@ def run_paper_benchmarks(
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     img_size = 64 if quick else 128
-    stride = 8 if quick else 4
-    epochs = 8 if quick else 30
-    tta_shifts: tuple[int, ...] = () if quick else (1, 2)
+    stride = 8 if quick else 7
+    epochs = 8 if quick else 32
+    tta_shifts: tuple[int, ...] = ()
     factors = [4, 8] if quick else [4, 8, 16]
+    norm = "preserve_counts"
 
     results: dict[str, Any] = {
         "config": {
@@ -112,6 +113,8 @@ def run_paper_benchmarks(
             "device": device,
             "stride": stride,
             "epochs": epochs,
+            "beam_profile": "moffat",
+            "guide_normalization": norm,
         },
         "ablation_resolution_sweep": [],
         "drift_and_psf_ablation": [],
@@ -121,7 +124,7 @@ def run_paper_benchmarks(
         "zenodo_holdouts": {},
     }
 
-    # 1. Resolution-Gap, Competing Field Baselines & Multi-Scale Layer Ablation
+    # 1. Resolution-Gap Sweep (Mismatched Moffat PSF, All Baselines, Fair Scale)
     for factor in factors:
         ph = generate_correlative_phantom_2d(
             size=img_size,
@@ -129,44 +132,55 @@ def run_paper_benchmarks(
             phase_b_contrast=0.35,
             hr_noise_std=0.03,
             poisson_counts=300.0,
+            beam_profile="moffat",
             seed=42,
         )
         gt = ph.gt_labels
-        otsu = otsu_threshold_baseline(ph.hr_image, ph.coarse_guide, mode="multiclass")
-        bic = bicubic_upsample_baseline(
-            ph.coarse_guide, (img_size, img_size), mode="multiclass"
+        otsu = otsu_threshold_baseline(
+            ph.hr_image, ph.coarse_guide, mode="multiclass", guide_normalization=norm
         )
-        jbu = jbu_guided_baseline(ph.hr_image, ph.coarse_guide, mode="multiclass")
+        bic = bicubic_upsample_baseline(
+            ph.coarse_guide,
+            (img_size, img_size),
+            mode="multiclass",
+            guide_normalization=norm,
+        )
+        jbu = jbu_guided_baseline(
+            ph.hr_image, ph.coarse_guide, mode="multiclass", guide_normalization=norm
+        )
         gs = gram_schmidt_pansharpen_baseline(
-            ph.hr_image, ph.coarse_guide, mode="multiclass"
+            ph.hr_image, ph.coarse_guide, mode="multiclass", guide_normalization=norm
         )
         cnmf = cnmf_pansharpen_baseline(
             ph.hr_image,
             ph.coarse_guide,
             mode="multiclass",
             n_iters=15 if quick else 35,
+            guide_normalization=norm,
         )
         gtv = guided_variational_sr_baseline(
             ph.hr_image,
             ph.coarse_guide,
             mode="multiclass",
-            n_steps=20 if quick else 70,
+            n_steps=20 if quick else 60,
             device=device,
+            guide_normalization=norm,
         )
         inr = coordinate_inr_baseline(
             ph.hr_image,
             ph.coarse_guide,
             mode="multiclass",
-            hidden_dim=32 if quick else 64,
-            epochs=20 if quick else 80,
+            hidden_dim=32 if quick else 48,
+            epochs=20 if quick else 65,
             device=device,
+            guide_normalization=norm,
         )
 
         m_last = XFuse(
             backbone=backbone,
             stride=stride,
             dtype=torch.float32,
-            loss_fn="forward_psf_bce",
+            loss_fn="compositional_kl",
             interpolation_mode="jbu",
             layers="last",
             pretrained=pretrained,
@@ -179,23 +193,18 @@ def run_paper_benchmarks(
             epochs=epochs,
             mode="multiclass",
             tta_shifts=tta_shifts,
+            guide_normalization=norm,
         )
-
-        # Extract raw ViT features via compositional backbone_extractor for K-Means
-        hr_prep, (oh, ow) = m_last._prepare_high_level_hr(ph.hr_image)
-        raw_feats = m_last.backbone_extractor.forward_sequential(hr_prep)[
-            :, :, :oh, :ow
-        ]
-        km = dino_kmeans_baseline(raw_feats, ph.coarse_guide, n_clusters=3)
 
         m_multi = XFuse(
             backbone=backbone,
             stride=stride,
             dtype=torch.float32,
-            loss_fn="forward_psf_bce",
+            loss_fn="compositional_kl",
             interpolation_mode="cross_attn",
             fusion_method="spatial_mlp",
-            layers="multiscale",
+            layers="last",
+            learn_psf=True,
             pretrained=pretrained,
             lr=1e-2,
             device=device,
@@ -206,6 +215,7 @@ def run_paper_benchmarks(
             epochs=epochs,
             mode="multiclass",
             tta_shifts=tta_shifts,
+            guide_normalization=norm,
         )
 
         met_otsu = compute_segmentation_metrics(otsu.hard_mask[0], gt)
@@ -215,7 +225,6 @@ def run_paper_benchmarks(
         met_cnmf = compute_segmentation_metrics(cnmf.hard_mask[0], gt)
         met_gtv = compute_segmentation_metrics(gtv.hard_mask[0], gt)
         met_inr = compute_segmentation_metrics(inr.hard_mask[0], gt)
-        met_km = compute_segmentation_metrics(km.hard_mask[0], gt)
         met_last = compute_segmentation_metrics(rep_last.hard_mask[0], gt)
         met_multi = compute_segmentation_metrics(rep_multi.hard_mask[0], gt)
         curve_multi = sparsification_curve(
@@ -226,16 +235,19 @@ def run_paper_benchmarks(
             {
                 "downsample_factor": factor,
                 "otsu_miou": round(met_otsu["iou"], 4),
+                "otsu_bf1": round(met_otsu["boundary_f1"], 4),
                 "bicubic_miou": round(met_bic["iou"], 4),
                 "bicubic_bf1": round(met_bic["boundary_f1"], 4),
                 "jbu_miou": round(met_jbu["iou"], 4),
                 "jbu_bf1": round(met_jbu["boundary_f1"], 4),
                 "gram_schmidt_miou": round(met_gs["iou"], 4),
+                "gram_schmidt_bf1": round(met_gs["boundary_f1"], 4),
                 "cnmf_miou": round(met_cnmf["iou"], 4),
+                "cnmf_bf1": round(met_cnmf["boundary_f1"], 4),
                 "guided_tv_miou": round(met_gtv["iou"], 4),
                 "guided_tv_bf1": round(met_gtv["boundary_f1"], 4),
                 "siren_inr_miou": round(met_inr["iou"], 4),
-                "vit_kmeans_miou": round(met_km["iou"], 4),
+                "siren_inr_bf1": round(met_inr["boundary_f1"], 4),
                 "xfuse_last_miou": round(met_last["iou"], 4),
                 "xfuse_last_bf1": round(met_last["boundary_f1"], 4),
                 "xfuse_multiscale_miou": round(met_multi["iou"], 4),
@@ -256,9 +268,11 @@ def run_paper_benchmarks(
         downsample_factor=4,
         phase_b_contrast=0.35,
         hr_noise_std=0.02,
+        beam_profile="moffat",
         seed=101,
     )
     drift_px_list = [0.0, 3.0] if quick else [0.0, 2.0, 4.0, 5.0]
+    rep_cal_specimen = None
     for shift_px in drift_px_list:
         drifted_guide = _inject_shifted_coarse_guide(
             ph_base.gt_phase_channels,
@@ -270,8 +284,9 @@ def run_paper_benchmarks(
             backbone=backbone,
             stride=stride,
             dtype=torch.float32,
-            loss_fn="forward_psf_bce",
-            interpolation_mode="jbu",
+            loss_fn="compositional_kl",
+            interpolation_mode="cross_attn",
+            fusion_method="spatial_mlp",
             align_guide="none",
             learn_psf=False,
             pretrained=pretrained,
@@ -281,17 +296,19 @@ def run_paper_benchmarks(
         rep_un = m_unaligned.fit_predict(
             ph_base.hr_image,
             drifted_guide,
-            epochs=epochs + 6,
+            epochs=epochs + 4,
             mode="multiclass",
             tta_shifts=tta_shifts,
+            guide_normalization=norm,
         )
 
         m_aligned = XFuse(
             backbone=backbone,
             stride=stride,
             dtype=torch.float32,
-            loss_fn="forward_psf_bce",
-            interpolation_mode="jbu",
+            loss_fn="compositional_kl",
+            interpolation_mode="cross_attn",
+            fusion_method="spatial_mlp",
             align_guide="translation",
             max_shift_coarse_px=2.0,
             learn_psf=True,
@@ -302,10 +319,13 @@ def run_paper_benchmarks(
         rep_al = m_aligned.fit_predict(
             ph_base.hr_image,
             drifted_guide,
-            epochs=epochs + 10,
+            epochs=epochs + 8,
             mode="multiclass",
             tta_shifts=tta_shifts,
+            guide_normalization=norm,
         )
+        if shift_px == 0.0:
+            rep_cal_specimen = (m_aligned, rep_al)
         met_un = compute_segmentation_metrics(rep_un.hard_mask[0], ph_base.gt_labels)
         met_al = compute_segmentation_metrics(rep_al.hard_mask[0], ph_base.gt_labels)
         results["drift_and_psf_ablation"].append(
@@ -330,7 +350,6 @@ def run_paper_benchmarks(
     ph_3d = generate_correlative_phantom_3d(
         shape=vol_shape, downsample_factor=4, hr_noise_std=0.06, seed=7
     )
-    # Build per-slice 2D coarse guides for every Z plane so schedules can query any z
     all_z_guides: dict[int, np.ndarray] = {}
     for z_i in range(vol_shape[0]):
         _, cg_z, _ = make_experimental_holdout(
@@ -343,6 +362,7 @@ def run_paper_benchmarks(
                 axis=0,
             ),
             factor=4,
+            beam_profile="moffat",
         )
         all_z_guides[z_i] = cg_z
 
@@ -357,7 +377,7 @@ def run_paper_benchmarks(
             backbone=backbone,
             stride=stride,
             dtype=torch.float32,
-            loss_fn="forward_psf_bce",
+            loss_fn="compositional_kl",
             guide_channels=2,
             pretrained=pretrained,
             lr=1e-2,
@@ -381,7 +401,6 @@ def run_paper_benchmarks(
         m3d = compute_segmentation_metrics(v_rep.hard_mask, ph_3d.gt_labels_3d)
         return round(m3d["iou"], 4), v_rep
 
-    # Active schedule starts from 2 boundary seed slices and greedily adds slices
     active_chosen = [1, vol_shape[0] - 2]
     prev_active_rep: Any = None
     for b_idx, budget in enumerate(budgets):
@@ -415,48 +434,95 @@ def run_paper_benchmarks(
         "final_active_slices": active_chosen,
     }
 
-    # 3b. v1.0 Stress Tests (Textured Iso-Intensity, 3D Spectral Cube, Conformal Sets)
-    ph_tex = generate_textured_isointensity_phantom_2d(
-        size=max(img_size, 64), downsample_factor=8, seed=55
+    # 3b. Stress Tests: Oriented Lamellar Texture, FIB Artifacts, Poisson & Conformal
+    ph_tex = generate_oriented_lamellar_phantom_2d(
+        size=max(img_size, 64), downsample_factor=8, beam_profile="moffat", seed=55
     )
     otsu_tex = otsu_threshold_baseline(
-        ph_tex.hr_image, ph_tex.coarse_guide, mode="multiclass"
+        ph_tex.hr_image,
+        ph_tex.coarse_guide,
+        mode="multiclass",
+        guide_normalization=norm,
+    )
+    bic_tex = bicubic_upsample_baseline(
+        ph_tex.coarse_guide,
+        ph_tex.hr_image.shape,
+        mode="multiclass",
+        guide_normalization=norm,
     )
     jbu_tex = jbu_guided_baseline(
-        ph_tex.hr_image, ph_tex.coarse_guide, mode="multiclass"
+        ph_tex.hr_image,
+        ph_tex.coarse_guide,
+        mode="multiclass",
+        guide_normalization=norm,
     )
     cnmf_tex = cnmf_pansharpen_baseline(
         ph_tex.hr_image,
         ph_tex.coarse_guide,
         mode="multiclass",
         n_iters=15 if quick else 35,
+        guide_normalization=norm,
     )
     gtv_tex = guided_variational_sr_baseline(
         ph_tex.hr_image,
         ph_tex.coarse_guide,
         mode="multiclass",
-        n_steps=20 if quick else 70,
+        n_steps=20 if quick else 60,
         device=device,
+        guide_normalization=norm,
+    )
+    inr_tex = coordinate_inr_baseline(
+        ph_tex.hr_image,
+        ph_tex.coarse_guide,
+        mode="multiclass",
+        hidden_dim=32 if quick else 48,
+        epochs=20 if quick else 65,
+        device=device,
+        guide_normalization=norm,
     )
     m_tex = XFuse(
         backbone=backbone,
         stride=stride,
         dtype=torch.float32,
-        loss_fn="forward_psf_bce",
+        loss_fn="compositional_kl",
         interpolation_mode="cross_attn",
-        learned_upsampler=True,
         fusion_method="spatial_mlp",
-        debias_positional=True,
         pretrained=pretrained,
-        lr=1.5e-2,
+        lr=1e-2,
         device=device,
     )
     rep_tex = m_tex.fit_predict(
         ph_tex.hr_image,
         ph_tex.coarse_guide,
-        epochs=max(epochs + 8, 20),
+        epochs=max(epochs + 6, 16),
         mode="multiclass",
         tta_shifts=tta_shifts,
+        guide_normalization=norm,
+    )
+
+    ph_art = generate_artifact_corrupted_phantom_2d(
+        size=max(img_size, 64), downsample_factor=8, beam_profile="moffat", seed=61
+    )
+    m_art = XFuse(
+        backbone=backbone,
+        stride=stride,
+        dtype=torch.float32,
+        loss_fn="compositional_kl",
+        interpolation_mode="cross_attn",
+        fusion_method="spatial_mlp",
+        debias_positional=True,
+        debias_degree=1,
+        pretrained=pretrained,
+        lr=1e-2,
+        device=device,
+    )
+    rep_art = m_art.fit_predict(
+        ph_art.hr_image,
+        ph_art.coarse_guide,
+        epochs=max(epochs + 4, 14),
+        mode="multiclass",
+        tta_shifts=tta_shifts,
+        guide_normalization=norm,
     )
 
     ph_spec = generate_spectral_cube_phantom_2d(
@@ -464,6 +530,7 @@ def run_paper_benchmarks(
         downsample_factor=4,
         n_spectral_bins=16,
         mean_counts=45.0,
+        beam_profile="moffat",
         seed=99,
     )
     m_spec = XFuse(
@@ -489,7 +556,6 @@ def run_paper_benchmarks(
         n_components=2,
     )
     pred_spec_np = rep_spec.hard_mask[0].cpu().numpy()
-    # Evaluate permutation-invariant foreground IoU for unsupervised NMF components
     pred_swapped = pred_spec_np.copy()
     pred_swapped[pred_spec_np == 1] = 2
     pred_swapped[pred_spec_np == 2] = 1
@@ -498,28 +564,40 @@ def run_paper_benchmarks(
         compute_segmentation_metrics(pred_swapped, ph_spec.gt_labels)["iou"],
     )
 
-    # Split Conformal Coverage Curve across nominal miscoverage alpha
-    cal_split = np.zeros_like(ph_base.gt_labels, dtype=bool)
-    cal_split[:, : img_size // 2] = True
-    test_split = ~cal_split
+    # Cross-Specimen LAC Conformal Calibration (Specimen A -> Independent Specimen B)
+    assert rep_cal_specimen is not None
+    cal_model, cal_rep_a = rep_cal_specimen
+    ph_test_b = generate_correlative_phantom_2d(
+        size=img_size,
+        downsample_factor=4,
+        phase_b_contrast=0.35,
+        hr_noise_std=0.02,
+        beam_profile="moffat",
+        seed=202,
+    )
+    rep_test_b = cal_model.predict(
+        ph_test_b.hr_image,
+        coarse_guide=None,
+        mode="multiclass",
+        calibrate_to_guide=False,
+    )
+    gt_a_t = torch.from_numpy(ph_base.gt_labels).unsqueeze(0)
+    gt_b_t = torch.from_numpy(ph_test_b.gt_labels).unsqueeze(0)
     conformal_curve: list[dict[str, float]] = []
-    probs_ref = rep_al.probabilities
-    gt_t = torch.from_numpy(ph_base.gt_labels).unsqueeze(0)
     for alpha in (0.05, 0.10, 0.20):
-        cal = ConformalCalibrator(alpha=alpha, method="aps")
-        cal.calibrate_labels(
-            probs_ref, gt_t, cal_mask=torch.from_numpy(cal_split).unsqueeze(0)
+        cal = ConformalCalibrator(alpha=alpha, method="lac")
+        cal.calibrate_labels(cal_rep_a.probabilities, gt_a_t)
+        p_sets_b, _ = cal.predict_sets_and_intervals(
+            rep_test_b.probabilities, guide_lr=None, mode="multiclass"
         )
-        p_sets, _ = cal.predict_sets_and_intervals(probs_ref)
-        cov_stats = empirical_conformal_coverage(
-            p_sets[:, :, test_split], gt_t[:, test_split]
-        )
+        cov_stats = empirical_conformal_coverage(p_sets_b, gt_b_t)
         conformal_curve.append(
             {
                 "alpha": alpha,
                 "nominal_coverage": round(1.0 - alpha, 4),
                 "empirical_coverage": round(cov_stats["empirical_coverage"], 4),
                 "mean_set_size": round(cov_stats["mean_set_size"], 4),
+                "singleton_fraction": round(cov_stats["singleton_fraction"], 4),
             }
         )
 
@@ -527,6 +605,12 @@ def run_paper_benchmarks(
         "textured_isointensity": {
             "otsu_miou": round(
                 compute_segmentation_metrics(otsu_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
+            "bicubic_miou": round(
+                compute_segmentation_metrics(bic_tex.hard_mask[0], ph_tex.gt_labels)[
                     "iou"
                 ],
                 4,
@@ -549,8 +633,22 @@ def run_paper_benchmarks(
                 ],
                 4,
             ),
+            "siren_inr_miou": round(
+                compute_segmentation_metrics(inr_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
             "xfuse_cross_attn_miou": round(
                 compute_segmentation_metrics(rep_tex.hard_mask[0], ph_tex.gt_labels)[
+                    "iou"
+                ],
+                4,
+            ),
+        },
+        "artifact_corrupted_fib": {
+            "xfuse_debiased_miou": round(
+                compute_segmentation_metrics(rep_art.hard_mask[0], ph_art.gt_labels)[
                     "iou"
                 ],
                 4,
@@ -562,43 +660,80 @@ def run_paper_benchmarks(
         "conformal_coverage": conformal_curve,
     }
 
-    # 4. Bundled Synchrotron Samples (Zn13X Slices 4 & 9 + Tiled MOR-GIS Hold-Out)
-    for zn_sample in load_bundled_zn13x_pairs():
-        crop_sz = 96 if quick else min(256, zn_sample.hr_image.shape[0])
-        h_full, w_full = zn_sample.hr_image.shape
-        y0, x0 = (h_full - crop_sz) // 2, (w_full - crop_sz) // 2
-        hr_sub = zn_sample.hr_image[y0 : y0 + crop_sz, x0 : x0 + crop_sz]
-        gh_full, gw_full = zn_sample.guide_map.shape[1:]
-        gy0 = int(round(y0 * gh_full / h_full))
-        gx0 = int(round(x0 * gw_full / w_full))
-        gh = max(4, int(round(crop_sz * gh_full / h_full)))
-        gw = max(4, int(round(crop_sz * gw_full / w_full)))
-        g_sub = zn_sample.guide_map[:, gy0 : gy0 + gh, gx0 : gx0 + gw]
-
-        zn_model = XFuse(
-            backbone=backbone,
-            stride=stride,
-            dtype=torch.float32,
-            loss_fn="forward_psf_bce",
-            interpolation_mode="jbu",
-            layers="multiscale",
-            pretrained=pretrained,
-            lr=1e-2,
-            device=device,
-        )
-        zn_rep = zn_model.fit_predict(
-            hr_sub, g_sub, epochs=epochs, mode="multilabel", tta_shifts=tta_shifts
-        )
-        results["synchrotron_samples"][zn_sample.key] = {
-            "hr_crop_shape": list(hr_sub.shape),
-            "guide_crop_shape": list(g_sub.shape),
-            "mean_phase_probability": round(
-                float(zn_rep.probabilities.mean().item()), 4
-            ),
-            "mean_uncertainty": round(
-                float(zn_rep.combined_uncertainty.mean().item()), 4
-            ),
-        }
+    # 4. Bundled Real Synchrotron Zn13X Quantitative Hold-Out & Cross-Slice Transfer
+    zn_pairs = load_bundled_zn13x_pairs()
+    if zn_pairs:
+        s4 = zn_pairs[0]
+        p05, p99 = np.percentile(s4.guide_map[0], [5, 99])
+        crop_sz = 96 if quick else 224
+        y0, x0 = 192, 1024
+        for zn_sample in zn_pairs:
+            hr_sub = zn_sample.hr_image[y0 : y0 + crop_sz, x0 : x0 + crop_sz]
+            gt_sub = np.clip(
+                (
+                    zn_sample.guide_map[
+                        0, y0 // 2 : (y0 + crop_sz) // 2, x0 // 2 : (x0 + crop_sz) // 2
+                    ]
+                    - p05
+                )
+                / max(float(p99 - p05), 1e-6),
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            _, g_lr_hold, _ = make_experimental_holdout(
+                np.zeros_like(gt_sub),
+                gt_sub[None],
+                factor=4 if quick else 8,
+                beam_profile="moffat",
+            )
+            zn_model = XFuse(
+                backbone=backbone,
+                stride=stride,
+                dtype=torch.float32,
+                loss_fn="forward_psf_mse",
+                interpolation_mode="cross_attn",
+                fusion_method="spatial_mlp",
+                guide_residual=True,
+                tv_weight=0.01,
+                learn_psf=True,
+                pretrained=pretrained,
+                lr=5e-3,
+                device=device,
+            )
+            zn_rep = zn_model.fit_predict(
+                hr_sub,
+                g_lr_hold,
+                epochs=epochs,
+                mode="multilabel",
+                calibrate_to_guide=False,
+                tta_shifts=tta_shifts,
+                guide_normalization=norm,
+            )
+            p_112 = (
+                F.avg_pool2d(zn_rep.probabilities.float(), 2, 2)
+                .reshape(-1)
+                .cpu()
+                .numpy()
+            )
+            g_112 = gt_sub.reshape(-1)
+            r_val = (
+                float(np.corrcoef(p_112, g_112)[0, 1]) if np.std(p_112) > 1e-8 else 0.0
+            )
+            psnr_val = float(
+                -10.0 * np.log10(max(float(np.mean((p_112 - g_112) ** 2)), 1e-10))
+            )
+            results["synchrotron_samples"][zn_sample.key] = {
+                "hr_crop_shape": list(hr_sub.shape),
+                "holdout_guide_shape": list(g_lr_hold.shape),
+                "holdout_pearson_r": round(r_val, 4),
+                "holdout_psnr_db": round(psnr_val, 2),
+                "mean_phase_probability": round(
+                    float(zn_rep.probabilities.mean().item()), 4
+                ),
+                "mean_uncertainty": round(
+                    float(zn_rep.combined_uncertainty.mean().item()), 4
+                ),
+            }
 
     mg_samples = load_bundled_morgis_samples()
     if mg_samples:
@@ -608,12 +743,13 @@ def run_paper_benchmarks(
             mg.hr_image[:mg_crop, :mg_crop],
             mg.guide_map[:, :mg_crop, :mg_crop],
             factor=8,
+            beam_profile="moffat",
         )
         mg_model = XFuse(
             backbone=backbone,
             stride=stride,
             dtype=torch.float32,
-            loss_fn="forward_psf_bce",
+            loss_fn="compositional_kl",
             interpolation_mode="jbu",
             tile_size=96,
             tile_overlap=24,
@@ -626,14 +762,16 @@ def run_paper_benchmarks(
             coarse_mg,
             epochs=3 if quick else epochs,
             mode="multiclass",
-            tta_shifts=() if quick else (1,),
+            tta_shifts=(),
             tta_flips=not quick,
+            guide_normalization=norm,
         )
         gt_labels_mg = np.zeros(hr_mg.shape, dtype=np.int64)
         gt_labels_mg[gt_mg[0] > 0.5] = 1
         gt_labels_mg[gt_mg[1] > 0.5] = 2
         mg_met = compute_segmentation_metrics(mg_rep.hard_mask[0], gt_labels_mg)
         results["synchrotron_samples"][mg.key] = {
+            "semi_synthetic": True,
             "tiled_shape": list(hr_mg.shape),
             "holdout_8x_miou": round(mg_met["iou"], 4),
             "holdout_8x_bf1": round(mg_met["boundary_f1"], 4),
@@ -656,6 +794,7 @@ def run_paper_benchmarks(
                         sample.hr_image[:crop_h, :crop_w],
                         sample.guide_map[:, :crop_h, :crop_w],
                         factor=8,
+                        beam_profile="moffat",
                     )
                 else:
                     gc_h = max(4, int(round(crop_h * gh_tot / max(h_tot, 1))))
@@ -715,7 +854,7 @@ def main() -> None:
     parser.add_argument(
         "--backbone",
         default="timm:vit_tiny_patch16_224",
-        help="ViT backbone (e.g., dinov2_vitb14_reg or timm:vit_tiny_patch16_224).",
+        help="ViT backbone (e.g., dinov2_vits14_reg or timm:vit_tiny_patch16_224).",
     )
     parser.add_argument("--pretrained", action="store_true")
     parser.add_argument("--quick", action="store_true")

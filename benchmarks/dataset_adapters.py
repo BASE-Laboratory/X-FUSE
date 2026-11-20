@@ -61,7 +61,8 @@ def load_bundled_zn13x_pairs() -> list[CorrelativeSample]:
 
 def load_bundled_morgis_samples() -> list[CorrelativeSample]:
     """Load bundled MOR-GIS synchrotron XCT zeolite micrographs paired with
-    multi-phase attenuation reference maps for high-resolution tiling tests.
+    semi-synthetic multi-phase attenuation percentile maps (for tiling and
+    attenuation-consistency smoke tests rather than independent chemical holdout).
     """
     mg_dir = get_sample_dataset_path("MOR-GIS")
     samples: list[CorrelativeSample] = []
@@ -82,7 +83,8 @@ def load_bundled_morgis_samples() -> list[CorrelativeSample]:
                 is_full_res_ground_truth=True,
                 metadata={
                     "hr_modality": "Synchrotron XCT",
-                    "guide_modality": "Multi-phase reference",
+                    "guide_modality": "Semi-synthetic XCT percentile reference",
+                    "semi_synthetic": True,
                     "source_file": png_path.name,
                 },
             )
@@ -123,13 +125,69 @@ def _ensure_extracted(paths: list[Path]) -> Path:
     return root
 
 
+def _load_text_matrix(path: Path) -> np.ndarray | None:
+    """Load a numeric 2D array from whitespace, comma, or semicolon delimited text,
+    including Bruker Esprit / ``edxia`` CSVs with trailing row commas, while returning
+    ``None`` for 1D vectors or tabular header/point files (e.g. ``pointsWt.csv``).
+    """
+    try:
+        raw_lines = [
+            ln.strip().rstrip(",;")
+            for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            if ln.strip()
+        ]
+    except OSError:
+        return None
+    if len(raw_lines) < 8:
+        return None
+    for delim in (None, ",", ";"):
+        try:
+            arr = np.loadtxt(raw_lines, dtype=np.float32, delimiter=delim)
+        except ValueError:
+            continue
+        if arr.ndim == 2 and min(arr.shape) >= 8:
+            return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    return None
+
+
+def _matches_elem_token(stem: str, kw: str) -> tuple[bool, bool]:
+    """Return ``(is_exact_token, is_loose_match)`` without letting single-letter
+    elements like ``'S'`` or ``'O'`` false-match ``'BSE Wt_'`` or ``'Si Wt_'``.
+    """
+    import re
+
+    s_low = stem.lower().strip()
+    k_low = kw.lower().strip()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", s_low) if t]
+    if s_low == k_low or (tokens and (tokens[0] == k_low or tokens[-1] == k_low)):
+        return True, True
+    if k_low in tokens:
+        return False, True
+    if len(k_low) >= 2 and k_low in s_low:
+        return False, True
+    return False, False
+
+
 def _discover_hr_and_guides_generic(
-    folder: Path, hr_keywords: tuple[str, ...], elem_keywords: tuple[str, ...]
+    folder: Path,
+    hr_keywords: tuple[str, ...],
+    elem_keywords: tuple[str, ...],
+    subpanel: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    search_root = folder
+    if subpanel is not None:
+        sub_matches = [
+            d
+            for d in folder.rglob("*")
+            if d.is_dir() and d.name.lower() == subpanel.lower()
+        ]
+        if sub_matches:
+            search_root = sub_matches[0]
+
     all_files = sorted(
         [
             f
-            for f in folder.rglob("*")
+            for f in search_root.rglob("*")
             if f.is_file()
             and f.suffix.lower()
             in {
@@ -145,53 +203,136 @@ def _discover_hr_and_guides_generic(
             }
         ]
     )
+    if not all_files:
+        pdfs = list(search_root.rglob("*.pdf"))
+        if pdfs:
+            raise RuntimeError(
+                f"Dataset folder {search_root} contains only PDF document(s) "
+                f"({[p.name for p in pdfs[:3]]}) rather than raw microscopy arrays."
+            )
     hr_candidates = [
-        f for f in all_files if any(kw in f.stem.lower() for kw in hr_keywords)
+        f
+        for f in all_files
+        if any(kw in f.stem.lower() for kw in hr_keywords)
+        and "diffraction" not in f.stem.lower()
+        and "saed" not in f.stem.lower()
+        and "points" not in f.stem.lower()
     ]
     if not hr_candidates:
         raise FileNotFoundError(
             f"Could not locate structural HR file matching {hr_keywords} "
-            f"under {folder}."
+            f"under {search_root}."
         )
-    hr_file = hr_candidates[0]
+    # Prefer Fig3b (aged 10Al with strong A2/B2 contrast) when multiple panels exist
+    if subpanel is None and len(hr_candidates) > 1:
+        fig3b = [f for f in hr_candidates if "fig3b" in str(f).lower()]
+        hr_file = fig3b[0] if fig3b else hr_candidates[0]
+    else:
+        hr_file = hr_candidates[0]
+
     if hr_file.suffix.lower() in {".txt", ".csv"}:
-        hr_arr = np.loadtxt(hr_file, dtype=np.float32)
+        hr_loaded = _load_text_matrix(hr_file)
+        if hr_loaded is None:
+            raise ValueError(f"Could not parse 2D matrix from {hr_file}.")
+        hr_arr = hr_loaded
     else:
         hr_arr, _ = load_microscopy_file(hr_file)
     if hr_arr.ndim == 3:
         hr_arr = hr_arr[..., 0] if hr_arr.shape[-1] <= 4 else hr_arr[0]
 
+    sibling_files = [f for f in all_files if f.parent == hr_file.parent]
+    pool_files = sibling_files if len(sibling_files) >= 2 else all_files
+
     guide_arrays: list[np.ndarray] = []
     names: list[str] = []
     for kw in elem_keywords:
-        matches = [
-            f for f in all_files if f != hr_file and kw.lower() in f.stem.lower()
-        ]
-        if matches:
-            gf = matches[0]
+        exact: list[Path] = []
+        loose: list[Path] = []
+        for f in pool_files:
+            if f == hr_file or "points" in f.stem.lower():
+                continue
+            is_ex, is_lo = _matches_elem_token(f.stem, kw)
+            if is_ex:
+                exact.append(f)
+            elif is_lo:
+                loose.append(f)
+        matches = exact or loose
+        for gf in matches:
             if gf.suffix.lower() in {".txt", ".csv"}:
-                g_arr = np.loadtxt(gf, dtype=np.float32)
+                g_loaded = _load_text_matrix(gf)
+                if g_loaded is None:
+                    continue
+                g_arr = g_loaded
             else:
                 g_arr, _ = load_microscopy_file(gf)
             if g_arr.ndim == 3:
-                g_arr = g_arr.sum(axis=-1)
+                g_arr = (
+                    g_arr[..., :3].max(axis=-1)
+                    if g_arr.shape[-1] in (3, 4)
+                    else g_arr.sum(axis=-1)
+                )
             guide_arrays.append(g_arr.astype(np.float32))
             names.append(kw)
+            break
 
     if not guide_arrays:
         raise FileNotFoundError(
-            f"Could not locate guide maps matching {elem_keywords} under {folder}."
+            f"Could not locate guide maps matching {elem_keywords} under {search_root}."
         )
-    min_h = min(g.shape[0] for g in guide_arrays)
-    min_w = min(g.shape[1] for g in guide_arrays)
+    min_h = min([hr_arr.shape[0]] + [g.shape[0] for g in guide_arrays])
+    min_w = min([hr_arr.shape[1]] + [g.shape[1] for g in guide_arrays])
     stack = np.stack([g[:min_h, :min_w] for g in guide_arrays], axis=0)
-    return hr_arr, stack, names
+    return hr_arr[:min_h, :min_w], stack, names
+
+
+def _parse_eels_energy_axis(meta: dict[str, Any], n_channels: int) -> np.ndarray:
+    axes = meta.get("axes", [])
+    if isinstance(axes, list):
+        for ax in axes:
+            if isinstance(ax, dict) and int(ax.get("size", -1)) == n_channels:
+                off = float(ax.get("offset", 0.0))
+                sc = float(ax.get("scale", 1.0))
+                if sc > 0.0 and off > 0.0:
+                    return (off + sc * np.arange(n_channels, dtype=np.float32)).astype(
+                        np.float32
+                    )
+    return (700.0 + 8.0 * np.arange(n_channels, dtype=np.float32)).astype(np.float32)
+
+
+def _strip_eels_powerlaw_window(
+    si_hwe: np.ndarray,
+    energies_ev: np.ndarray,
+    pre_range: tuple[float, float],
+    sig_range: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Subtract an Egerton power-law continuum ``A * E^(-r)`` fit in log-log space
+    on ``pre_range`` and return ``(integrated_edge_hw, net_cube_hwe_sig)``."""
+    pre = (energies_ev >= pre_range[0]) & (energies_ev <= pre_range[1])
+    sig = (energies_ev >= sig_range[0]) & (energies_ev <= sig_range[1])
+    if int(pre.sum()) < 2 or int(sig.sum()) < 1:
+        mid = si_hwe.shape[-1] // 2
+        return si_hwe[..., :mid].mean(axis=-1), si_hwe[..., :mid]
+    lx = np.log(energies_ev[pre])
+    lxm = float(lx.mean())
+    ly = np.log(np.clip(si_hwe[..., pre], 1.0, None))
+    lym = ly.mean(axis=-1, keepdims=True)
+    denom = float(((lx - lxm) ** 2).sum())
+    slope = (
+        ((lx - lxm) * (ly - lym)).sum(axis=-1, keepdims=True) / max(denom, 1e-8)
+    ).clip(-12.0, 0.0)
+    intercept = lym - slope * lxm
+    bg_sig = np.exp(intercept + slope * np.log(energies_ev[sig])[None, None, :])
+    net_sig = np.clip(si_hwe[..., sig] - bg_sig, 0.0, None).astype(np.float32)
+    return net_sig.sum(axis=-1).astype(np.float32), net_sig
 
 
 def load_zenodo_correlative_sample(
     dataset_key: str,
     dest_root: str | Path | None = None,
     auto_download: bool = False,
+    *,
+    subpanel: str | None = None,
+    crop_clean_roi: bool = True,
 ) -> CorrelativeSample:
     """Parse a downloaded (or on-demand fetched) Zenodo dataset into a
     standardized ``CorrelativeSample`` ready for ``make_experimental_holdout``.
@@ -222,17 +363,32 @@ def load_zenodo_correlative_sample(
         folder = _ensure_extracted(list(base.iterdir()))
 
     if dataset_key == "edxia_cement_sem_eds":
+        eff_sub = subpanel if subpanel is not None else "LC3"
         hr, guides, names = _discover_hr_and_guides_generic(
             folder,
             hr_keywords=("bse", "sem"),
             elem_keywords=("Ca", "Si", "Al", "Fe", "Mg", "S"),
+            subpanel=eff_sub,
         )
+        if crop_clean_roi:
+            h8 = min(512, (hr.shape[0] // 16) * 16)
+            w8 = min(512, (hr.shape[1] // 16) * 16)
+            if h8 >= 64 and w8 >= 64:
+                y0 = (hr.shape[0] - h8) // 2
+                x0 = (hr.shape[1] - w8) // 2
+                hr = hr[y0 : y0 + h8, x0 : x0 + w8]
+                guides = guides[:, y0 : y0 + h8, x0 : x0 + w8]
     elif dataset_key == "ti_rcca_stem_eds":
         hr, guides, names = _discover_hr_and_guides_generic(
             folder,
             hr_keywords=("haadf", "stem", "adf"),
             elem_keywords=("Ti", "Mo", "Ta", "Cr", "Al"),
+            subpanel=subpanel,
         )
+        if crop_clean_roi and hr.shape[0] >= 1024 and hr.shape[1] >= 1024:
+            # Exclude top-left panel glyph and bottom-right burned-in scale bar
+            hr = hr[96:864, 96:864]
+            guides = guides[:, 96:864, 96:864]
     elif dataset_key == "cuzn_stem_eels":
         hspy_files = sorted(folder.rglob("*.hspy")) + sorted(folder.rglob("*.dm4"))
         if len(hspy_files) >= 2:
@@ -241,13 +397,17 @@ def load_zenodo_correlative_sample(
             ] or hspy_files[:1]
             eels_cand = [f for f in hspy_files if f != hr_cand[0]]
             hr, _ = load_microscopy_file(hr_cand[0])
-            si, _ = load_microscopy_file(eels_cand[0])
+            si, si_meta = load_microscopy_file(eels_cand[0])
             if si.ndim == 3:
-                mid = si.shape[-1] // 2
-                guides = np.stack(
-                    [si[..., :mid].mean(axis=-1), si[..., mid:].mean(axis=-1)], axis=0
+                energies = _parse_eels_energy_axis(si_meta, int(si.shape[-1]))
+                cu_map, _ = _strip_eels_powerlaw_window(
+                    si, energies, (780.0, 916.0), (932.0, 1004.0)
                 )
-                names = ["Cu_L", "Zn_L"]
+                zn_map, _ = _strip_eels_powerlaw_window(
+                    si, energies, (964.0, 1012.0), (1028.0, 1132.0)
+                )
+                guides = np.stack([cu_map, zn_map], axis=0)
+                names = ["Cu_L23", "Zn_L23"]
             else:
                 guides = si[None, ...]
                 names = ["EELS_core"]
@@ -256,6 +416,7 @@ def load_zenodo_correlative_sample(
                 folder,
                 hr_keywords=("haadf", "survey"),
                 elem_keywords=("Cu", "Zn", "eels"),
+                subpanel=subpanel,
             )
     elif dataset_key == "refractory_alloy_bse_eds_ebsd":
         h5_files = sorted(folder.rglob("*.h5")) + sorted(folder.rglob("*.hdf5"))
@@ -284,16 +445,19 @@ def load_zenodo_correlative_sample(
                 folder,
                 hr_keywords=("bse", "sem"),
                 elem_keywords=("Al", "Ti", "Nb", "Zr", "Ta", "phase"),
+                subpanel=subpanel,
             )
     else:  # isis_imat_bragg_edge
         hr, guides, names = _discover_hr_and_guides_generic(
             folder,
             hr_keywords=("white", "open", "attenuation", "recon", "sum"),
             elem_keywords=("Al", "Fe", "Cu", "Ni", "Zn", "bragg"),
+            subpanel=subpanel,
         )
 
+    sample_key = f"{dataset_key}_{subpanel.lower()}" if subpanel else dataset_key
     return CorrelativeSample(
-        key=dataset_key,
+        key=sample_key,
         hr_image=hr.astype(np.float32),
         guide_map=guides.astype(np.float32),
         channel_names=names,
@@ -303,5 +467,74 @@ def load_zenodo_correlative_sample(
             "doi": meta.doi,
             "hr_modality": meta.hr_modality,
             "guide_modality": meta.guide_modality,
+            "subpanel": subpanel,
         },
     )
+
+
+def load_cuzn_eels_cube_sample(
+    dest_root: str | Path | None = None,
+    auto_download: bool = False,
+    *,
+    coarse_factor: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """Load the simultaneous HAADF-STEM survey image, pre-edge continuum-subtracted
+    3D core-loss EELS spectral cube ``(E_core, H_c, W_c)`` across ``[924, 1180] eV``,
+    and full-resolution reference ``(2, H, W)`` ``[Cu_L23, Zn_L23]`` maps from
+    ``cuzn_stem_eels``.
+
+    When ``coarse_factor > 1`` is specified, raw unstripped EELS counts are spatially
+    binned by ``coarse_factor x coarse_factor`` *before* Egerton power-law pre-edge
+    continuum subtraction so zero fine-grid continuum fit information leaks into the
+    coarse spectral cube.
+    """
+    if auto_download:
+        file_paths = fetch_open_dataset("cuzn_stem_eels", dest_root=dest_root)
+        folder = _ensure_extracted(file_paths)
+    else:
+        base = (
+            Path(dest_root) / "cuzn_stem_eels"
+            if dest_root is not None
+            else Path(__file__).resolve().parent.parent
+            / "data"
+            / "downloads"
+            / "cuzn_stem_eels"
+        )
+        folder = _ensure_extracted(list(base.iterdir()))
+
+    hspy_files = sorted(folder.rglob("*.hspy")) + sorted(folder.rglob("*.dm4"))
+    hr_cand = [f for f in hspy_files if "haadf" in f.stem.lower()] or hspy_files[:1]
+    eels_cand = [f for f in hspy_files if f != hr_cand[0]]
+    hr, _ = load_microscopy_file(hr_cand[0])
+    si, si_meta = load_microscopy_file(eels_cand[0])
+    energies = _parse_eels_energy_axis(si_meta, int(si.shape[-1]))
+
+    div = max(4, int(coarse_factor)) if coarse_factor is not None else 4
+    h4 = (hr.shape[0] // div) * div
+    w4 = (hr.shape[1] // div) * div
+    si_hr = si[:h4, :w4, :]
+
+    cu_map, _ = _strip_eels_powerlaw_window(
+        si_hr, energies, (780.0, 916.0), (932.0, 1004.0)
+    )
+    zn_map, _ = _strip_eels_powerlaw_window(
+        si_hr, energies, (964.0, 1012.0), (1028.0, 1132.0)
+    )
+    if coarse_factor is not None and int(coarse_factor) > 1:
+        f = int(coarse_factor)
+        si_lr = (
+            si_hr.astype(np.float64)
+            .reshape(h4 // f, f, w4 // f, f, -1)
+            .sum(axis=(1, 3))
+        )
+        _, net_cube_hwe = _strip_eels_powerlaw_window(
+            si_lr, energies, (780.0, 916.0), (924.0, 1180.0)
+        )
+    else:
+        _, net_cube_hwe = _strip_eels_powerlaw_window(
+            si_hr, energies, (780.0, 916.0), (924.0, 1180.0)
+        )
+    hr_crop = hr[:h4, :w4].astype(np.float32)
+    cube_ehw = np.transpose(net_cube_hwe, (2, 0, 1)).astype(np.float32)
+    gt_maps = np.stack([cu_map, zn_map], axis=0).astype(np.float32)
+    return hr_crop, cube_ehw, gt_maps, ["Cu_L23", "Zn_L23"]

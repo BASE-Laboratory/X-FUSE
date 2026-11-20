@@ -18,6 +18,7 @@ from .uncertainty import (
     match_coarse_priors,
 )
 from .upsamplers import joint_bilateral_upsample
+from .utils import GuideNormalization, guide_to_tensor
 from .vit_patch import TorchPCA, torch_pca
 
 
@@ -113,7 +114,13 @@ def pca_otsu_segment(
 # ── Classical & Unsupervised Baselines for Quantitative Benchmarking ──────────
 
 
-def _to_4d_guide(guide_lr: torch.Tensor | np.ndarray) -> torch.Tensor:
+def _to_4d_guide(
+    guide_lr: torch.Tensor | np.ndarray,
+    guide_normalization: GuideNormalization | None = None,
+) -> torch.Tensor:
+    if guide_normalization is not None:
+        dev = guide_lr.device if isinstance(guide_lr, torch.Tensor) else "cpu"
+        return guide_to_tensor(guide_lr, device=dev, normalization=guide_normalization)
     g = (
         guide_lr.detach().float()
         if isinstance(guide_lr, torch.Tensor)
@@ -131,10 +138,11 @@ def bicubic_upsample_baseline(
     target_hw: tuple[int, int],
     mode: Literal["multiclass", "multilabel"] = "multilabel",
     calibrate: bool = True,
+    guide_normalization: GuideNormalization | None = None,
 ) -> UncertaintyReport:
     """Baseline 1: Direct bicubic interpolation of the coarse physical guide ``G_LR``
     without using the high-resolution structural image ``I_HR``."""
-    g = _to_4d_guide(guide_lr)
+    g = _to_4d_guide(guide_lr, guide_normalization=guide_normalization)
     up = F.interpolate(g, size=target_hw, mode="bicubic", align_corners=False).clamp(
         0.0, 1.0
     )
@@ -166,11 +174,12 @@ def jbu_guided_baseline(
     n_iters: int = 2,
     mode: Literal["multiclass", "multilabel"] = "multilabel",
     calibrate: bool = True,
+    guide_normalization: GuideNormalization | None = None,
 ) -> UncertaintyReport:
     """Baseline 2: Classical non-ML Joint Bilateral Upsampling (JBU) of ``G_LR``
     guided directly by raw pixel intensities of ``I_HR`` (as used in SEM-EDS JBF
     literature, e.g. Georget et al., Cem. Concr. Res. 2021)."""
-    g = _to_4d_guide(guide_lr)
+    g = _to_4d_guide(guide_lr, guide_normalization=guide_normalization)
     hr = (
         hr_image.detach().float()
         if isinstance(hr_image, torch.Tensor)

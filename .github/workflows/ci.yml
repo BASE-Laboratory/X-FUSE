@@ -28,7 +28,10 @@ jobs:
           enable-cache: true
 
       - name: Install developer & docs dependencies
-        run: uv sync --extra cpu --extra io --extra dev --extra docs
+        run: >-
+          uv sync --extra cpu --extra io --extra dev --extra docs
+          --index-strategy unsafe-best-match
+          --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Check lint rules (Ruff)
         run: uv run ruff check x_fuse tests benchmarks
@@ -39,6 +42,9 @@ jobs:
       - name: Static type check (Mypy)
         run: uv run mypy x_fuse
 
+      - name: Verify stripped notebooks (nbstripout)
+        run: uv run nbstripout --verify notebooks/*.ipynb
+
       - name: Strict MkDocs documentation build
         run: uv run mkdocs build --strict -d /tmp/xfuse-docs-check
 
@@ -46,6 +52,12 @@ jobs:
     name: Unit Tests (Py ${{ matrix.python-version }} / ${{ matrix.os }})
     needs: quality
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -67,7 +79,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --python ${{ matrix.python-version }} --extra cpu --extra io --extra dev
+        run: >-
+          uv sync --python ${{ matrix.python-version }} --extra cpu --extra io --extra dev
+          --index-strategy unsafe-best-match
+          --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Run CPU test suite with coverage gate
         run: >
@@ -89,6 +104,11 @@ jobs:
     name: Package Build & Benchmark Smoke
     needs: quality
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -110,10 +130,13 @@ jobs:
           /tmp/xfuse-wheel-smoke/bin/xfuse --version
           /tmp/xfuse-wheel-smoke/bin/xfuse info
           /tmp/xfuse-wheel-smoke/bin/xfuse datasets --json
+          /tmp/xfuse-wheel-smoke/bin/xfuse demo --epochs 2
 
       - name: Run synthetic & paper ablation smoke suites
         run: |
-          uv sync --extra cpu --extra io --extra dev
+          uv sync --extra cpu --extra io --extra dev \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cpu
           uv run python -m benchmarks.run_synthetic_suite --quick
           uv run python -m benchmarks.run_paper_benchmarks --quick --output-dir benchmarks/outputs/paper_smoke
 

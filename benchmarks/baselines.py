@@ -31,7 +31,7 @@ from x_fuse.uncertainty import (
     match_coarse_priors,
 )
 from x_fuse.upsamplers import ForwardPSFDownsampler
-from x_fuse.utils import guide_to_tensor
+from x_fuse.utils import GuideNormalization, guide_to_tensor
 
 
 def _hr_to_pan_tensor(
@@ -64,17 +64,25 @@ def _probs_to_report(
     guide_t: torch.Tensor,
     mode: Literal["multiclass", "multilabel"],
     method_name: str,
+    calibrate: bool = True,
 ) -> UncertaintyReport:
     eps = 1e-5
     p_clamped = probs_fg.float().clamp(eps, 1.0 - eps)
-    logits = torch.log(p_clamped / (1.0 - p_clamped))
-    if mode == "multiclass":
-        bg = torch.zeros_like(logits[:, :1])
-        probs = match_coarse_priors(
-            torch.cat([bg, logits], dim=1), guide_t, mode="multiclass"
-        )
+    if calibrate:
+        logits = torch.log(p_clamped / (1.0 - p_clamped))
+        if mode == "multiclass":
+            bg = torch.zeros_like(logits[:, :1])
+            probs = match_coarse_priors(
+                torch.cat([bg, logits], dim=1), guide_t, mode="multiclass"
+            )
+        else:
+            probs = match_coarse_priors(logits, guide_t, mode="multilabel")
+    elif mode == "multiclass":
+        bg = (1.0 - p_clamped.sum(dim=1, keepdim=True)).clamp(0.0, 1.0)
+        probs = torch.cat([bg, p_clamped], dim=1)
+        probs = probs / probs.sum(dim=1, keepdim=True).clamp(min=1e-6)
     else:
-        probs = match_coarse_priors(logits, guide_t, mode="multilabel")
+        probs = probs_fg.float().clamp(0.0, 1.0)
     return build_uncertainty_report(
         probs_hr=probs,
         guide_lr=guide_t,
@@ -89,6 +97,8 @@ def otsu_threshold_baseline(
     coarse_guide: np.ndarray | torch.Tensor,
     mode: Literal["multiclass", "multilabel"] = "multiclass",
     n_bins: int = 128,
+    guide_normalization: GuideNormalization = "minmax",
+    calibrate: bool = True,
 ) -> UncertaintyReport:
     """Multi-Otsu 1D structural intensity thresholding baseline matched to coarse
     guide channels by spatial overlap (testing how much of a segmentation task can
@@ -98,7 +108,9 @@ def otsu_threshold_baseline(
     pan = pan_t.numpy()
     h_hr, w_hr = pan.shape
 
-    g_t = guide_to_tensor(coarse_guide, normalize=True)  # (1, M, H_lr, W_lr)
+    g_t = guide_to_tensor(
+        coarse_guide, normalization=guide_normalization
+    )  # (1, M, H_lr, W_lr)
     m_ch = int(g_t.shape[1])
     h_lr, w_lr = int(g_t.shape[2]), int(g_t.shape[3])
     n_classes = m_ch + 1
@@ -193,7 +205,9 @@ def otsu_threshold_baseline(
     for m in range(m_ch):
         chosen.append(soft_t[:, assigned[m] : assigned[m] + 1])
     probs_fg = torch.cat(chosen, dim=1)
-    return _probs_to_report(probs_fg, g_t, mode=mode, method_name="otsu_threshold")
+    return _probs_to_report(
+        probs_fg, g_t, mode=mode, method_name="otsu_threshold", calibrate=calibrate
+    )
 
 
 @torch.no_grad()
@@ -201,13 +215,17 @@ def gram_schmidt_pansharpen_baseline(
     hr_image: np.ndarray | torch.Tensor,
     coarse_guide: np.ndarray | torch.Tensor,
     mode: Literal["multiclass", "multilabel"] = "multiclass",
+    guide_normalization: GuideNormalization = "minmax",
+    calibrate: bool = True,
 ) -> UncertaintyReport:
     """Gram-Schmidt orthogonal component-substitution pan-sharpening."""
     pan_t = _hr_to_pan_tensor(hr_image, device="cpu")
     pan = pan_t.numpy()
     h_hr, w_hr = pan.shape
 
-    g_t = guide_to_tensor(coarse_guide, normalize=True)  # (1, M, H_lr, W_lr)
+    g_t = guide_to_tensor(
+        coarse_guide, normalization=guide_normalization
+    )  # (1, M, H_lr, W_lr)
     ms_up = F.interpolate(g_t, size=(h_hr, w_hr), mode="bicubic", align_corners=False)[
         0
     ].numpy()  # (M, H, W)
@@ -232,7 +250,9 @@ def gram_schmidt_pansharpen_baseline(
         sharpened[m] = np.clip(band + gain * delta_pan, 0.0, 1.0).reshape(h_hr, w_hr)
 
     probs_fg = torch.from_numpy(sharpened).unsqueeze(0)
-    return _probs_to_report(probs_fg, g_t, mode=mode, method_name="gram_schmidt")
+    return _probs_to_report(
+        probs_fg, g_t, mode=mode, method_name="gram_schmidt", calibrate=calibrate
+    )
 
 
 @torch.no_grad()
@@ -243,6 +263,8 @@ def cnmf_pansharpen_baseline(
     n_endmembers: int = 4,
     n_iters: int = 35,
     device: str | torch.device = "cpu",
+    guide_normalization: GuideNormalization = "minmax",
+    calibrate: bool = True,
 ) -> UncertaintyReport:
     """Coupled Non-negative Matrix Factorization (CNMF, Yokoya et al.) fusing
     multi-band structural intensity channels ``[I_HR, 1 - I_HR, I_HR^2]`` with
@@ -254,7 +276,9 @@ def cnmf_pansharpen_baseline(
     hr_bands = torch.stack([pan, 1.0 - pan, pan**2, (1.0 - pan) ** 2], dim=0)
     y_hr = hr_bands.reshape(4, -1).clamp(min=1e-5)
 
-    g_t = guide_to_tensor(coarse_guide, device=device, normalize=True)
+    g_t = guide_to_tensor(
+        coarse_guide, device=device, normalization=guide_normalization
+    )
     m_ch = int(g_t.shape[1])
     height_lr, width_lr = int(g_t.shape[2]), int(g_t.shape[3])
     # Augment coarse guide with simplex matrix residual (1 - sum_m G_m)
@@ -315,7 +339,9 @@ def cnmf_pansharpen_baseline(
     recon_hr = (dict_lr @ h_hr_ab).reshape(1, c_lr, h_hr, w_hr)
     recon_hr = recon_hr / recon_hr.sum(dim=1, keepdim=True).clamp(min=eps)
     probs_fg = recon_hr[:, 1:].clamp(0.0, 1.0).cpu()
-    return _probs_to_report(probs_fg, g_t.cpu(), mode=mode, method_name="cnmf")
+    return _probs_to_report(
+        probs_fg, g_t.cpu(), mode=mode, method_name="cnmf", calibrate=calibrate
+    )
 
 
 def guided_variational_sr_baseline(
@@ -327,6 +353,8 @@ def guided_variational_sr_baseline(
     tv_weight: float = 0.04,
     lr: float = 0.12,
     device: str | torch.device = "cpu",
+    guide_normalization: GuideNormalization = "minmax",
+    calibrate: bool = True,
 ) -> UncertaintyReport:
     """Variational inverse solver minimizing forward-PSF data fidelity plus
     intensity-edge-weighted anisotropic Total Variation:
@@ -336,7 +364,9 @@ def guided_variational_sr_baseline(
     pan = _hr_to_pan_tensor(hr_image, device=device)
     h_hr, w_hr = int(pan.shape[0]), int(pan.shape[1])
 
-    g_t = guide_to_tensor(coarse_guide, device=device, normalize=True)
+    g_t = guide_to_tensor(
+        coarse_guide, device=device, normalization=guide_normalization
+    )
     lr_hw = (int(g_t.shape[-2]), int(g_t.shape[-1]))
     init_up = F.interpolate(
         g_t, size=(h_hr, w_hr), mode="bilinear", align_corners=False
@@ -375,7 +405,11 @@ def guided_variational_sr_baseline(
     with torch.no_grad():
         probs_fg = torch.sigmoid(logits.detach()).cpu()
     return _probs_to_report(
-        probs_fg, g_t.cpu(), mode=mode, method_name="guided_variational_sr"
+        probs_fg,
+        g_t.cpu(),
+        mode=mode,
+        method_name="guided_variational_sr",
+        calibrate=calibrate,
     )
 
 
@@ -414,6 +448,8 @@ def coordinate_inr_baseline(
     lr: float = 5e-3,
     seed: int = 0,
     device: str | torch.device = "cpu",
+    guide_normalization: GuideNormalization = "minmax",
+    calibrate: bool = True,
 ) -> UncertaintyReport:
     """``SIREN`` Implicit Neural Representation baseline mapping continuous
     coordinates + structural intensity ``(y, x, I_HR(y, x))`` to HR phase logits
@@ -437,7 +473,9 @@ def coordinate_inr_baseline(
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
     coords_in = torch.stack([yy, xx, 2.0 * pan - 1.0], dim=-1).reshape(-1, 3)
 
-    g_t = guide_to_tensor(coarse_guide, device=device, normalize=True)
+    g_t = guide_to_tensor(
+        coarse_guide, device=device, normalization=guide_normalization
+    )
     m_ch = int(g_t.shape[1])
     lr_hw = (int(g_t.shape[-2]), int(g_t.shape[-1]))
 
@@ -470,4 +508,6 @@ def coordinate_inr_baseline(
 
     with torch.no_grad():
         probs_fg = torch.sigmoid(net(coords_in).T.reshape(1, m_ch, h_hr, w_hr)).cpu()
-    return _probs_to_report(probs_fg, g_t.cpu(), mode=mode, method_name="siren_inr")
+    return _probs_to_report(
+        probs_fg, g_t.cpu(), mode=mode, method_name="siren_inr", calibrate=calibrate
+    )

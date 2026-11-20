@@ -59,6 +59,7 @@ plugins:
 nav:
   - Home: index.md
   - Mathematical Theory: theory.md
+  - Benchmarks & Regimes: benchmarks.md
   - Modality Recipes: modalities.md
   - Tutorials & CLI: tutorials.md
   - API Reference: api.md

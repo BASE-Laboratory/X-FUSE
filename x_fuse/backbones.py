@@ -2,6 +2,7 @@
 extractor (replacing the external HR-Dv2 dependency and fixing double loading).
 """
 
+import math
 import re
 from collections.abc import Sequence
 from functools import partial
@@ -33,6 +34,7 @@ Interpolation: TypeAlias = Literal[
     "cross_attn",
 ]
 LayerSelection: TypeAlias = Literal["last", "multiscale"] | Sequence[int]
+MinInputSizeSpec: TypeAlias = int | Literal["auto"] | None
 
 
 def infer_vit_params(
@@ -201,10 +203,15 @@ class HighResBackbone(nn.Module):
         debias_positional: bool = False,
         debias_degree: int = 2,
         learned_upsampler: bool = False,
+        upsampler_orientation: bool = True,
+        upsampler_subtoken: bool = True,
+        min_input_size: MinInputSizeSpec = "auto",
         **kwargs,
     ) -> None:
         super().__init__()
         self.dino_name = dino_name
+        self.pretrained: bool = bool(pretrained)
+        self.min_input_size: MinInputSizeSpec = min_input_size
         device = kwargs.pop("device", None)
 
         self.dinov2: nn.Module = load_backbone(
@@ -248,6 +255,8 @@ class HighResBackbone(nn.Module):
         self.transforms: list[partial] = []
         self.inverse_transforms: list[partial] = []
         self.interpolation_mode: Interpolation = interpolation_mode
+        self.upsampler_orientation: bool = bool(upsampler_orientation)
+        self.upsampler_subtoken: bool = bool(upsampler_subtoken)
         self.jbu_upsampler = JointBilateralUpsampler(
             guidance_dim=3, radius=2, sigma_spatial=1.5, sigma_range=0.15, learned=False
         )
@@ -256,6 +265,8 @@ class HighResBackbone(nn.Module):
             key_dim=16,
             radius=2,
             learned=learned_upsampler,
+            orientation_aware=self.upsampler_orientation,
+            subtoken_offsets=self.upsampler_subtoken,
         )
         self.debiaser = ApositionalFeatureDebiaser(
             enabled=debias_positional, degree=debias_degree
@@ -532,6 +543,66 @@ class HighResBackbone(nn.Module):
             multi_feats = torch.cat((multi_feats, out_dict["x_patchattn"]), dim=-1)
         return multi_feats
 
+    @property
+    def resolved_min_input_size(self) -> int | None:
+        if self.min_input_size == "auto":
+            return 112 if self.pretrained else None
+        if self.min_input_size is None or int(self.min_input_size) <= 0:
+            return None
+        return int(self.min_input_size)
+
+    def small_fov_upscale_factor(self, img_h: int, img_w: int) -> int:
+        eff_min = self.resolved_min_input_size
+        h_i, w_i = int(img_h), int(img_w)
+        if eff_min is None or min(h_i, w_i) >= eff_min:
+            return 1
+        raw_up = max(1, int(math.ceil(eff_min / max(1, min(h_i, w_i)))))
+        if max(h_i, w_i) > eff_min:
+            max_cap = max(1, int((2 * eff_min) // max(1, max(h_i, w_i))))
+            return min(raw_up, max_cap)
+        return raw_up
+
+    def extract_patch_grid(
+        self,
+        transformed_img: torch.Tensor,
+        attn_choice: AttentionOptions = "none",
+    ) -> torch.Tensor:
+        """Extract spatial ViT patch grid ``(1, C, n_patch_h, n_patch_w)``,
+        automatically bicubic-upsampling small-FOV inputs
+        (``min(H, W) < min_input_size``) onto an exact stride-divisible grid to
+        prevent ViT token starvation.
+        """
+        img_h, img_w = int(transformed_img.shape[-2]), int(transformed_img.shape[-1])
+        up_scale = self.small_fov_upscale_factor(img_h, img_w)
+        if up_scale > 1:
+            patch = self.original_patch_size
+            stride_l = self.stride[0]
+            up_h = patch + stride_l * int(
+                math.ceil(max(img_h * up_scale - patch, 0) / stride_l)
+            )
+            up_w = patch + stride_l * int(
+                math.ceil(max(img_w * up_scale - patch, 0) / stride_l)
+            )
+            vit_in = F.interpolate(
+                transformed_img.float(),
+                size=(up_h, up_w),
+                mode="bicubic",
+                align_corners=False,
+            ).to(transformed_img.dtype)
+            n_patch_h, n_patch_w = self.get_n_patches(up_h, up_w)
+        else:
+            vit_in = transformed_img
+            n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
+
+        feats = self.extract_patch_tokens(vit_in, attn_choice=attn_choice)
+        channels = int(feats.shape[-1])
+        return (
+            feats.squeeze(0)
+            .reshape(n_patch_h, n_patch_w, channels)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+        )
+
     @torch.no_grad()
     def _forward_single_tile(
         self, x: torch.Tensor, attn_choice: AttentionOptions = "none"
@@ -540,20 +611,12 @@ class HighResBackbone(nn.Module):
             x = x.to(self.dtype)
         img_batch = self.get_transformed_input_batch(x, self.transforms)
         _, img_h, img_w = x.shape
-        n_patch_h, n_patch_w = self.get_n_patches(img_h, img_w)
 
         out_feature_img: torch.Tensor | None = None
         n_transforms = len(self.transforms)
         for i in range(n_transforms):
             transformed_img = img_batch[i].unsqueeze(0)
-            feats = self.extract_patch_tokens(transformed_img, attn_choice=attn_choice)
-            channels = int(feats.shape[-1])
-            permuted = (
-                feats.squeeze(0)
-                .reshape(n_patch_h, n_patch_w, channels)
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-            )
+            permuted = self.extract_patch_grid(transformed_img, attn_choice=attn_choice)
             full_size = self._upsample_patch_map(
                 permuted, (img_h, img_w), guidance_img=transformed_img
             )

@@ -14,8 +14,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .fusion import CorrelativeFuser
-from .loaders import _natural_sort_key, load_image_array
+from .fusion import (
+    CorrelativeFuser,
+    PoreMaskSpec,
+    _otsu_threshold_1d,
+    _tie_homogeneity_filter_2d,
+)
+from .loaders import _natural_sort_key, detrend_radial_cupping, load_image_array
 from .transforms import (
     build_default_tta,
     ensure_spatial_divisible,
@@ -369,6 +374,143 @@ class VolumetricFuser:
         )
         self._global_prior: torch.Tensor | None = None
         self._sparse_guides_norm: dict[int, torch.Tensor] = {}
+        self._last_fit_diagnostics: dict[str, Any] = {}
+        self._fit_pore_mask_spec: PoreMaskSpec = None
+
+    def _filter_plane_for_otsu(
+        self, plane: np.ndarray, alpha: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        arr = np.asarray(plane, dtype=np.float32)
+        fin = np.isfinite(arr)
+        if not np.any(fin):
+            return np.zeros_like(arr), fin
+        f_vals = arr[fin]
+        work = np.nan_to_num(
+            arr,
+            nan=float(np.median(f_vals)),
+            posinf=float(np.max(f_vals)),
+            neginf=float(np.min(f_vals)),
+        )
+        if self.fuser.pore_detrend_cupping:
+            work = detrend_radial_cupping(work, valid_mask=fin)
+        if alpha > 0.0:
+            work = _tie_homogeneity_filter_2d(work, alpha)
+        return work, fin
+
+    def _estimate_global_otsu_3d(
+        self, accessor: VolumeSliceAccessor, eff_spec: str
+    ) -> tuple[float, float]:
+        if eff_spec == "auto_otsu_fringe_guarded":
+            alpha = (
+                self.fuser.pore_homogeneity_alpha_vox2
+                if self.fuser.pore_homogeneity_alpha_vox2 > 0.0
+                else 0.6
+            )
+        elif eff_spec == "auto_otsu":
+            alpha = float(max(0.0, self.fuser.pore_homogeneity_alpha_vox2))
+        else:
+            raise ValueError(f"Unsupported 3D pore_mask='{eff_spec}'.")
+        z_dim = accessor.shape[0]
+        n_sub = min(z_dim, 16)
+        z_indices = np.unique(np.linspace(0, z_dim - 1, num=n_sub, dtype=int))
+        samples = []
+        for z_i in z_indices:
+            w_p, fin_p = self._filter_plane_for_otsu(
+                accessor.get_plane(0, int(z_i)), alpha
+            )
+            if np.any(fin_p):
+                v = w_p[fin_p]
+                step = max(1, v.size // 16384)
+                samples.append(v[::step])
+        if not samples:
+            return 0.0, alpha
+        return _otsu_threshold_1d(np.concatenate(samples, axis=0)), alpha
+
+    def _resolve_slice_pore_mask_2d(
+        self,
+        accessor: VolumeSliceAccessor,
+        index: int,
+        axis: int,
+        padded_hw: tuple[int, int],
+        orig_hw: tuple[int, int],
+        spec: PoreMaskSpec,
+        device: torch.device,
+        global_otsu_alpha: tuple[float, float] | None = None,
+    ) -> torch.Tensor | None:
+        eff_spec = spec if spec is not None else self.fuser.pore_mask_spec
+        if eff_spec is None:
+            return None
+        if isinstance(eff_spec, str):
+            thresh, alpha = (
+                global_otsu_alpha
+                if global_otsu_alpha is not None
+                else self._estimate_global_otsu_3d(accessor, eff_spec)
+            )
+            w_p, fin_p = self._filter_plane_for_otsu(
+                accessor.get_plane(axis, index), alpha
+            )
+            plane_m = (w_p < thresh) & fin_p
+            return self.fuser._resolve_pore_mask_2d(
+                plane_m,
+                padded_hw=padded_hw,
+                orig_hw=orig_hw,
+                spec_override=plane_m,
+                device=device,
+            )
+        pm_acc = VolumeSliceAccessor(eff_spec)
+        d_hr = max(1, accessor.shape[axis])
+        d_pm = max(1, pm_acc.shape[axis])
+        idx_pm = min(d_pm - 1, round(index * (d_pm - 1) / max(d_hr - 1, 1)))
+        plane_m = pm_acc.get_plane(axis, idx_pm) > 0.5
+        return self.fuser._resolve_pore_mask_2d(
+            plane_m,
+            padded_hw=padded_hw,
+            orig_hw=orig_hw,
+            spec_override=plane_m,
+            device=device,
+        )
+
+    def _resolve_volume_pore_mask_3d(
+        self,
+        accessor: VolumeSliceAccessor,
+        spec: PoreMaskSpec,
+    ) -> torch.Tensor | None:
+        eff_spec = (
+            spec
+            if spec is not None
+            else (
+                self._fit_pore_mask_spec
+                if self._fit_pore_mask_spec is not None
+                else self.fuser.pore_mask_spec
+            )
+        )
+        if eff_spec is None:
+            return None
+        z_dim, y_dim, x_dim = accessor.shape
+        if isinstance(eff_spec, str):
+            thresh, alpha = self._estimate_global_otsu_3d(accessor, eff_spec)
+            planes = []
+            for z_i in range(z_dim):
+                w_p, fin_p = self._filter_plane_for_otsu(
+                    accessor.get_plane(0, z_i), alpha
+                )
+                planes.append((w_p < thresh) & fin_p)
+            return torch.from_numpy(np.stack(planes, axis=0))
+        pm_acc = VolumeSliceAccessor(eff_spec)
+        planes_m = [pm_acc.get_plane(0, z_i) > 0.5 for z_i in range(pm_acc.shape[0])]
+        pm_t = torch.from_numpy(np.stack(planes_m, axis=0))
+        if tuple(pm_t.shape) != (z_dim, y_dim, x_dim):
+            pm_t = (
+                F.interpolate(
+                    pm_t.float().unsqueeze(0).unsqueeze(0),
+                    size=(z_dim, y_dim, x_dim),
+                    mode="nearest",
+                )
+                .squeeze(0)
+                .squeeze(0)
+                > 0.5
+            )
+        return pm_t
 
     def _can_tile_head(self) -> bool:
         return self.fuser.xrd_fuse_method in ("learned_gating", "spatial_mlp")
@@ -402,6 +544,291 @@ class VolumetricFuser:
         )
         return padded, orig_hw
 
+    def _forward_slab_logits_grad(
+        self,
+        slab_t: torch.Tensor,
+        orig_hw: tuple[int, int],
+        guide_ref: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Differentiably predict canonical HR logits ``(1, M, H_pad, W_pad)``
+        ensembled across TTA views while reusing cached frozen ViT features."""
+        from .heads import SpatialConvMLPHead
+
+        _, img_h, img_w = slab_t.shape
+        kind, cached_views = self.fuser._extract_tta_views(slab_t, want_hr=True)
+        img_batch: torch.Tensor | None = None
+        if kind == "patch" or self.fuser.xrd_fuse_method == "spatial_mlp":
+            x_in = (
+                slab_t.to(self.fuser.dtype)
+                if self.fuser.dtype != torch.float32
+                else slab_t
+            )
+            with torch.no_grad():
+                img_batch = self.fuser.get_transformed_input_batch(
+                    x_in, self.fuser.transforms
+                )
+
+        n_tr = len(self.fuser.transforms)
+        valid_hw = orig_hw if orig_hw != (img_h, img_w) else None
+        logits_acc: torch.Tensor | None = None
+        for i in range(n_tr):
+            tr_img = img_batch[i].unsqueeze(0) if img_batch is not None else None
+            feat_in = (
+                self.fuser._upsample_patch_map(
+                    cached_views[i].float(), (img_h, img_w), guidance_img=tr_img
+                )
+                if (kind == "patch" and tr_img is not None)
+                else cached_views[i]
+            )
+            if self.fuser.xrd_fuse_method in ("learned_gating", "spatial_mlp"):
+                head_mod = (
+                    self.fuser.learned_gating
+                    if self.fuser.xrd_fuse_method == "learned_gating"
+                    else self.fuser.spatial_mlp
+                )
+                assert head_mod is not None
+                l_tr = head_mod.predict_logits(feat_in, guidance_hr=tr_img)
+                if l_tr.shape[-2:] != (img_h, img_w):
+                    l_tr = F.interpolate(
+                        l_tr,
+                        size=(img_h, img_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                l_can = self.fuser.inverse_transforms[i](l_tr)
+                if isinstance(head_mod, SpatialConvMLPHead) and guide_ref is not None:
+                    l_can = head_mod.apply_guide_residual(
+                        l_can, guide_ref, valid_hr_hw=valid_hw
+                    )
+            else:
+                assert self.fuser.spatial_attention is not None
+                if feat_in.shape[-2:] != (img_h, img_w):
+                    feat_in = F.interpolate(
+                        feat_in.float(),
+                        size=(img_h, img_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                f_can = self.fuser.inverse_transforms[i](feat_in)
+                g_att = (
+                    guide_ref
+                    if guide_ref is not None
+                    else torch.full(
+                        (1, self.fuser.guide_channels, 4, 4),
+                        0.5,
+                        device=slab_t.device,
+                    )
+                )
+                l_can = self.fuser.spatial_attention.predict_logits(f_can, g_att)
+            logits_acc = l_can if logits_acc is None else (logits_acc + l_can)
+        assert logits_acc is not None
+        return logits_acc / float(max(n_tr, 1))
+
+    def _logits_to_probs_grad(
+        self, logits: torch.Tensor, target_hint: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, str]:
+        phys = self.fuser._active_physics()
+        if phys is not None and phys.loss_fn == "compositional_kl":
+            sp = phys.logits_to_simplex_probs(logits.float(), target=target_hint)
+            tag = "simplex_bg" if sp.shape[1] == phys.n_channels + 1 else "simplex_full"
+            return sp, tag
+        return torch.sigmoid(logits.float()), "sigmoid"
+
+    @staticmethod
+    def _probs_to_effective_logits(
+        probs: torch.Tensor, mode_tag: str, eps: float = 1e-6
+    ) -> torch.Tensor:
+        p = probs.clamp(eps, 1.0 - eps)
+        if mode_tag == "simplex_bg":
+            return torch.log(p[:, 1:]) - torch.log(p[:, :1])
+        if mode_tag == "simplex_full":
+            return torch.log(p)
+        return torch.logit(p, eps=eps)
+
+    def _depth_psf_slice_step(
+        self,
+        s_idx: int,
+        canon_guide: torch.Tensor,
+        center_slab: torch.Tensor,
+        orig_hw: tuple[int, int],
+        loss_mask_lr: torch.Tensor | None,
+        stencil_slabs: dict[int, tuple[torch.Tensor, tuple[int, int]]],
+        sparse_norm_cpu: dict[int, torch.Tensor],
+        depth_ax: int,
+        axis: int,
+        stencil_radius: int,
+        z_step: int,
+        sigma_z: torch.Tensor,
+        update_aligner: bool,
+        dev: torch.device,
+        stencil_pore_masks: dict[int, torch.Tensor | None] | None = None,
+    ) -> float:
+        assert self.fuser.fusion_optimizer is not None
+        self.fuser.fusion_optimizer.zero_grad()
+        if self.fuser.align_optimizer is not None:
+            self.fuser.align_optimizer.zero_grad()
+
+        g_ref = canon_guide.unsqueeze(0) if canon_guide.ndim == 3 else canon_guide
+        dz = torch.tensor(
+            [float(j * z_step) for j in range(-stencil_radius, stencil_radius + 1)],
+            device=dev,
+            dtype=torch.float32,
+        )
+        w_z = torch.exp(-0.5 * (dz / sigma_z) ** 2)
+        w_z = w_z / w_z.sum().clamp(min=1e-8)
+
+        p_bar: torch.Tensor | None = None
+        solid_bar: torch.Tensor | None = None
+        has_any_pm = False
+        l_center: torch.Tensor | None = None
+        mode_tag = "sigmoid"
+        for j_i, j in enumerate(range(-stencil_radius, stencil_radius + 1)):
+            z_nb = int(np.clip(s_idx + j * z_step, 0, depth_ax - 1))
+            nb_slab, nb_hw = stencil_slabs[z_nb]
+            g_nb = self._resolve_slice_guide_2d(
+                idx=z_nb,
+                depth=depth_ax,
+                axis=axis,
+                coarse_guide_3d_norm=None,
+                sparse_guides_norm=sparse_norm_cpu or None,
+                fallback_guide=g_ref,
+                device=dev,
+            )
+            l_nb = self._forward_slab_logits_grad(nb_slab, nb_hw, guide_ref=g_nb)
+            pm_nb = (
+                stencil_pore_masks.get(z_nb) if stencil_pore_masks is not None else None
+            )
+            if pm_nb is not None:
+                has_any_pm = True
+                l_nb, _ = self.fuser._apply_pore_mask_to_logits_and_guide(
+                    l_nb, g_ref, pm_nb, allow_guide_porosity_cap=False
+                )
+                sol_nb = (~pm_nb.to(device=dev, dtype=torch.bool)).float()
+            else:
+                sol_nb = torch.ones(
+                    (1, 1, l_nb.shape[-2], l_nb.shape[-1]),
+                    device=dev,
+                    dtype=torch.float32,
+                )
+            w_sol = w_z[j_i].detach() * sol_nb
+            solid_bar = w_sol if solid_bar is None else (solid_bar + w_sol)
+            if j == 0:
+                l_center = l_nb
+            p_nb, mode_tag = self._logits_to_probs_grad(l_nb, target_hint=g_ref)
+            w_p = w_z[j_i] * p_nb
+            p_bar = w_p if p_bar is None else (p_bar + w_p)
+
+        assert p_bar is not None
+        logits_eff = self._probs_to_effective_logits(p_bar, mode_tag)
+        aligner_arg = (
+            self.fuser.guide_aligner if self.fuser.align_guide != "none" else None
+        )
+        valid_hw = orig_hw if orig_hw != tuple(center_slab.shape[-2:]) else None
+        if (
+            has_any_pm
+            and solid_bar is not None
+            and self.fuser.spectral_channels is None
+            and self.fuser.loss_fn != "forward_psf_poisson"
+            and (
+                self.fuser.guide_channels >= 2
+                or self.fuser.loss_fn == "compositional_kl"
+            )
+        ):
+            solid_hr = (
+                solid_bar[:, :, : valid_hw[0], : valid_hw[1]]
+                if valid_hw is not None
+                else solid_bar
+            )
+            lr_hw_g = (int(g_ref.shape[-2]), int(g_ref.shape[-1]))
+            ds = self.fuser._active_downsampler()
+            with torch.no_grad():
+                if self.fuser.align_guide != "none":
+                    solid_hr = self.fuser.guide_aligner(solid_hr, lr_hw_g).clamp(
+                        0.0, 1.0
+                    )
+                if ds is not None:
+                    f_solid_lr = ds(
+                        solid_hr.expand(-1, ds.n_channels, -1, -1), lr_hw_g
+                    ).mean(dim=1, keepdim=True)
+                else:
+                    f_solid_lr = F.adaptive_avg_pool2d(solid_hr, output_size=lr_hw_g)
+                g_sum = g_ref.sum(dim=1, keepdim=True)
+                scale = torch.where(
+                    g_sum > f_solid_lr + 1e-4,
+                    (f_solid_lr / g_sum.clamp(min=1e-6)).clamp(0.0, 1.0),
+                    torch.ones_like(g_sum),
+                )
+            g_ref = g_ref * scale
+        if self.fuser.xrd_fuse_method == "spatial_mlp":
+            from .heads import edge_aware_tv_loss
+
+            assert self.fuser.spatial_mlp is not None
+            loss_t = self.fuser.spatial_mlp.physics.compute_loss_from_logits(
+                logits_eff,
+                guide_map=g_ref,
+                coarse_target=g_ref,
+                aligner=aligner_arg,
+                valid_hr_hw=valid_hw,
+                loss_mask_lr=loss_mask_lr,
+            )
+            if self.fuser.spatial_mlp.tv_weight > 0.0 and l_center is not None:
+                tv_logits = (
+                    l_center[:, :, : valid_hw[0], : valid_hw[1]]
+                    if valid_hw is not None
+                    else l_center
+                )
+                g_hr_c = center_slab.unsqueeze(0)
+                tv_g = (
+                    g_hr_c[:, :, : valid_hw[0], : valid_hw[1]]
+                    if valid_hw is not None
+                    else g_hr_c
+                )
+                simplex = self.fuser.spatial_mlp.loss_fn == "compositional_kl"
+                loss_t = loss_t + self.fuser.spatial_mlp.tv_weight * edge_aware_tv_loss(
+                    tv_logits,
+                    guidance_hr=tv_g,
+                    simplex=simplex,
+                    orientation_aware=self.fuser.spatial_mlp.orientation_aware,
+                )
+        elif self.fuser.xrd_fuse_method == "learned_gating":
+            assert self.fuser.learned_gating is not None
+            loss_t = self.fuser.learned_gating.compute_loss_from_logits(
+                logits_eff,
+                xrd_map=g_ref,
+                coarse_target=g_ref,
+                aligner=aligner_arg,
+                valid_hr_hw=valid_hw,
+                loss_mask_lr=loss_mask_lr,
+            )
+        else:
+            assert self.fuser.spatial_attention is not None
+            loss_t = self.fuser.spatial_attention.compute_loss_from_logits(
+                logits_eff[:, :, : orig_hw[0], : orig_hw[1]],
+                guide_map=g_ref,
+                coarse_target=g_ref,
+                aligner=aligner_arg,
+                loss_mask_lr=loss_mask_lr,
+            )
+        if aligner_arg is not None and update_aligner:
+            loss_t = loss_t + aligner_arg.regularization_loss(
+                (int(g_ref.shape[-2]), int(g_ref.shape[-1])),
+                device=dev,
+                hr_hw=orig_hw,
+            )
+        loss_t.backward()
+        all_p = [
+            p for pg in self.fuser.fusion_optimizer.param_groups for p in pg["params"]
+        ]
+        if all_p:
+            torch.nn.utils.clip_grad_norm_(all_p, max_norm=1.0)
+        self.fuser.fusion_optimizer.step()
+        if update_aligner and self.fuser.align_optimizer is not None:
+            torch.nn.utils.clip_grad_norm_(
+                list(self.fuser.guide_aligner.parameters()), max_norm=1.0
+            )
+            self.fuser.align_optimizer.step()
+        return float(loss_t.item())
+
     def fit_sparse_slices(
         self,
         hr_volume: Any,
@@ -410,15 +837,32 @@ class VolumetricFuser:
         delta: int = 1,
         axis: int = 0,
         reset_weights: bool = True,
+        *,
+        pore_mask: PoreMaskSpec = None,
+        depth_psf_sigma: float = 0.0,
+        learn_depth_psf: bool = False,
+        depth_stencil_radius: int = 1,
+        triplane_consistency_weight: float = 0.0,
+        n_consistency_slices: int = 2,
     ) -> list[float]:
         """Train the ``CorrelativeFuser`` head on sparse 2D guided slices
-        ``{slice_idx: guide_map}`` using 2.5D ``(z - delta, z, z + delta)`` slabs."""
+        ``{slice_idx: guide_map}`` using 2.5D ``(z - delta, z, z + delta)`` slabs,
+        with optional axial depth-PSF deconvolution and tri-plane consistency."""
         if not sparse_guides:
             raise ValueError("sparse_guides must contain at least one guided slice.")
         if reset_weights:
             self.fuser.reset_trainable_weights()
+        elif self.fuser.fusion_optimizer is not None:
+            self.fuser.fusion_optimizer.param_groups = [
+                pg
+                for pg in self.fuser.fusion_optimizer.param_groups
+                if not pg.get("_depth_psf_group", False)
+            ]
 
+        self._fit_pore_mask_spec = pore_mask
         accessor = VolumeSliceAccessor(hr_volume)
+        z_dim, y_dim, x_dim = accessor.shape
+        depth_ax = accessor.shape[axis]
         vmin, vmax = accessor.estimate_robust_range()
         dev = next(self.fuser.dinov2.parameters()).device
         is_spectral = self.fuser.spectral_channels is not None
@@ -428,8 +872,15 @@ class VolumetricFuser:
         sparse_norm_cpu: dict[int, torch.Tensor] = {}
         prepared_slabs: dict[int, torch.Tensor] = {}
         orig_hws: dict[int, tuple[int, int]] = {}
+        slice_pore_masks: dict[int, torch.Tensor | None] = {}
         cal_masks: dict[int, torch.Tensor | None] = {}
         train_masks: dict[int, torch.Tensor | None] = {}
+        eff_pm_spec = pore_mask if pore_mask is not None else self.fuser.pore_mask_spec
+        global_otsu_alpha = (
+            self._estimate_global_otsu_3d(accessor, eff_pm_spec)
+            if isinstance(eff_pm_spec, str)
+            else None
+        )
         prior_accum = []
         for idx, g_raw in sparse_guides.items():
             s_i = int(idx)
@@ -440,6 +891,16 @@ class VolumetricFuser:
             )
             prepared_slabs[s_i] = slab_t
             orig_hws[s_i] = orig_hw
+            slice_pore_masks[s_i] = self._resolve_slice_pore_mask_2d(
+                accessor,
+                s_i,
+                axis=axis,
+                padded_hw=(int(slab_t.shape[-2]), int(slab_t.shape[-1])),
+                orig_hw=orig_hw,
+                spec=pore_mask,
+                device=dev,
+                global_otsu_alpha=global_otsu_alpha,
+            )
             lr_hw = (int(g_t.shape[-2]), int(g_t.shape[-1]))
             if self.fuser.calibrator is not None and lr_hw[0] * lr_hw[1] >= 16:
                 cm = self.fuser.calibrator.make_spatial_holdout_mask(
@@ -455,20 +916,141 @@ class VolumetricFuser:
                 sparse_norm_cpu[s_i] = g_unit.detach().cpu()
                 prior_accum.append(g_unit.mean(dim=(-2, -1)))
 
+        slice_keys = sorted(prepared_guides.keys())
+        use_depth_psf = (depth_psf_sigma > 0.0 or learn_depth_psf) and depth_ax >= 2
+        use_cons = (
+            triplane_consistency_weight > 0.0
+            and min(z_dim, y_dim, x_dim) >= 4
+            and max(1, int(n_consistency_slices)) >= 1
+        )
+
+        self.fuser.set_guide_transforms(
+            prepared_guides[slice_keys[0]],
+            self.fwd_tta,
+            self.inv_tta,
+            spectral_unmix=is_spectral,
+            n_components=self.fuser.guide_channels,
+        )
+        if is_spectral:
+            for s_i in slice_keys:
+                ref_u = self.fuser._effective_reference_guide(prepared_guides[s_i])
+                sparse_norm_cpu[s_i] = ref_u.detach().cpu()
+                prior_accum.append(ref_u.detach().mean(dim=(-2, -1)))
+
         self._sparse_guides_norm = sparse_norm_cpu
         if prior_accum:
             self._global_prior = torch.stack(prior_accum, dim=0).mean(dim=0)
-        # Ensure all sparse slices fit in the TTA feature cache across epochs
-        self.fuser._max_cache_entries = max(
-            self.fuser._max_cache_entries, len(prepared_slabs) + 2
-        )
 
+        raw_depth_sigma: torch.nn.Parameter | None = None
+        init_sig = float(
+            np.clip(depth_psf_sigma if depth_psf_sigma > 0.0 else 1.5, 0.35, 5.8)
+        )
+        # Contiguous unit-step stencil (z_step=1) avoids skipping intermediate slices
+        stencil_r = (
+            min(
+                4,
+                max(
+                    int(depth_stencil_radius),
+                    int(np.ceil(1.5 * init_sig)),
+                    2 if learn_depth_psf else 1,
+                ),
+            )
+            if use_depth_psf
+            else max(1, int(depth_stencil_radius))
+        )
+        z_step = 1
+        stencil_slabs: dict[int, tuple[torch.Tensor, tuple[int, int]]] = {
+            s_i: (prepared_slabs[s_i], orig_hws[s_i]) for s_i in slice_keys
+        }
+        if use_depth_psf:
+            if learn_depth_psf and self.fuser.fusion_optimizer is not None:
+                frac = float(np.clip((init_sig - 0.25) / 6.0, 1e-3, 1.0 - 1e-3))
+                raw_depth_sigma = torch.nn.Parameter(
+                    torch.tensor(
+                        float(np.log(frac / (1.0 - frac))),
+                        device=dev,
+                        dtype=torch.float32,
+                    )
+                )
+                self.fuser.fusion_optimizer.add_param_group(
+                    {
+                        "params": [raw_depth_sigma],
+                        "lr": max(self.fuser.lr * 2.0, 2e-2),
+                        "_depth_psf_group": True,
+                    }
+                )
+            for s_i in slice_keys:
+                for j in range(-stencil_r, stencil_r + 1):
+                    z_nb = int(np.clip(s_i + j * z_step, 0, depth_ax - 1))
+                    if z_nb not in stencil_slabs:
+                        nb_s, nb_hw = self._prepare_slab_tensor(
+                            accessor,
+                            z_nb,
+                            axis=axis,
+                            delta=delta,
+                            vmin=vmin,
+                            vmax=vmax,
+                            device=dev,
+                        )
+                        stencil_slabs[z_nb] = (nb_s, nb_hw)
+                        slice_pore_masks[z_nb] = self._resolve_slice_pore_mask_2d(
+                            accessor,
+                            z_nb,
+                            axis=axis,
+                            padded_hw=(int(nb_s.shape[-2]), int(nb_s.shape[-1])),
+                            orig_hw=nb_hw,
+                            spec=pore_mask,
+                            device=dev,
+                            global_otsu_alpha=global_otsu_alpha,
+                        )
+
+        cons_coords: list[tuple[int, int, int]] = []
+        cons_slabs: dict[tuple[int, int], tuple[torch.Tensor, tuple[int, int]]] = {}
+        if use_cons:
+            n_cs = max(1, int(n_consistency_slices))
+            n_pool = max(2, n_cs * 2)
+            unguided = [
+                z_i for z_i in range(z_dim) if (axis != 0 or z_i not in prepared_guides)
+            ] or list(range(z_dim))
+            rng_c = np.random.default_rng(137 + len(slice_keys))
+            z_ps = [
+                int(unguided[i % len(unguided)])
+                for i in np.linspace(0, len(unguided) - 1, num=n_pool, dtype=int)
+            ]
+            y_ps = rng_c.integers(1, max(2, y_dim - 1), size=n_pool).tolist()
+            x_ps = rng_c.integers(1, max(2, x_dim - 1), size=n_pool).tolist()
+            for z_u, y_u, x_u in zip(z_ps, y_ps, x_ps, strict=False):
+                cons_coords.append((int(z_u), int(y_u), int(x_u)))
+                for ax_c, idx_c in ((0, int(z_u)), (1, int(y_u)), (2, int(x_u))):
+                    if (ax_c, idx_c) not in cons_slabs:
+                        cons_slabs[(ax_c, idx_c)] = (
+                            stencil_slabs[idx_c]
+                            if (ax_c == axis and idx_c in stencil_slabs)
+                            else self._prepare_slab_tensor(
+                                accessor,
+                                idx_c,
+                                axis=ax_c,
+                                delta=delta,
+                                vmin=vmin,
+                                vmax=vmax,
+                                device=dev,
+                            )
+                        )
+
+        self.fuser._max_cache_entries = max(
+            self.fuser._max_cache_entries, len(stencil_slabs) + len(cons_slabs) + 4
+        )
         self.fuser.train()
         self.fuser.dinov2.eval()
         epoch_losses: list[float] = []
-        slice_keys = sorted(prepared_guides.keys())
         n_ep = max(1, epochs)
         warmup_ep = int(round(0.3 * n_ep)) if self.fuser.align_guide != "none" else 0
+        dummy_guide = (
+            self._global_prior.to(dev).unsqueeze(-1).unsqueeze(-1)
+            if self._global_prior is not None
+            else torch.full((1, self.fuser.guide_channels, 4, 4), 0.5, device=dev)
+        )
+
         for ep in range(n_ep):
             step_losses = []
             for s_idx in slice_keys:
@@ -479,39 +1061,200 @@ class VolumetricFuser:
                     spectral_unmix=is_spectral,
                     n_components=self.fuser.guide_channels,
                 )
-                loss_val = self.fuser.train_fusion_step(
-                    prepared_slabs[s_idx],
-                    update_aligner=(ep >= warmup_ep),
-                    valid_hr_hw=orig_hws[s_idx],
-                    loss_mask_lr=train_masks[s_idx],
-                )
+                if not use_depth_psf:
+                    loss_val = self.fuser.train_fusion_step(
+                        prepared_slabs[s_idx],
+                        update_aligner=(ep >= warmup_ep),
+                        valid_hr_hw=orig_hws[s_idx],
+                        loss_mask_lr=train_masks[s_idx],
+                        pore_mask_hr=slice_pore_masks.get(s_idx),
+                    )
+                else:
+                    sig_t = (
+                        0.25 + 6.0 * torch.sigmoid(raw_depth_sigma)
+                        if raw_depth_sigma is not None
+                        else torch.tensor(
+                            max(float(depth_psf_sigma), 0.25),
+                            device=dev,
+                            dtype=torch.float32,
+                        )
+                    )
+                    loss_val = self._depth_psf_slice_step(
+                        s_idx=s_idx,
+                        canon_guide=prepared_guides[s_idx],
+                        center_slab=prepared_slabs[s_idx],
+                        orig_hw=orig_hws[s_idx],
+                        loss_mask_lr=train_masks[s_idx],
+                        stencil_slabs=stencil_slabs,
+                        sparse_norm_cpu=sparse_norm_cpu,
+                        depth_ax=depth_ax,
+                        axis=axis,
+                        stencil_radius=stencil_r,
+                        z_step=z_step,
+                        sigma_z=sig_t,
+                        update_aligner=(ep >= warmup_ep),
+                        dev=dev,
+                        stencil_pore_masks=slice_pore_masks,
+                    )
                 step_losses.append(loss_val)
+
+            if (
+                use_cons
+                and ep >= int(0.25 * n_ep)
+                and self.fuser.fusion_optimizer is not None
+                and cons_coords
+            ):
+                self.fuser.fusion_optimizer.zero_grad()
+                n_cs = max(1, int(n_consistency_slices))
+                c_sum = torch.tensor(0.0, device=dev)
+                sp_z = sparse_norm_cpu if (axis == 0 and sparse_norm_cpu) else None
+                for k_c in range(n_cs):
+                    z_u, y_u, x_u = cons_coords[(ep * n_cs + k_c) % len(cons_coords)]
+                    s_xy, hw_xy = cons_slabs[(0, z_u)]
+                    s_xz, hw_xz = cons_slabs[(1, y_u)]
+                    s_yz, hw_yz = cons_slabs[(2, x_u)]
+                    g_xy = self._resolve_slice_guide_2d(
+                        z_u, z_dim, 0, None, sp_z, dummy_guide, dev, z_dim=z_dim
+                    )
+                    g_xz = self._resolve_slice_guide_2d(
+                        y_u, y_dim, 1, None, sp_z, dummy_guide, dev, z_dim=z_dim
+                    )
+                    g_yz = self._resolve_slice_guide_2d(
+                        x_u, x_dim, 2, None, sp_z, dummy_guide, dev, z_dim=z_dim
+                    )
+                    p_xy = self._logits_to_probs_grad(
+                        self._forward_slab_logits_grad(s_xy, hw_xy, guide_ref=g_xy)
+                    )[0][0, :, : hw_xy[0], : hw_xy[1]]
+                    p_xz = self._logits_to_probs_grad(
+                        self._forward_slab_logits_grad(s_xz, hw_xz, guide_ref=g_xz)
+                    )[0][0, :, : hw_xz[0], : hw_xz[1]]
+                    p_yz = self._logits_to_probs_grad(
+                        self._forward_slab_logits_grad(s_yz, hw_yz, guide_ref=g_yz)
+                    )[0][0, :, : hw_yz[0], : hw_yz[1]]
+
+                    lx_a, lx_b = p_xy[:, y_u, :], p_xz[:, z_u, :]
+                    bx = 0.55 * lx_a.detach() + 0.45 * lx_b.detach()
+                    ly_a, ly_b = p_xy[:, :, x_u], p_yz[:, z_u, :]
+                    by = 0.55 * ly_a.detach() + 0.45 * ly_b.detach()
+                    lz_a, lz_b = p_xz[:, :, x_u], p_yz[:, :, y_u]
+                    bz = 0.50 * (lz_a.detach() + lz_b.detach())
+                    c_sum = (
+                        c_sum
+                        + (
+                            F.mse_loss(lx_a, bx)
+                            + F.mse_loss(lx_b, bx)
+                            + F.mse_loss(ly_a, by)
+                            + F.mse_loss(ly_b, by)
+                            + F.mse_loss(lz_a, bz)
+                            + F.mse_loss(lz_b, bz)
+                        )
+                        / 6.0
+                    )
+                (float(triplane_consistency_weight) * (c_sum / float(n_cs))).backward()
+                all_p = [
+                    p
+                    for pg in self.fuser.fusion_optimizer.param_groups
+                    for p in pg["params"]
+                ]
+                if all_p:
+                    torch.nn.utils.clip_grad_norm_(all_p, max_norm=1.0)
+                self.fuser.fusion_optimizer.step()
+
             epoch_losses.append(float(np.mean(step_losses)))
         self.fuser.eval()
 
-        # Calibrate zero-label conformal sets on held-out blocks of first guided slice
+        learned_sig_z = (
+            float((0.25 + 6.0 * torch.sigmoid(raw_depth_sigma)).detach().cpu().item())
+            if raw_depth_sigma is not None
+            else float(depth_psf_sigma)
+        )
+        self._last_fit_diagnostics = {
+            "depth_psf_enabled": bool(use_depth_psf),
+            "depth_psf_sigma_learned": learned_sig_z,
+            "triplane_consistency_weight": float(triplane_consistency_weight),
+        }
+
         if self.fuser.calibrator is not None and slice_keys:
-            s0 = slice_keys[0]
-            self.fuser.set_guide_transforms(
-                prepared_guides[s0],
-                self.fwd_tta,
-                self.inv_tta,
-                spectral_unmix=is_spectral,
-                n_components=self.fuser.guide_channels,
+            cal_mode: Literal["multiclass", "multilabel"] = (
+                "multiclass"
+                if (
+                    self.fuser.guide_channels >= 2
+                    or self.fuser.loss_fn == "compositional_kl"
+                )
+                else "multilabel"
             )
-            rep0 = self.fuser.predict_with_uncertainty(
-                prepared_slabs[s0], mode="multiclass"
-            ).crop_spatial(*orig_hws[s0])
-            ref_g0 = self.fuser._effective_reference_guide(prepared_guides[s0])
-            self.fuser.calibrator.calibrate_coarse(
-                probs_hr=rep0.probabilities,
-                guide_lr=ref_g0,
-                epistemic_var_hr=rep0.epistemic_variance,
-                cal_mask_lr=cal_masks[s0],
-                downsampler=self.fuser._active_downsampler(),
-                aligner=self.fuser.guide_aligner,
-                mode="multiclass",
+            self.fuser.set_transforms(self.fwd_tta, self.inv_tta)
+            probs_list, guides_list, epi_list, cm_list, pm_list = [], [], [], [], []
+            has_all_pm = True
+            for s_k in slice_keys:
+                g_k = prepared_guides[s_k]
+                self.fuser._bind_guide_only(g_k)
+                pm_k = slice_pore_masks.get(s_k)
+                oh_k, ow_k = orig_hws[s_k]
+                sl_k = prepared_slabs[s_k]
+                vh_k = (
+                    (oh_k, ow_k)
+                    if (oh_k, ow_k) != (int(sl_k.shape[-2]), int(sl_k.shape[-1]))
+                    else None
+                )
+                rep_k = self.fuser.predict_with_uncertainty(
+                    sl_k,
+                    guide_lr=g_k,
+                    mode=cal_mode,
+                    valid_hr_hw=vh_k,
+                    pore_mask_hr=pm_k,
+                ).crop_spatial(oh_k, ow_k)
+                ref_gk = self.fuser._effective_reference_guide(g_k)
+                if pm_k is not None:
+                    _, ref_gk = self.fuser._apply_pore_mask_to_logits_and_guide(
+                        rep_k.probabilities[:, : self.fuser.guide_channels],
+                        ref_gk,
+                        pm_k[:, :, :oh_k, :ow_k],
+                        valid_hr_hw=None,
+                        allow_guide_porosity_cap=(cal_mode == "multiclass"),
+                    )
+                    pm_list.append(pm_k[:, :, :oh_k, :ow_k])
+                else:
+                    has_all_pm = False
+                probs_list.append(rep_k.probabilities)
+                guides_list.append(ref_gk)
+                epi_list.append(rep_k.epistemic_variance)
+                cm_k = cal_masks[s_k]
+                cm_list.append(
+                    cm_k.unsqueeze(0)
+                    if cm_k is not None
+                    else torch.ones(
+                        (1, int(ref_gk.shape[-2]), int(ref_gk.shape[-1])),
+                        device=dev,
+                        dtype=torch.bool,
+                    )
+                )
+
+            same_shapes = len({tuple(p.shape[1:]) for p in probs_list}) == 1 and (
+                len({tuple(g.shape[1:]) for g in guides_list}) == 1
             )
+            if same_shapes and len(probs_list) > 1:
+                self.fuser.calibrator.calibrate_coarse(
+                    probs_hr=torch.cat(probs_list, dim=0),
+                    guide_lr=torch.cat(guides_list, dim=0),
+                    epistemic_var_hr=torch.cat(epi_list, dim=0),
+                    cal_mask_lr=torch.cat(cm_list, dim=0),
+                    downsampler=self.fuser._active_downsampler(),
+                    aligner=self.fuser.guide_aligner,
+                    mode=cal_mode,
+                    pore_mask_hr=(torch.cat(pm_list, dim=0) if has_all_pm else None),
+                )
+            else:
+                self.fuser.calibrator.calibrate_coarse(
+                    probs_hr=probs_list[0],
+                    guide_lr=guides_list[0],
+                    epistemic_var_hr=epi_list[0],
+                    cal_mask_lr=cal_masks[slice_keys[0]],
+                    downsampler=self.fuser._active_downsampler(),
+                    aligner=self.fuser.guide_aligner,
+                    mode=cal_mode,
+                    pore_mask_hr=(pm_list[0] if has_all_pm and pm_list else None),
+                )
         return epoch_losses
 
     @staticmethod
@@ -523,6 +1266,7 @@ class VolumetricFuser:
         sparse_guides_norm: dict[int, torch.Tensor] | None,
         fallback_guide: torch.Tensor,
         device: torch.device,
+        z_dim: int | None = None,
     ) -> torch.Tensor:
         if coarse_guide_3d_norm is not None:
             if axis == 0:
@@ -537,22 +1281,65 @@ class VolumetricFuser:
             i_lr = min(d_lr - 1, round(idx * (d_lr - 1) / max(depth - 1, 1)))
             return coarse_guide_3d_norm[:, :, :, i_lr].unsqueeze(0).to(device)
 
-        if axis == 0 and sparse_guides_norm:
+        if sparse_guides_norm:
             zs = sorted(sparse_guides_norm.keys())
-            if idx <= zs[0]:
-                return sparse_guides_norm[zs[0]].to(device)
-            if idx >= zs[-1]:
-                return sparse_guides_norm[zs[-1]].to(device)
-            for k in range(len(zs) - 1):
-                z0, z1 = zs[k], zs[k + 1]
-                if z0 <= idx <= z1:
-                    if idx == z0 or z1 == z0:
-                        return sparse_guides_norm[z0].to(device)
-                    w = float(idx - z0) / float(z1 - z0)
-                    g0, g1 = sparse_guides_norm[z0], sparse_guides_norm[z1]
-                    if g0.shape == g1.shape:
-                        return ((1.0 - w) * g0 + w * g1).to(device)
-                    return (g0 if w < 0.5 else g1).to(device)
+            if axis == 0:
+                if idx <= zs[0]:
+                    return sparse_guides_norm[zs[0]].to(device)
+                if idx >= zs[-1]:
+                    return sparse_guides_norm[zs[-1]].to(device)
+                for k in range(len(zs) - 1):
+                    z0, z1 = zs[k], zs[k + 1]
+                    if z0 <= idx <= z1:
+                        if idx == z0 or z1 == z0:
+                            return sparse_guides_norm[z0].to(device)
+                        w = float(idx - z0) / float(z1 - z0)
+                        g0, g1 = sparse_guides_norm[z0], sparse_guides_norm[z1]
+                        if g0.shape == g1.shape:
+                            return ((1.0 - w) * g0 + w * g1).to(device)
+                        return (g0 if w < 0.5 else g1).to(device)
+            else:
+                g_first = sparse_guides_norm[zs[0]]
+                h_lr, w_lr = int(g_first.shape[-2]), int(g_first.shape[-1])
+                lines_1d = []
+                for z_s in zs:
+                    g_s = sparse_guides_norm[z_s]
+                    if tuple(g_s.shape[-2:]) != (h_lr, w_lr):
+                        g_s = F.interpolate(
+                            g_s.float(),
+                            size=(h_lr, w_lr),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    if axis == 1:
+                        y_lr = min(
+                            h_lr - 1, round(idx * (h_lr - 1) / max(depth - 1, 1))
+                        )
+                        lines_1d.append(g_s[:, :, y_lr, :])
+                    else:
+                        x_lr = min(
+                            w_lr - 1, round(idx * (w_lr - 1) / max(depth - 1, 1))
+                        )
+                        lines_1d.append(g_s[:, :, :, x_lr])
+                if len(lines_1d) == 1:
+                    return lines_1d[0].unsqueeze(2).expand(-1, -1, 4, -1).to(device)
+                z_span = max(int(z_dim) if z_dim is not None else (zs[-1] + 1), 2)
+                z_lr_dim = min(max(z_span, 4), 64)
+                z_queries = np.linspace(0.0, float(z_span - 1), num=z_lr_dim)
+                rows_interp = []
+                for z_q in z_queries:
+                    if z_q <= zs[0]:
+                        rows_interp.append(lines_1d[0])
+                    elif z_q >= zs[-1]:
+                        rows_interp.append(lines_1d[-1])
+                    else:
+                        k_hi = int(np.searchsorted(zs, z_q, side="right"))
+                        z0, z1 = zs[k_hi - 1], zs[k_hi]
+                        w = float(z_q - z0) / max(float(z1 - z0), 1e-6)
+                        rows_interp.append(
+                            (1.0 - w) * lines_1d[k_hi - 1] + w * lines_1d[k_hi]
+                        )
+                return torch.stack(rows_interp, dim=2).to(device)
         return fallback_guide
 
     def _predict_single_plane_stack(
@@ -580,13 +1367,8 @@ class VolumetricFuser:
             if self._global_prior is not None
             else torch.full((1, n_guides, 4, 4), 0.5, device=device)
         )
-        self.fuser.set_guide_transforms(
-            dummy_guide,
-            self.fwd_tta,
-            self.inv_tta,
-            spectral_unmix=(self.fuser.spectral_channels is not None),
-            n_components=n_guides,
-        )
+        self.fuser.set_transforms(self.fwd_tta, self.inv_tta)
+        self.fuser._bind_guide_only(dummy_guide)
 
         for idx in range(depth):
             slice_guide = self._resolve_slice_guide_2d(
@@ -597,6 +1379,7 @@ class VolumetricFuser:
                 sparse_guides_norm=sparse_guides_norm,
                 fallback_guide=dummy_guide,
                 device=device,
+                z_dim=z_dim,
             )
             if needs_spatial_guide:
                 self.fuser._bind_guide_only(slice_guide)
@@ -632,6 +1415,13 @@ class VolumetricFuser:
                     stride=self.fuser.stride[0],
                 )
                 m_l = packed[:, :n_guides, :orig_h, :orig_w]
+                if (
+                    self.fuser.xrd_fuse_method == "spatial_mlp"
+                    and self.fuser.spatial_mlp is not None
+                ):
+                    m_l = self.fuser.spatial_mlp.apply_guide_residual(
+                        m_l, slice_guide, valid_hr_hw=None
+                    )
                 v_p = packed[:, n_guides:, :orig_h, :orig_w]
             else:
                 valid_hw = (
@@ -643,6 +1433,13 @@ class VolumetricFuser:
                 m_l_pad, v_p_pad = self.fuser._predict_logits_and_var_tile(
                     slab_t, slice_guide, valid_hr_hw=valid_hw
                 )
+                if (
+                    self.fuser.xrd_fuse_method == "spatial_mlp"
+                    and self.fuser.spatial_mlp is not None
+                ):
+                    m_l_pad = self.fuser.spatial_mlp.apply_guide_residual(
+                        m_l_pad, slice_guide, valid_hr_hw=valid_hw
+                    )
                 m_l = m_l_pad[:, :, :orig_h, :orig_w]
                 v_p = v_p_pad[:, :, :orig_h, :orig_w]
 
@@ -679,26 +1476,40 @@ class VolumetricFuser:
     def predict_volume(
         self,
         hr_volume: Any,
-        mode: Literal["2d", "2.5d_slab", "triplane"] = "2.5d_slab",
+        mode: Literal["2d", "slice_2d", "2.5d_slab", "triplane"] = "2.5d_slab",
         delta: int = 1,
         coarse_guide_3d: np.ndarray | torch.Tensor | None = None,
         sparse_guides: dict[int, np.ndarray | torch.Tensor] | None = None,
         pred_mode: Literal["multiclass", "multilabel"] = "multilabel",
         calibrate_to_guide: bool = True,
+        *,
+        pore_mask: PoreMaskSpec = None,
     ) -> VolumetricUncertaintyReport:
         """Segment a full 3D structural volume ``(Z, Y, X)`` (in-memory or lazy
         HDF5/Zarr/TIFF directory) using ``"2d"``, ``"2.5d_slab"``, or ``"triplane"``.
         """
+        norm_mode_3d = "2d" if mode == "slice_2d" else mode
+        if norm_mode_3d not in ("2d", "2.5d_slab", "triplane"):
+            raise ValueError(
+                f"Unsupported volumetric mode='{mode}'. "
+                "Expected '2d', '2.5d_slab', or 'triplane'."
+            )
+        if pred_mode not in ("multiclass", "multilabel"):
+            raise ValueError(
+                f"Unsupported pred_mode='{pred_mode}'. "
+                "Expected 'multiclass' or 'multilabel'."
+            )
         self.fuser.eval()
         accessor = VolumeSliceAccessor(hr_volume)
         z_dim, y_dim, x_dim = accessor.shape
         vmin, vmax = accessor.estimate_robust_range()
         dev = next(self.fuser.dinov2.parameters()).device
+        pm_3d = self._resolve_volume_pore_mask_3d(accessor, spec=pore_mask)
 
-        eff_delta = 0 if mode == "2d" else max(1, delta)
-        axes = (0, 1, 2) if mode == "triplane" else (0,)
+        eff_delta = 0 if norm_mode_3d == "2d" else max(1, delta)
+        axes = (0, 1, 2) if norm_mode_3d == "triplane" else (0,)
         if (
-            mode == "triplane"
+            norm_mode_3d == "triplane"
             and accessor._kind == "dir"
             and (z_dim * y_dim * x_dim) <= 128 * 1024 * 1024
         ):
@@ -715,7 +1526,11 @@ class VolumetricFuser:
         )
         sparse_norm_map: dict[int, torch.Tensor] | None = (
             {
-                int(k): guide_to_tensor(v, device="cpu", normalize=True)
+                int(k): self.fuser._effective_reference_guide(
+                    guide_to_tensor(v, device=dev, normalize=True)
+                )
+                .detach()
+                .cpu()
                 for k, v in sparse_guides.items()
             }
             if sparse_guides
@@ -748,15 +1563,20 @@ class VolumetricFuser:
         epi_var_m = interplane_var + (tta_var_accum / len(axes))
         epi_var = epi_var_m.mean(dim=0)  # (Z, Y, X)
 
+        if pm_3d is not None:
+            mean_logits = torch.where(
+                pm_3d.unsqueeze(0),
+                torch.full_like(mean_logits, -30.0),
+                mean_logits,
+            )
+            epi_var = torch.where(pm_3d, torch.zeros_like(epi_var), epi_var)
+
         n_guides = mean_logits.shape[0]
         flat_logits = mean_logits.reshape(1, n_guides, z_dim, y_dim * x_dim)
         if g3_norm is not None:
             prior_ref: torch.Tensor | None = g3_norm.reshape(1, g3_norm.shape[0], -1, 1)
-        elif sparse_guides:
-            means = [
-                guide_to_tensor(g, normalize=True).mean(dim=(-2, -1))
-                for g in sparse_guides.values()
-            ]
+        elif sparse_norm_map and sparse_guides:
+            means = [g.mean(dim=(-2, -1)) for g in sparse_norm_map.values()]
             prior_ref = (
                 torch.stack(means, dim=0).mean(dim=0).unsqueeze(-1).unsqueeze(-1)
             )
@@ -766,11 +1586,33 @@ class VolumetricFuser:
             prior_ref = None
 
         phys = self.fuser._active_physics()
+        if pm_3d is not None:
+            if phys is not None and phys.loss_fn == "compositional_kl":
+                phys._force_bg_for_pores = True
+                phys._resolved_bg_simplex = True
+            if prior_ref is not None and (
+                pred_mode == "multiclass" or self.fuser.loss_fn == "compositional_kl"
+            ):
+                f_solid = float((~pm_3d).float().mean().item())
+                p_sum = prior_ref.sum(dim=1, keepdim=True)
+                prior_ref = prior_ref * torch.where(
+                    p_sum > f_solid + 1e-4,
+                    (f_solid / p_sum.clamp(min=1e-6)).clamp(0.0, 1.0),
+                    torch.ones_like(p_sum),
+                )
+
         if pred_mode == "multiclass":
             if self.fuser.loss_fn == "compositional_kl" and phys is not None:
-                simplex_flat = phys.logits_to_simplex_probs(flat_logits.to(dev)).cpu()
-                n_k = int(simplex_flat.shape[1])
-                probs_3d = simplex_flat.squeeze(0).reshape(n_k, z_dim, y_dim, x_dim)
+                sp_slices = [
+                    phys.logits_to_simplex_probs(
+                        mean_logits[:, z_i].unsqueeze(0).to(dev)
+                    )
+                    .squeeze(0)
+                    .cpu()
+                    for z_i in range(z_dim)
+                ]
+                probs_3d = torch.stack(sp_slices, dim=1)
+                n_k = int(probs_3d.shape[0])
                 fg_probs_3d = probs_3d[1:] if n_k == n_guides + 1 else probs_3d
             else:
                 bg_l = torch.zeros((1, 1, z_dim, y_dim * x_dim), dtype=torch.float32)
@@ -792,6 +1634,25 @@ class VolumetricFuser:
             )
             probs_3d = probs_flat.squeeze(0).reshape(n_guides, z_dim, y_dim, x_dim)
             fg_probs_3d = probs_3d
+
+        if pm_3d is not None:
+            if pred_mode == "multiclass":
+                if probs_3d.shape[0] == n_guides:
+                    bg_ch = torch.zeros_like(probs_3d[:1])
+                    probs_3d = torch.cat([bg_ch, probs_3d], dim=0)
+                if probs_3d.shape[0] >= 2:
+                    probs_3d[0] = torch.where(
+                        pm_3d, torch.ones_like(probs_3d[0]), probs_3d[0]
+                    )
+                    probs_3d[1:] = torch.where(
+                        pm_3d.unsqueeze(0), torch.zeros_like(probs_3d[1:]), probs_3d[1:]
+                    )
+                    fg_probs_3d = probs_3d[1:]
+            else:
+                probs_3d = torch.where(
+                    pm_3d.unsqueeze(0), torch.zeros_like(probs_3d), probs_3d
+                )
+                fg_probs_3d = probs_3d
 
         entropy_flat, _ = compute_posterior_uncertainty(
             probs_3d.reshape(1, probs_3d.shape[0], z_dim, y_dim * x_dim),
@@ -826,10 +1687,10 @@ class VolumetricFuser:
                 .squeeze(0)
                 .squeeze(0)
             )
-        elif sparse_guides:
-            for s_idx, g_s in sparse_guides.items():
+        elif sparse_guides and sparse_norm_map:
+            for s_idx in sparse_guides:
                 if 0 <= int(s_idx) < z_dim:
-                    g_t = guide_to_tensor(g_s, normalize=True).cpu()
+                    g_t = sparse_norm_map[int(s_idx)].cpu()
                     out_2d = (int(g_t.shape[-2]), int(g_t.shape[-1]))
                     p_s = F.adaptive_avg_pool2d(
                         fg_probs_3d[:, int(s_idx)].unsqueeze(0),
@@ -852,7 +1713,8 @@ class VolumetricFuser:
                         .squeeze(0)
                     )
 
-        p99 = _safe_quantile(epi_var, 0.99).clamp(min=1e-6)
+        epi_ref = epi_var[~pm_3d] if (pm_3d is not None and (~pm_3d).any()) else epi_var
+        p99 = _safe_quantile(epi_ref, 0.99).clamp(min=1e-6)
         epi_norm = (epi_var / p99).clamp(0.0, 1.0)
         has_guide_3d = (g3_norm is not None) or bool(sparse_guides)
         combined_3d = (
@@ -860,17 +1722,23 @@ class VolumetricFuser:
             if has_guide_3d
             else (0.65 * entropy_3d + 0.35 * epi_norm)
         ).clamp(0.0, 1.0)
+        if pm_3d is not None:
+            combined_3d = torch.where(pm_3d, torch.zeros_like(combined_3d), combined_3d)
 
         hard_3d = compute_hard_phase_mask(probs_3d, mode=pred_mode, channel_dim=0)
 
         pred_sets_3d: torch.Tensor | None = None
         conf_hw_3d: torch.Tensor | None = None
         if self.fuser.calibrator is not None:
+            pm_flat = (
+                pm_3d.reshape(1, 1, z_dim, y_dim * x_dim) if pm_3d is not None else None
+            )
             ps_flat, hw_flat = self.fuser.calibrator.predict_sets_and_intervals(
                 probs_hr=probs_3d.reshape(1, probs_3d.shape[0], z_dim, y_dim * x_dim),
                 guide_lr=None,
                 epistemic_var_hr=epi_var.reshape(1, z_dim, y_dim * x_dim),
                 mode=pred_mode,
+                pore_mask_hr=pm_flat,
             )
             pred_sets_3d = ps_flat.squeeze(0).reshape(
                 ps_flat.shape[1], z_dim, y_dim, x_dim
@@ -890,7 +1758,8 @@ class VolumetricFuser:
             combined_uncertainty=combined_3d,
             z_slice_consistency=z_cons,
             diagnostics={
-                "volumetric_mode": mode,
+                **self._last_fit_diagnostics,
+                "volumetric_mode": norm_mode_3d,
                 "delta": eff_delta,
                 "volume_shape": [z_dim, y_dim, x_dim],
                 "lazy_streaming": accessor.is_lazy,
