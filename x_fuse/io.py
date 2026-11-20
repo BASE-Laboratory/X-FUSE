@@ -8,12 +8,21 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import warnings
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
+from basecoat import (
+    Volume,
+    VolumeSet,
+    read_ome_zarr,
+    read_volume,
+    write_ome_zarr,
+    write_volume,
+)
 from PIL import Image
 
 from .uncertainty import UncertaintyReport
@@ -381,9 +390,9 @@ def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
 def load_microscopy_file(
     path: str | Path, signal_index: int = 0
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Load a microscopy dataset (``.tif``, ``.npy``, ``.npz``, ``.h5``/``.nxs``,
-    or vendor formats such as ``.emd``, ``.dm3``/``.dm4``, ``.bcf``, ``.hspy``
-    via RosettaSciIO).
+    """Load a microscopy dataset (``.ome.zarr``, ``.tif``, ``.npy``, ``.npz``,
+    ``.h5``/``.nxs``, or vendor formats such as ``.emd``, ``.dm3``/``.dm4``,
+    ``.bcf``, ``.hspy`` via RosettaSciIO).
 
     Returns:
         ``(data_float32, metadata_dict)``.
@@ -392,9 +401,21 @@ def load_microscopy_file(
     if not in_path.exists():
         raise FileNotFoundError(f"Microscopy file not found: {in_path}")
 
+    lower_name = in_path.name.lower()
     suffix = in_path.suffix.lower()
+    if in_path.is_dir() and lower_name.endswith((".ome.zarr", ".zarr")):
+        vol = read_ome_zarr(in_path, level=0)
+        arr = np.asarray(vol.data, dtype=np.float32)
+        meta_z: dict[str, Any] = {
+            "format": "ome.zarr",
+            "shape": list(arr.shape),
+            "space": vol.space,
+            "provenance": vol.provenance,
+        }
+        return arr, meta_z
+
     if suffix == ".npy":
-        arr = np.load(in_path).astype(np.float32)
+        arr = np.asarray(read_volume(in_path).data, dtype=np.float32)
         return arr, {"format": "npy", "shape": list(arr.shape)}
 
     if suffix == ".npz":
@@ -441,14 +462,12 @@ def load_microscopy_file(
         }
 
     if suffix in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
-        try:
-            import tifffile  # type: ignore[import-not-found]
-
-            if suffix in (".tif", ".tiff"):
-                arr = tifffile.imread(in_path).astype(np.float32)
+        if suffix in (".tif", ".tiff"):
+            try:
+                arr = np.asarray(read_volume(in_path).data, dtype=np.float32)
                 return arr, {"format": "tiff", "shape": list(arr.shape)}
-        except (ImportError, ValueError):
-            pass
+            except Exception:
+                pass
         with Image.open(in_path) as im:
             arr = np.array(im, dtype=np.float32)
         return arr, {"format": suffix.lstrip("."), "shape": list(arr.shape)}
@@ -500,46 +519,30 @@ def _import_rsciio_reader(suffix: str) -> Any:
 
 
 def _write_uncompressed_uint8_3d_tiff(path: Path, vol_u8: np.ndarray) -> None:
-    try:
-        import tifffile  # type: ignore[import-not-found]
-
-        tifffile.imwrite(
-            path,
-            vol_u8,
-            photometric="minisblack",
-            compression=None,
-        )
-    except ImportError:
-        frames = [Image.fromarray(vol_u8[z], mode="L") for z in range(vol_u8.shape[0])]
-        frames[0].save(path, save_all=True, append_images=frames[1:], compression=None)
+    write_volume(
+        Volume.uncalibrated(vol_u8),
+        path,
+        compression=None,
+        overwrite=True,
+    )
 
 
-def export_for_openimpala(
+def _extract_phase_and_conformal_arrays(
     vol_report_or_mask: Any,
-    output_dir: str | Path,
-    name: str = "sample",
-    active_phase: int = 0,
-    direction: str = "x",
-    max_grid_size: int = 64,
-    export_conformal_bounds: bool = True,
-) -> tuple[Path, Path]:
-    """Export a 3D multi-phase chemical segmentation volume (plus optional
-    ``(1 - alpha)`` conformal lower/upper phase-envelope geometries) as an
-    uncompressed ``uint8`` 3D TIFF and AMReX ``ParmParse`` ``.inputs`` deck
-    directly compatible with ``OpenImpala`` (matching ``OpenLSR-X`` conventions).
-    """
-    import math
-
+) -> tuple[
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    dict[str, Any],
+]:
     import torch
-
-    if direction not in ("x", "y", "z"):
-        raise ValueError(f"direction must be 'x', 'y', or 'z'; got '{direction}'.")
-    act = int(active_phase)
-    if not (0 <= act <= 255):
-        raise ValueError(f"active_phase must lie in [0, 255], got {active_phase}.")
 
     probs_np: np.ndarray | None = None
     conf_hw_np: np.ndarray | None = None
+    comb_unc_np: np.ndarray | None = None
+    prov: dict[str, Any] = {}
     if isinstance(vol_report_or_mask, VolumetricUncertaintyReport):
         raw_mask = vol_report_or_mask.hard_mask.detach().cpu().numpy()
         # Map negative abstained voxels (-1) to 255 rather than 0 (pore/void)
@@ -547,6 +550,9 @@ def export_for_openimpala(
             np.uint8
         )
         probs_np = vol_report_or_mask.probabilities.detach().cpu().float().numpy()
+        comb_unc_np = (
+            vol_report_or_mask.combined_uncertainty.detach().cpu().float().numpy()
+        )
         pred_sets = (
             vol_report_or_mask.prediction_sets.detach().cpu().numpy().astype(bool)
             if vol_report_or_mask.prediction_sets is not None
@@ -560,6 +566,10 @@ def export_for_openimpala(
             if vol_report_or_mask.conformal_interval_halfwidth is not None
             else None
         )
+        prov = {
+            "z_slice_consistency": float(vol_report_or_mask.z_slice_consistency),
+            "diagnostics": dict(vol_report_or_mask.diagnostics),
+        }
     elif isinstance(vol_report_or_mask, torch.Tensor):
         raw_mask = vol_report_or_mask.detach().cpu().numpy()
         labeled = np.where(raw_mask < 0, 255, np.clip(raw_mask, 0, 255)).astype(
@@ -572,7 +582,209 @@ def export_for_openimpala(
             np.uint8
         )
         pred_sets = None
+    return labeled, probs_np, pred_sets, conf_hw_np, comb_unc_np, prov
 
+
+def _compute_conformal_phase_envelopes(
+    labeled: np.ndarray,
+    probs_np: np.ndarray | None,
+    pred_sets: np.ndarray | None,
+    conf_hw_np: np.ndarray | None,
+    active_phase: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if pred_sets is None:
+        return None
+    act = int(active_phase)
+    is_multiclass = (
+        probs_np is not None
+        and probs_np.shape[0] >= 2
+        and pred_sets.shape[0] == probs_np.shape[0]
+        and float(np.max(np.abs(np.sum(probs_np, axis=0) - 1.0))) < 1e-3
+    )
+    in_lower: np.ndarray | None = None
+    in_upper: np.ndarray | None = None
+    if is_multiclass and act < pred_sets.shape[0]:
+        set_sizes = pred_sets.sum(axis=0)
+        in_lower = pred_sets[act] & (set_sizes == 1)
+        in_upper = pred_sets[act]
+    elif not is_multiclass and act <= pred_sets.shape[0]:
+        # Multilabel: hard_mask uses 0=background/pore and 1..M=channel m+1
+        if act == 0:
+            in_lower = ~np.any(pred_sets, axis=0)
+            if (
+                probs_np is not None
+                and conf_hw_np is not None
+                and conf_hw_np.shape == probs_np.shape
+            ):
+                in_upper = np.all((probs_np - conf_hw_np) < 0.5, axis=0)
+            else:
+                in_upper = in_lower | (labeled == 0)
+        else:
+            ch_idx = act - 1
+            in_upper = pred_sets[ch_idx]
+            if (
+                probs_np is not None
+                and conf_hw_np is not None
+                and ch_idx < conf_hw_np.shape[0]
+            ):
+                in_lower = ((probs_np[ch_idx] - conf_hw_np[ch_idx]) >= 0.5) & in_upper
+            else:
+                in_lower = in_upper & (labeled == act)
+
+    if in_lower is None or in_upper is None:
+        return None
+    complement_val = np.uint8(1 if act == 0 else 0)
+    act_val = np.uint8(act)
+    lower_u8 = np.where(in_lower, act_val, complement_val).astype(np.uint8)
+    upper_u8 = np.where(in_upper, act_val, complement_val).astype(np.uint8)
+    return lower_u8, upper_u8
+
+
+def export_volume_ome_zarr(
+    vol_report_or_mask: Any,
+    store_path: str | Path,
+    *,
+    image_volume: np.ndarray | None = None,
+    voxel_size_um: float | Sequence[float] | None = None,
+    origin_um: Sequence[float] | None = None,
+    space: str | None = None,
+    label_names: Mapping[int, str] | None = None,
+    active_phase: int = 0,
+    export_conformal_bounds: bool = True,
+    multiscale_levels: int = 2,
+    overwrite: bool = True,
+) -> Path:
+    """Export a 3D ``VolumetricUncertaintyReport`` (or phase mask) as an OME-Zarr v0.4
+    contract store via ``basecoat``.
+
+    Writes a calibrated primary 3D ``Volume`` (``image_volume`` when supplied,
+    otherwise ``combined_uncertainty`` or ``float32`` phase field) together with
+    mode-downsampled integer ``labels/phase`` (and optional ``labels/phase_lower`` /
+    ``labels/phase_upper`` conformal phase envelopes) so Layer 3 solvers
+    (``OpenImpala``, ``SMS``) and Layer 4 evaluators consume ``X-FUSE`` outputs
+    without bespoke glue.
+    """
+    act = int(active_phase)
+    if not (0 <= act <= 255):
+        raise ValueError(f"active_phase must lie in [0, 255], got {active_phase}.")
+
+    labeled, probs_np, pred_sets, conf_hw_np, comb_unc_np, prov = (
+        _extract_phase_and_conformal_arrays(vol_report_or_mask)
+    )
+    if labeled.ndim != 3:
+        raise ValueError(
+            f"Expected 3D (D, H, W) volume for OME-Zarr export, got {labeled.shape}."
+        )
+
+    if image_volume is not None:
+        img_arr = np.asarray(image_volume, dtype=np.float32)
+        if img_arr.shape != labeled.shape:
+            raise ValueError(
+                f"image_volume shape {img_arr.shape} must match "
+                f"phase mask shape {labeled.shape}."
+            )
+    elif comb_unc_np is not None:
+        img_arr = np.asarray(comb_unc_np, dtype=np.float32)
+    else:
+        img_arr = labeled.astype(np.float32)
+
+    img_vol = Volume.from_array(
+        img_arr,
+        voxel_size_um=voxel_size_um,
+        origin_um=origin_um,
+        space=space,
+        provenance=prov,
+    )
+    resolved_names: dict[int, str] | None = None
+    if label_names is not None:
+        resolved_names = {int(k): str(v) for k, v in label_names.items()}
+    else:
+        uniq = [int(v) for v in np.unique(labeled)]
+        resolved_names = {v: ("abstained" if v == 255 else f"phase_{v}") for v in uniq}
+
+    labels_map: dict[str, Volume] = {
+        "phase": Volume(
+            labeled,
+            axes=img_vol.axes,
+            space=img_vol.space,
+            label_names=resolved_names,
+            provenance={"active_phase": act},
+        )
+    }
+
+    if export_conformal_bounds:
+        envelopes = _compute_conformal_phase_envelopes(
+            labeled, probs_np, pred_sets, conf_hw_np, active_phase=act
+        )
+        if envelopes is not None:
+            lower_u8, upper_u8 = envelopes
+            comp = 1 if act == 0 else 0
+            env_names = {act: f"phase_{act}", comp: "complement"}
+            labels_map["phase_lower"] = Volume(
+                lower_u8,
+                axes=img_vol.axes,
+                space=img_vol.space,
+                label_names=env_names,
+                provenance={"envelope": "conformal_lower", "active_phase": act},
+            )
+            labels_map["phase_upper"] = Volume(
+                upper_u8,
+                axes=img_vol.axes,
+                space=img_vol.space,
+                label_names=env_names,
+                provenance={"envelope": "conformal_upper", "active_phase": act},
+            )
+
+    vset = VolumeSet(img_vol, labels=labels_map)
+    return write_ome_zarr(
+        vset,
+        store_path,
+        multiscale_levels=multiscale_levels,
+        overwrite=overwrite,
+    )
+
+
+def export_for_openimpala(
+    vol_report_or_mask: Any,
+    output_dir: str | Path,
+    name: str = "sample",
+    active_phase: int = 0,
+    direction: str = "x",
+    max_grid_size: int = 64,
+    export_conformal_bounds: bool = True,
+    *,
+    _warn_deprecated: bool = True,
+) -> tuple[Path, Path]:
+    """Export a 3D multi-phase chemical segmentation volume (plus optional
+    ``(1 - alpha)`` conformal lower/upper phase-envelope geometries) as an
+    uncompressed ``uint8`` 3D TIFF and AMReX ``ParmParse`` ``.inputs`` deck
+    directly compatible with ``OpenImpala`` (matching ``OpenLSR-X`` conventions).
+
+    .. deprecated:: 1.0.1
+        Tool-to-solver bespoke exporters are deprecated under ``ECOSYSTEM.md``
+        and will be removed in ``v1.1.0`` once ``OpenImpala v5.1`` reads
+        ``.ome.zarr`` directly; prefer :func:`export_volume_ome_zarr`.
+    """
+    import math
+
+    if _warn_deprecated:
+        warnings.warn(
+            "export_for_openimpala is deprecated under ECOSYSTEM.md and scheduled "
+            "for removal once OpenImpala v5.1 accepts OME-Zarr directly; prefer "
+            "x_fuse.io.export_volume_ome_zarr (or basecoat.write_ome_zarr).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    if direction not in ("x", "y", "z"):
+        raise ValueError(f"direction must be 'x', 'y', or 'z'; got '{direction}'.")
+    act = int(active_phase)
+    if not (0 <= act <= 255):
+        raise ValueError(f"active_phase must lie in [0, 255], got {active_phase}.")
+
+    labeled, probs_np, pred_sets, conf_hw_np, _, _ = (
+        _extract_phase_and_conformal_arrays(vol_report_or_mask)
+    )
     if labeled.ndim != 3:
         raise ValueError(
             f"Expected 3D (D, H, W) volume for OpenImpala export, got {labeled.shape}."
@@ -605,50 +817,12 @@ def export_for_openimpala(
         "torteff.verbose = 1",
     ]
 
-    if export_conformal_bounds and pred_sets is not None:
-        is_multiclass = (
-            probs_np is not None
-            and probs_np.shape[0] >= 2
-            and pred_sets.shape[0] == probs_np.shape[0]
-            and float(np.max(np.abs(np.sum(probs_np, axis=0) - 1.0))) < 1e-3
+    if export_conformal_bounds:
+        envelopes = _compute_conformal_phase_envelopes(
+            labeled, probs_np, pred_sets, conf_hw_np, active_phase=act
         )
-        in_lower: np.ndarray | None = None
-        in_upper: np.ndarray | None = None
-        if is_multiclass and act < pred_sets.shape[0]:
-            set_sizes = pred_sets.sum(axis=0)
-            in_lower = pred_sets[act] & (set_sizes == 1)
-            in_upper = pred_sets[act]
-        elif not is_multiclass and act <= pred_sets.shape[0]:
-            # Multilabel: hard_mask uses 0=background/pore and 1..M=channel m+1
-            if act == 0:
-                in_lower = ~np.any(pred_sets, axis=0)
-                if (
-                    probs_np is not None
-                    and conf_hw_np is not None
-                    and conf_hw_np.shape == probs_np.shape
-                ):
-                    in_upper = np.all((probs_np - conf_hw_np) < 0.5, axis=0)
-                else:
-                    in_upper = in_lower | (labeled == 0)
-            else:
-                ch_idx = act - 1
-                in_upper = pred_sets[ch_idx]
-                if (
-                    probs_np is not None
-                    and conf_hw_np is not None
-                    and ch_idx < conf_hw_np.shape[0]
-                ):
-                    in_lower = (
-                        (probs_np[ch_idx] - conf_hw_np[ch_idx]) >= 0.5
-                    ) & in_upper
-                else:
-                    in_lower = in_upper & (labeled == act)
-
-        if in_lower is not None and in_upper is not None:
-            complement_val = np.uint8(1 if act == 0 else 0)
-            act_val = np.uint8(act)
-            lower_u8 = np.where(in_lower, act_val, complement_val).astype(np.uint8)
-            upper_u8 = np.where(in_upper, act_val, complement_val).astype(np.uint8)
+        if envelopes is not None:
+            lower_u8, upper_u8 = envelopes
             lower_tif = out_dir / f"{name}_phase{act}_lower.tif"
             upper_tif = out_dir / f"{name}_phase{act}_upper.tif"
             _write_uncompressed_uint8_3d_tiff(lower_tif, lower_u8)

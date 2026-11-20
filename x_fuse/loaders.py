@@ -10,9 +10,14 @@ from typing import Any, Literal
 
 import h5py
 import numpy as np
+from basecoat import open_savu_h5, read_ome_zarr, read_volume
 from PIL import Image
 from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates, rotate
 
+_ORIG_H5PY_FILE = h5py.File
+
+# Retained in v1.0.x for manuscript reproducibility; canonical home under ECOSYSTEM.md
+# is BASE-Laboratory/MultimodalBenchmark (Layer 4).
 DIAD_ZN13X_50UM_SCAN_IDS: tuple[int, ...] = tuple(
     list(range(43336, 43348)) + list(range(43393, 43401))
 )
@@ -98,6 +103,26 @@ def load_xct_subvolume(
         else (slice(None), slice(None), slice(None))
     )
 
+    if (
+        h5py.File is _ORIG_H5PY_FILE
+        and (sz, sy, sx) == (1, 1, 1)
+        and not flip_x
+        and all((sl.step is None or sl.step == 1) for sl in (z_sl, y_sl, x_sl))
+    ):
+        ds_path = f"{recon_methods[recon]}/data"
+        with open_savu_h5(xct_path, dataset_path=ds_path, savu_xzy=True) as lv:
+            z0, z1, _ = z_sl.indices(lv.shape[0])
+            y0, y1, _ = y_sl.indices(lv.shape[1])
+            x0, x1, _ = x_sl.indices(lv.shape[2])
+            if z1 <= z0 or y1 <= y0 or x1 <= x0:
+                return np.zeros(
+                    (max(0, z1 - z0), max(0, y1 - y0), max(0, x1 - x0)),
+                    dtype=lv.dtype,
+                )
+            return lv.read_region(
+                (slice(z0, z1), slice(y0, y1), slice(x0, x1))
+            ).data.copy()
+
     with h5py.File(xct_path, "r") as f:
         ds = f[recon_methods[recon]]["data"]
         if zyx_slices is None and (sz, sy, sx) == (1, 1, 1):
@@ -154,6 +179,11 @@ def load_xct(xct_path: str | Path, recon: str = "Tomopy", **kwargs: Any) -> np.n
         raise KeyError(
             f"Unknown recon method '{recon}'. Choose from {list(recon_methods)}"
         )
+
+    if h5py.File is _ORIG_H5PY_FILE:
+        ds_path = f"{recon_methods[recon]}/data"
+        with open_savu_h5(xct_path, dataset_path=ds_path, savu_xzy=True) as lv:
+            return lv.read_region((slice(None), slice(None), slice(None))).data.copy()
 
     with h5py.File(xct_path, "r") as f:
         return np.transpose(np.array(f[recon_methods[recon]]["data"]), (1, 2, 0))
@@ -675,10 +705,19 @@ def load_i13_xct(xct_path: str, **kwargs: Any) -> np.ndarray:
 
 
 def load_image_array(path: str | Path) -> np.ndarray:
-    """Load a 2D/3D TIFF, PNG, or NPY micrograph/map preserving bit depth as float32."""
+    """Load a 2D/3D OME-Zarr, TIFF, PNG, or NPY array as float32."""
     p = Path(path)
-    if p.suffix.lower() == ".npy":
-        return np.load(p).astype(np.float32)
+    lower_name = p.name.lower()
+    sfx = p.suffix.lower()
+    if p.is_dir() and lower_name.endswith((".ome.zarr", ".zarr")):
+        return np.asarray(read_ome_zarr(p, level=0).data, dtype=np.float32)
+    if sfx == ".npy":
+        return np.asarray(read_volume(p).data, dtype=np.float32)
+    if sfx in (".tif", ".tiff"):
+        try:
+            return np.asarray(read_volume(p).data, dtype=np.float32)
+        except Exception:
+            pass
     with Image.open(p) as img:
         return np.array(img, dtype=np.float32)
 

@@ -39,6 +39,9 @@ jobs:
       - name: Check code formatting (Ruff)
         run: uv run ruff format --check x_fuse tests benchmarks
 
+      - name: Check Layer 2 architectural import boundaries (basecoat)
+        run: uv run python -m basecoat.layers
+
       - name: Static type check (Mypy)
         run: uv run mypy x_fuse
 

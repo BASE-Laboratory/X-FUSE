@@ -13,6 +13,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
+from basecoat import LazyVolume, Volume, open_volume, read_volume
 
 from .fusion import (
     CorrelativeFuser,
@@ -79,10 +80,63 @@ class VolumeSliceAccessor:
             self.shape: tuple[int, int, int] = source.shape
             return
 
+        if isinstance(source, Volume):
+            arr_v = np.asarray(source.data, dtype=np.float32)
+            if arr_v.ndim != 3:
+                raise ValueError(f"Expected 3D Volume (Z, Y, X), got {arr_v.shape}.")
+            self._kind = "ndarray"
+            self._data = arr_v
+            self.shape = (
+                int(arr_v.shape[0]),
+                int(arr_v.shape[1]),
+                int(arr_v.shape[2]),
+            )
+            return
+
+        if isinstance(source, LazyVolume):
+            if source.ndim != 3:
+                raise ValueError(
+                    f"Expected 3D LazyVolume (Z, Y, X), got {source.shape}."
+                )
+            self._kind = "basecoat_lazy"
+            self._data = source
+            self.shape = (
+                int(source.shape[0]),
+                int(source.shape[1]),
+                int(source.shape[2]),
+            )
+            return
+
         if isinstance(source, (str, Path)):
             p = Path(source)
+            lower_name = p.name.lower()
             sfx = p.suffix.lower()
+            if lower_name.endswith(".ome.zarr") and p.exists():
+                lv = open_volume(p, level=0)
+                if lv.ndim != 3:
+                    lv.close()
+                    raise ValueError(
+                        f"Expected 3D OME-Zarr volume in {p}, got {lv.shape}."
+                    )
+                self._kind = "basecoat_lazy"
+                self._data = lv
+                self.shape = (int(lv.shape[0]), int(lv.shape[1]), int(lv.shape[2]))
+                return
             if sfx == ".zarr" and p.exists():
+                try:
+                    lv_z = open_volume(p, level=0)
+                    if lv_z.ndim == 3:
+                        self._kind = "basecoat_lazy"
+                        self._data = lv_z
+                        self.shape = (
+                            int(lv_z.shape[0]),
+                            int(lv_z.shape[1]),
+                            int(lv_z.shape[2]),
+                        )
+                        return
+                    lv_z.close()
+                except Exception:
+                    pass
                 import zarr  # type: ignore[import-not-found]
 
                 opened: Any = zarr.open(str(p), mode="r")
@@ -147,9 +201,7 @@ class VolumeSliceAccessor:
                 self.shape = (int(mm.shape[0]), int(mm.shape[1]), int(mm.shape[2]))
                 return
             if p.is_file() and sfx in (".tif", ".tiff"):
-                import tifffile  # type: ignore[import-not-found]
-
-                arr_tif = tifffile.imread(p).astype(np.float32)
+                arr_tif = np.asarray(read_volume(p).data, dtype=np.float32)
                 if arr_tif.ndim != 3:
                     raise ValueError(f"Expected 3D TIFF stack, got {arr_tif.shape}.")
                 self._kind = "ndarray"
@@ -180,7 +232,7 @@ class VolumeSliceAccessor:
                 return
             raise ValueError(
                 f"Unsupported path source {p}; pass an open h5py.Dataset, zarr.Array, "
-                "3D file (.h5/.zarr/.npy/.tif), 3D array, or directory of 2D slices."
+                "3D file (.ome.zarr/.h5/.zarr/.npy/.tif), 3D array, or 2D slice dir."
             )
 
         if isinstance(source, torch.Tensor):
@@ -218,7 +270,7 @@ class VolumeSliceAccessor:
 
     @property
     def is_lazy(self) -> bool:
-        return self._kind in ("lazy", "dir", "h5_file")
+        return self._kind in ("lazy", "basecoat_lazy", "dir", "h5_file")
 
     def get_plane(self, axis: int, index: int) -> np.ndarray:
         """Fetch a single 2D float32 plane along ``axis`` (0=Z, 1=Y, 2=X)."""
@@ -229,6 +281,22 @@ class VolumeSliceAccessor:
             raise IndexError(
                 f"Slice index {index} out of bounds for axis {axis} of size {depth}."
             )
+
+        if self._kind == "basecoat_lazy":
+            lv_obj: LazyVolume = self._data
+            if axis == 0:
+                reg = lv_obj.read_region(
+                    (slice(index, index + 1), slice(None), slice(None))
+                ).data[0]
+            elif axis == 1:
+                reg = lv_obj.read_region(
+                    (slice(None), slice(index, index + 1), slice(None))
+                ).data[:, 0, :]
+            else:
+                reg = lv_obj.read_region(
+                    (slice(None), slice(None), slice(index, index + 1))
+                ).data[:, :, 0]
+            return np.asarray(reg, dtype=np.float32)
 
         if self._kind == "h5_file":
             import h5py
