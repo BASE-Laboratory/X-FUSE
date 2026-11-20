@@ -1,0 +1,852 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Physics-Guided Foundation-Model Feature Fusion & Uncertainty-Aware Segmentation for Correlative Materials Imaging">
+      
+      
+      
+        <link rel="canonical" href="https://base-laboratory.github.io/X-FUSE/theory/">
+      
+      
+        <link rel="prev" href="..">
+      
+      
+        <link rel="next" href="../benchmarks/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
+    
+    
+      
+        <title>Mathematical Theory - X-FUSE Documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#mathematical-theory" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="X-FUSE Documentation" class="md-header__button md-logo" aria-label="X-FUSE Documentation" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            X-FUSE Documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Mathematical Theory
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/BASE-Laboratory/X-FUSE" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    BASE-Laboratory/X-FUSE
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="X-FUSE Documentation" class="md-nav__button md-logo" aria-label="X-FUSE Documentation" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    X-FUSE Documentation
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/BASE-Laboratory/X-FUSE" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    BASE-Laboratory/X-FUSE
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Mathematical Theory
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Mathematical Theory
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-dense-sub-patch-multi-layer-vit-feature-extraction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Dense Sub-Patch Multi-Layer ViT Feature Extraction
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Dense Sub-Patch Multi-Layer ViT Feature Extraction">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#feature-upsampling-scale-dilated-jbu-texture-aware-cross-attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Feature Upsampling: Scale-Dilated JBU &amp; Texture-Aware Cross-Attention
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#apositional-feature-debiasing-debias_positionaltrue" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apositional Feature Debiasing (debias_positional=True)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-quantitative-forward-physics-heavy-tailed-psfs-b-spline-registration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Quantitative Forward Physics, Heavy-Tailed PSFs &amp; B-Spline Registration
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-prior-calibration-tri-part-uncertainty-split-conformal-sets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Prior Calibration, Tri-Part Uncertainty &amp; Split Conformal Sets
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Prior Calibration, Tri-Part Uncertainty &amp; Split Conformal Sets">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#temperature-scaled-regularized-adaptive-conformal-prediction-conformalcalibrator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Temperature-Scaled Regularized Adaptive Conformal Prediction (ConformalCalibrator)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-1d-voronoi-integrated-active-sparse-slice-roi-steering" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. 1D Voronoi-Integrated Active Sparse-Slice &amp; ROI Steering
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-3d-axial-interaction-volume-deconvolution-tri-plane-consistency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. 3D Axial Interaction-Volume Deconvolution &amp; Tri-Plane Consistency
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../benchmarks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks & Regimes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../modalities/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Modality Recipes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tutorials/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tutorials & CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-dense-sub-patch-multi-layer-vit-feature-extraction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Dense Sub-Patch Multi-Layer ViT Feature Extraction
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Dense Sub-Patch Multi-Layer ViT Feature Extraction">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#feature-upsampling-scale-dilated-jbu-texture-aware-cross-attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Feature Upsampling: Scale-Dilated JBU &amp; Texture-Aware Cross-Attention
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#apositional-feature-debiasing-debias_positionaltrue" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apositional Feature Debiasing (debias_positional=True)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-quantitative-forward-physics-heavy-tailed-psfs-b-spline-registration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Quantitative Forward Physics, Heavy-Tailed PSFs &amp; B-Spline Registration
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-prior-calibration-tri-part-uncertainty-split-conformal-sets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Prior Calibration, Tri-Part Uncertainty &amp; Split Conformal Sets
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Prior Calibration, Tri-Part Uncertainty &amp; Split Conformal Sets">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#temperature-scaled-regularized-adaptive-conformal-prediction-conformalcalibrator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Temperature-Scaled Regularized Adaptive Conformal Prediction (ConformalCalibrator)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-1d-voronoi-integrated-active-sparse-slice-roi-steering" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. 1D Voronoi-Integrated Active Sparse-Slice &amp; ROI Steering
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-3d-axial-interaction-volume-deconvolution-tri-plane-consistency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. 3D Axial Interaction-Volume Deconvolution &amp; Tri-Plane Consistency
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="mathematical-theory">Mathematical Theory<a class="headerlink" href="#mathematical-theory" title="Permanent link">&para;</a></h1>
+<p>X-FUSE formulates correlative super-resolution segmentation as <strong>physically constrained inverse inference</strong> conditioned on dense self-supervised structural features.</p>
+<hr />
+<h2 id="1-dense-sub-patch-multi-layer-vit-feature-extraction">1. Dense Sub-Patch Multi-Layer ViT Feature Extraction<a class="headerlink" href="#1-dense-sub-patch-multi-layer-vit-feature-extraction" title="Permanent link">&para;</a></h2>
+<p>Given a structural micrograph <span class="arithmatex">\(I_{\text{HR}} \in \mathbb{R}^{H \times W}\)</span>, X-FUSE modifies the patch-embedding convolution stride of a pretrained Vision Transformer (DINOv2, DINOv3, ALiBi, NoPE, or <code>timm</code> ViT) from patch size <span class="arithmatex">\(p\)</span> (typically <span class="arithmatex">\(14\)</span> or <span class="arithmatex">\(16\)</span>) down to sub-patch stride <span class="arithmatex">\(s \in \{2, 4, 7, 8\}\)</span> while interpolating positional embeddings accordingly.</p>
+<p>When <code>layers="multiscale"</code> is enabled, patch tokens are extracted across shallow, mid-level, and deep transformer blocks <span class="arithmatex">\(\ell \in \mathcal{L}\)</span> (e.g. quarter, half, three-quarter, and final depth), each individually LayerNorm-stabilized and channel-concatenated:</p>
+<div class="arithmatex">\[
+F_{\text{raw}}(x) = \bigoplus_{\ell \in \mathcal{L}} \mathrm{LN}\!\left(T^{(\ell)}(x)\right) \in \mathbb{R}^{(\sum_\ell D_\ell) \times H_f \times W_f}
+\]</div>
+<p>Shallow ViT blocks preserve sharp high-frequency pore, grain, and precipitate edges, while deeper blocks capture multi-grain textural context.</p>
+<h3 id="feature-upsampling-scale-dilated-jbu-texture-aware-cross-attention">Feature Upsampling: Scale-Dilated JBU &amp; Texture-Aware Cross-Attention<a class="headerlink" href="#feature-upsampling-scale-dilated-jbu-texture-aware-cross-attention" title="Permanent link">&para;</a></h3>
+<p>Rather than nearest-neighbor or bilinear upsampling from the stride-<span class="arithmatex">\(s\)</span> token grid <span class="arithmatex">\((H_f, W_f)\)</span> to <span class="arithmatex">\((H, W)\)</span>, X-FUSE provides two complementary high-resolution feature upsamplers:</p>
+<ol>
+<li><strong>Scale-Dilated Joint Bilateral Upsampling (<code>interpolation_mode="jbu"</code>)</strong>: Pure-PyTorch progressive bilateral filtering conditioned on normalized structural intensity <span class="arithmatex">\(g = I_{\text{HR}}\)</span>:
+   $$
+   w_{\text{JBU}}(p, q) = \exp!\left(-\frac{|p - q|_2^2}{2\sigma_s^2}\right) \exp!\left(-\frac{|g(p) - g(q)|_2^2}{2\sigma_r^2}\right)
+   $$</li>
+<li><strong>Spin-2 Orientation-Aware &amp; Continuous Sub-Token Cross-Attention (<code>interpolation_mode="cross_attn"</code>, <code>CrossAttentionFeatureUpsampler</code>)</strong>: Inspired by continuous coordinate-query upsamplers (<code>JAFAR</code> / <code>AnyUp</code>), each pixel <span class="arithmatex">\(p \in \{1, \dots, H\} \times \{1, \dots, W\}\)</span> extracts an 8-channel multiscale texture descriptor <span class="arithmatex">\(\tau(p)\)</span> augmented—when <code>orientation_aware=True</code>—by a 4-channel multiscale <strong>spin-2 structure-tensor director field</strong> <span class="arithmatex">\(\mathbf{s}(p) = (c_1 \cos 2\theta_1, c_1 \sin 2\theta_1, c_2 \cos 2\theta_2, c_2 \sin 2\theta_2)\)</span> derived from smoothed outer products <span class="arithmatex">\(J_\sigma = G_\sigma * (\nabla I_{\text{HR}} \nabla I_{\text{HR}}^\top)\)</span> with local coherence <span class="arithmatex">\(c = \frac{\lambda_1 - \lambda_2}{\lambda_1 + \lambda_2 + \epsilon}\)</span>. Because grain boundaries and lamellae carry headless orientation (<span class="arithmatex">\(\theta \equiv \theta + \pi\)</span>), encoding <span class="arithmatex">\(2\theta\)</span> makes <span class="arithmatex">\(\theta\)</span> and <span class="arithmatex">\(\theta + \pi\)</span> identical while orthogonal colonies (<span class="arithmatex">\(\theta + \pi/2\)</span>) negate both spin-2 components (<span class="arithmatex">\(\cos 2(\theta + \pi/2) = -\cos 2\theta\)</span>), cleanly separating differently oriented iso-intensity colonies! When <code>subtoken_offsets=True</code>, continuous sub-token offsets <span class="arithmatex">\(\Delta_{pq} = (\Delta y_{pq}, \Delta x_{pq}) \in [-1.5, 1.5]^2\)</span> enter both via isotropic radial decay and an exact <span class="arithmatex">\(D_4\)</span>-equivariant learned bilinear distance penalty.</li>
+</ol>
+<h3 id="apositional-feature-debiasing-debias_positionaltrue">Apositional Feature Debiasing (<code>debias_positional=True</code>)<a class="headerlink" href="#apositional-feature-debiasing-debias_positionaltrue" title="Permanent link">&para;</a></h3>
+<p>Pretrained Vision Transformers with learned absolute positional embeddings or RoPE encode linear and quadratic <span class="arithmatex">\((y, x)\)</span> coordinate ramps in dedicated feature channels (<code>dino-saw</code>, Docherty et al., 2026). On materials exhibiting macroscopic chemical gradients (diffusion couples, battery electrodes, thermal-barrier coatings), a probe can overfit to image coordinates <span class="arithmatex">\((y, x)\)</span> instead of microstructure. <code>ApositionalFeatureDebiaser</code> projects each feature channel onto the orthogonal complement of normalized degree-<span class="arithmatex">\(d\)</span> bivariate Legendre polynomials <span class="arithmatex">\(\mathcal{B}_d(y, x)\)</span>, driving coordinate <span class="arithmatex">\(R^2 \to 0\)</span> on <em>any</em> standard ViT without custom re-pretraining.</p>
+<hr />
+<h2 id="2-quantitative-forward-physics-heavy-tailed-psfs-b-spline-registration">2. Quantitative Forward Physics, Heavy-Tailed PSFs &amp; B-Spline Registration<a class="headerlink" href="#2-quantitative-forward-physics-heavy-tailed-psfs-b-spline-registration" title="Permanent link">&para;</a></h2>
+<p>Naive correlative fusion upsamples the coarse chemical guide <span class="arithmatex">\(G_{\text{LR}}\)</span> to <span class="arithmatex">\((H, W)\)</span> and trains against blurry targets—actively penalizing crisp high-resolution phase boundaries.</p>
+<p>Instead, X-FUSE predicts high-resolution phase abundances <span class="arithmatex">\(\hat{P}_{\text{HR}} \in [0, 1]^{M \times H \times W}\)</span> via a <code>LinearProbeHead</code>, nonlinear <code>SpatialConvMLPHead</code> (<code>fusion_method="spatial_mlp"</code>), or <span class="arithmatex">\(O(HW)\)</span> <code>WindowedGuideCrossAttentionHead</code> (<code>fusion_method="attention"</code>), warps them into the guide frame via <span class="arithmatex">\(\mathcal{W}_\theta\)</span> (<code>DifferentiableGuideAligner</code>), and applies an anisotropic forward PSF operator <span class="arithmatex">\(\mathcal{D}_\Sigma\)</span> (<code>ForwardPSFDownsampler</code>):</p>
+<div class="arithmatex">\[
+\hat{G}_{\text{LR}} = \mathcal{D}_\Sigma\!\left(\mathcal{W}_\theta(\hat{P}_{\text{HR}})\right) = \mathrm{AvgPool}_{r_y, r_x}\!\left(K_{\Sigma}^{(m)} * \mathcal{W}_\theta(\hat{P}_{\text{HR}})_m\right)
+\]</div>
+<p>To match real electron, X-ray, and neutron microprobes without Gaussian inverse crime, <code>ForwardPSFDownsampler</code> supports three learnable per-channel PSF families (<code>psf_profile</code>):</p>
+<ul>
+<li><strong><code>"gaussian"</code></strong>: Separable anisotropic Gaussian <span class="arithmatex">\(K_{\sigma_y, \sigma_x}(\Delta y, \Delta x) \propto \exp\!\left(-\frac{\Delta y^2}{2\sigma_y^2} - \frac{\Delta x^2}{2\sigma_x^2}\right)\)</span>.</li>
+<li><strong><code>"moffat"</code></strong>: Non-separable heavy-tailed Lorentzian/Moffat probe skirt <span class="arithmatex">\(K_{\alpha_y, \alpha_x, \beta}(\Delta y, \Delta x) \propto \left(1 + \frac{\Delta y^2}{\alpha_y^2} + \frac{\Delta x^2}{\alpha_x^2}\right)^{-\beta}\)</span> with learnable tail index <span class="arithmatex">\(\beta &gt; 1.05\)</span>.</li>
+<li><strong><code>"core_halo"</code></strong>: Double-Gaussian primary beam core plus secondary fluorescence / Monte Carlo backscattered interaction halo <span class="arithmatex">\((1 - w_h) K_{\sigma_y, \sigma_x}^{\text{core}} + w_h K_{\eta \sigma_y, \eta \sigma_x}^{\text{halo}}\)</span> with learnable halo fraction <span class="arithmatex">\(w_h \in (0, 0.5)\)</span> and width ratio <span class="arithmatex">\(\eta &gt; 1\)</span>.</li>
+</ul>
+<p><code>PhysicsForwardModel</code> pairs these forward operators with quantitative counting-statistics objectives:</p>
+<ul>
+<li><strong>Poisson Shot-Noise Deviance (<code>loss_fn="forward_psf_poisson"</code>)</strong>: Exact maximum-likelihood negative log-likelihood for low-dose STEM-EDS, EELS, XRF, and time-of-flight Bragg-edge photon/neutron counts <span class="arithmatex">\(C_{\text{LR}} \sim \mathrm{Poisson}(s_m \hat{G}_{\text{LR}, m} + b_m)\)</span> with learnable per-channel gain <span class="arithmatex">\(s_m &gt; 0\)</span> and background <span class="arithmatex">\(b_m \ge 0\)</span>:
+  $$
+  \mathcal{L}<em>{\text{Poisson}}(\hat{\Lambda}, C) = 2 \sum</em>{m, u} \left[\hat{\Lambda}<em>{m,u} - C</em>{m,u} + C_{m,u} \log!\left(\frac{\max(C_{m,u}, \epsilon)}{\hat{\Lambda}_{m,u}}\right)\right]
+  $$</li>
+<li><strong>Simplex Mass/Atomic-Fraction Conservation (<code>loss_fn="compositional_kl"</code>)</strong>: Enforces <span class="arithmatex">\(\hat{P}_{\text{HR}} = \mathrm{softmax}(Z_{\text{HR}}) \in \Delta^{K-1}\)</span> (<span class="arithmatex">\(\sum_{k=1}^K \hat{P}_{k}(x) = 1\)</span> at every pixel) supervised via forward-PSF Kullback–Leibler divergence.</li>
+<li><strong>3D Spectral / Diffraction Cube Unmixing (<code>SpectralUnmixingDictionary</code>, <code>spectral_unmix=True</code>)</strong>: Accepts raw <span class="arithmatex">\((E, H_{\text{LR}}, W_{\text{LR}})\)</span> EDS/EELS/XRD cubes directly without external pre-fitting, jointly learning non-negative endmember spectra <span class="arithmatex">\(S \in \mathbb{R}_{\ge 0}^{M \times E}\)</span> (<span class="arithmatex">\(\sum_e S_{m,e} = 1\)</span>, initialized via Successive Projection Algorithm + multiplicative NMF) alongside super-resolved spatial abundances: <span class="arithmatex">\(\hat{Y}_{e, u} = \sum_{m=1}^M \alpha_m \hat{G}_{\text{LR}, m, u} S_{m, e} + b_e\)</span>.</li>
+<li><strong>Cubic B-Spline Non-Rigid Registration (<code>align_guide="bspline"</code>)</strong>: Compensates nonlinear SEM/STEM charging drift and scan-coil hysteresis via a bicubic control-point displacement field regularized by thin-plate bending energy <span class="arithmatex">\(\|\nabla^2 u\|_2^2\)</span> and monitored via minimum Jacobian determinant <span class="arithmatex">\(\min \det J_{\mathcal{W}}\)</span> for diffeomorphic invertibility.</li>
+<li><strong>Fringe-Guarded Porous-Media Void Clamping (<code>pore_mask="auto_otsu_fringe_guarded"</code>)</strong>: In porous catalysts and electrodes, structural voids (<span class="arithmatex">\(M_{\text{pore}} = 1\)</span>) contain zero solid phase while coarse diffraction/EDS voxels suffer partial-volume pore dilution. <code>segment_pores_otsu</code> damps 1–2 px Fresnel propagation phase-contrast overshoots solely during threshold estimation via a Fourier Tie-homogeneity filter <span class="arithmatex">\(\mathcal{F}^{-1}\{\mathcal{F}(I_{\text{HR}}) / (1 + \alpha \|\mathbf{k}\|_2^2)\}\)</span> (without blurring <span class="arithmatex">\(I_{\text{HR}}\)</span>) and clamps void logits prior to <span class="arithmatex">\(\mathcal{D}_\Sigma\)</span>, deconvolving solid-framework stoichiometry with zero void leakage.</li>
+</ul>
+<hr />
+<h2 id="3-prior-calibration-tri-part-uncertainty-split-conformal-sets">3. Prior Calibration, Tri-Part Uncertainty &amp; Split Conformal Sets<a class="headerlink" href="#3-prior-calibration-tri-part-uncertainty-split-conformal-sets" title="Permanent link">&para;</a></h2>
+<p>After fitting, X-FUSE calibrates high-resolution posteriors via <code>match_coarse_priors</code> so spatial means match physical coarse phase fractions, and decomposes pixel/voxel uncertainty into:</p>
+<ol>
+<li><strong>Aleatoric / Chemical Ambiguity (<span class="arithmatex">\(U_{\text{alea}}\)</span>)</strong>: Normalized Shannon entropy <span class="arithmatex">\(-\frac{1}{\log K} \sum_{k=1}^{K} p_k(x) \log p_k(x) \in [0, 1]\)</span>.</li>
+<li><strong>Epistemic / View Disagreement (<span class="arithmatex">\(U_{\text{epi}}\)</span>)</strong>: Computed in <span class="arithmatex">\(O(1)\)</span> auxiliary memory via an online <strong>Welford accumulator</strong> across invertible sub-patch TTA views (and orthogonal <code>XY</code>, <code>XZ</code>, <code>YZ</code> planes in 2.5D mode).</li>
+<li><strong>Physical Forward-Model Residual (<span class="arithmatex">\(U_{\text{phys}}\)</span>)</strong>: Upsampled <span class="arithmatex">\(|\mathcal{D}_\Sigma(\mathcal{W}_\theta(\hat{P}_{\text{HR}})) - G_{\text{LR}}|\)</span>, automatically flagging <strong>structurally invisible phases</strong> carrying zero contrast in <span class="arithmatex">\(I_{\text{HR}}\)</span>.</li>
+</ol>
+<h3 id="temperature-scaled-regularized-adaptive-conformal-prediction-conformalcalibrator">Temperature-Scaled Regularized Adaptive Conformal Prediction (<code>ConformalCalibrator</code>)<a class="headerlink" href="#temperature-scaled-regularized-adaptive-conformal-prediction-conformalcalibrator" title="Permanent link">&para;</a></h3>
+<p>When <code>conformal_alpha</code> <span class="arithmatex">\(\alpha \in (0, 1)\)</span> is specified (or calibrated against sparse reference labels via <code>ConformalCalibrator.calibrate_labels</code>), X-FUSE supports Least Ambiguous Set-Valued Classifiers (<code>"lac"</code>), Adaptive Prediction Sets (<code>"aps"</code>), and <strong>Regularized Adaptive Prediction Sets (<code>"raps"</code>, Angelopoulos et al., ICLR 2021)</strong> with post-hoc NLL temperature scaling (<code>fit_temperature=True</code>) on spatially disjoint checkerboard blocks (<code>spatial_block_size</code> <span class="arithmatex">\(b\)</span>):</p>
+<div class="arithmatex">\[
+s_{\text{RAPS}}(x, y) = \sum_{j=1}^{r(x, y) - 1} \tilde{\pi}_{(j)}(x; T) + u \cdot \tilde{\pi}_{(r(x, y))}(x; T) + \lambda_{\text{reg}} \max\!\left(0,\, r(x, y) - k_{\text{reg}}\right)
+\]</div>
+<p>where <span class="arithmatex">\(\tilde{\pi}(x; T) = \mathrm{softmax}(\log p(x) / T)\)</span> is fit on half of the <span class="arithmatex">\(b \times b\)</span> spatial blocks and the conformal quantile <span class="arithmatex">\(\hat{q}_{1-\alpha}\)</span> is evaluated at finite-sample effective sample size <span class="arithmatex">\(N_{\text{eff}} = \lfloor N_{\text{cal}} / b^2 \rfloor\)</span> on the complementary blocks. This yields compact singleton sets inside homogeneous grain interiors while expanding cleanly to 2-phase sets along diffuse interphase boundaries.</p>
+<hr />
+<h2 id="4-1d-voronoi-integrated-active-sparse-slice-roi-steering">4. 1D Voronoi-Integrated Active Sparse-Slice &amp; ROI Steering<a class="headerlink" href="#4-1d-voronoi-integrated-active-sparse-slice-roi-steering" title="Permanent link">&para;</a></h2>
+<p>During synchrotron or electron-microscopy beamtime, <code>suggest_next_slices</code> ranks candidate unmeasured <span class="arithmatex">\(z\)</span>-slices in a 3D tomogram by combining local axial-correlation-discounted uncertainty <span class="arithmatex">\(\hat{U}(c \mid \mathcal{S}) = (w_{\text{epi}} \tilde{U}_{\text{epi}}(c) + w_{\text{alea}} \tilde{U}_{\text{alea}}(c))(1 - e^{-d_{\mathcal{S}}(c)/\ell_z})\)</span> with <strong>1D Voronoi distance-reduction integration</strong> across the full axial stack:</p>
+<div class="arithmatex">\[
+\mathcal{A}(c \mid \mathcal{S}) = 0.55\, \hat{U}(c \mid \mathcal{S}) + \frac{0.45}{Z_{\max}} \sum_{z=1}^{Z} \left(\hat{U}(z \mid \mathcal{S}) + w_{\text{dist}}\right) \max\!\left(0,\, d_{\mathcal{S}}(z) - |z - c|\right)
+\]</div>
+<p>where <span class="arithmatex">\(d_{\mathcal{S}}(z) = \min_{s \in \mathcal{S}} |z - s|\)</span>, subject to minimum slice spacing <span class="arithmatex">\(\Delta z_{\min}\)</span>. This immediately discovers localized reaction fronts on initial scouts while naturally bisecting unvisited bulk intervals as the acquisition budget grows. Similarly, <code>suggest_2d_rois</code> evaluates exact <span class="arithmatex">\(O(HW)\)</span> integral-image sliding-window sums over <span class="arithmatex">\((1 - w_r) U_{\text{comb}} + w_r U_{\text{phys}}\)</span> with non-maximum suppression to schedule non-overlapping 2D re-acquisition windows.</p>
+<hr />
+<h2 id="5-3d-axial-interaction-volume-deconvolution-tri-plane-consistency">5. 3D Axial Interaction-Volume Deconvolution &amp; Tri-Plane Consistency<a class="headerlink" href="#5-3d-axial-interaction-volume-deconvolution-tri-plane-consistency" title="Permanent link">&para;</a></h2>
+<p>In correlative 3D tomography (<code>VolumetricFuser</code>), a 2D chemical or diffraction map acquired at nominal slice <span class="arithmatex">\(z_k\)</span> (e.g., polished FIB-SEM-EDS or thick-beam XRD-CT) integrates signal across an axial interaction depth <span class="arithmatex">\(\sigma_z &gt; 0\)</span> rather than an infinitesimally thin plane. When <code>depth_psf_sigma &gt; 0</code>, <code>VolumetricFuser.fit_sparse_slices</code> supervises an axial stencil <span class="arithmatex">\(z_k + \delta\)</span> (<span class="arithmatex">\(\delta \in \{-R, \dots, R\}\)</span>) weighted by a normalized Gaussian depth kernel <span class="arithmatex">\(w_\delta \propto \exp(-\delta^2 / 2\sigma_z^2)\)</span> (optionally learning <span class="arithmatex">\(\sigma_z\)</span> jointly via <code>learn_depth_psf=True</code>):</p>
+<div class="arithmatex">\[
+\hat{P}_{\text{slab}}(z_k) = \sum_{\delta=-R}^{R} w_\delta(\sigma_z)\, \hat{P}_{\text{HR}}(z_k + \delta), \qquad \mathcal{L}_{\text{3D}} = \mathcal{L}_{\text{phys}}\!\left(\mathcal{D}_\Sigma(\hat{P}_{\text{slab}}(z_k)),\, G_{\text{LR}}(z_k)\right) + \lambda_{\text{tri}} \mathcal{L}_{\text{JSD}}(P_{XY}, P_{XZ}, P_{YZ})
+\]</div>
+<p>When <code>triplane_consistency_weight</code> <span class="arithmatex">\(\lambda_{\text{tri}} &gt; 0\)</span>, randomly sampled unguided interior voxels are regularized via symmetric Jensen–Shannon divergence <span class="arithmatex">\(\mathcal{L}_{\text{JSD}}\)</span> across orthogonal <code>XY</code>, <code>XZ</code>, and <code>YZ</code> 2.5D slice predictions, suppressing slice-to-slice striping between sparse chemical acquisitions.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.expand", "navigation.top", "content.code.copy", "search.suggest", "search.highlight"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.a5f9d56c.min.js"></script>
+      
+        <script src="https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"></script>
+      
+    
+  </body>
+</html>
