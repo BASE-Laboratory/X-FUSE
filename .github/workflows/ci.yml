@@ -26,6 +26,7 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
+          python-version: "3.12"
 
       - name: Install developer & docs dependencies
         run: >-
@@ -118,6 +119,7 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
+          python-version: "3.12"
 
       - name: Build sdist and wheel
         run: uv build
