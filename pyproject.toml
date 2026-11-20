@@ -124,7 +124,6 @@ include = [
     "/docs",
     "/mkdocs.yml",
     "/AGENTS.md",
-    "/ECOSYSTEM.md",
     "/README.md",
     "/INSTALL.md",
     "/CHANGELOG.md",
