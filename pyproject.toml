@@ -41,8 +41,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Swap to "basecoat>=0.2.0,<0.3.0" once PyPI Trusted Publisher is enabled on BASE-Laboratory/basecoat
-    "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.2.0",
+    # Swap to "basecoat>=0.3.0,<0.4.0" once PyPI Trusted Publisher is enabled on BASE-Laboratory/basecoat
+    "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.3.0",
     "h5py>=3.10",
     "matplotlib>=3.7",
     "numpy>=1.24",

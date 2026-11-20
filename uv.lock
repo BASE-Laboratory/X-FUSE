@@ -300,8 +300,8 @@ wheels = [
 
 [[package]]
 name = "basecoat"
-version = "0.2.0"
-source = { git = "https://github.com/BASE-Laboratory/basecoat.git?rev=v0.2.0#6cc85cbb92e7a13ce69bd9a1e4591ddaa423ba1d" }
+version = "0.3.0"
+source = { git = "https://github.com/BASE-Laboratory/basecoat.git?rev=v0.3.0#261e80a012cfe85e8e854d11b1cbab878a54f9c4" }
 dependencies = [
     { name = "h5py" },
     { name = "numcodecs", version = "0.13.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -9008,7 +9008,7 @@ synthetic = [
 
 [package.metadata]
 requires-dist = [
-    { name = "basecoat", git = "https://github.com/BASE-Laboratory/basecoat.git?rev=v0.2.0" },
+    { name = "basecoat", git = "https://github.com/BASE-Laboratory/basecoat.git?rev=v0.3.0" },
     { name = "h5py", specifier = ">=3.10" },
     { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6.25" },
     { name = "ipywidgets", marker = "extra == 'notebooks'", specifier = ">=8.0" },

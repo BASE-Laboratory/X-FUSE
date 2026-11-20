@@ -10,9 +10,15 @@ from typing import Any, Literal
 
 import h5py
 import numpy as np
-from basecoat import open_savu_h5, read_ome_zarr, read_volume
+from basecoat import (
+    detrend_radial_cupping as _bc_detrend_radial_cupping,
+    open_savu_h5,
+    read_ome_zarr,
+    read_volume,
+    remove_rings_polar_conservative as _bc_remove_rings_polar,
+)
 from PIL import Image
-from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates, rotate
+from scipy.ndimage import rotate
 
 _ORIG_H5PY_FILE = h5py.File
 
@@ -523,64 +529,28 @@ def detrend_radial_cupping(
     valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Remove low-order local-tomography radial cupping and tilt drift per 2D
-    slice using a 7-term ``[1, y, x, y^2, y*x, x^2, r^4]`` polynomial fit.
-
-    Subtracts only the centered non-constant spatial drift terms over ``valid_mask``
-    while preserving exact mean attenuation and high-frequency pore-throat boundaries.
+    slice via :func:`basecoat.detrend_radial_cupping`.
 
     .. warning::
        On radially zoned or core--shell specimens (e.g. ion-exchanged catalyst
        pellets where radial ``Z``-contrast tracks chemical exchange), polynomial
-       cupping subtraction is confounded with genuine radial attenuation gradients
-       (``r(Delta_cupping, Zn) ~ +0.53`` on DIAD ``Zn-13X``). Use only as an
-       optional pore-thresholding helper on chemically uniform matrices, and
-       prefer :func:`remove_polar_rings_conservative` when preserving radial
-       chemical contrast.
+       cupping subtraction is confounded with genuine radial attenuation gradients.
+       Use only as an optional pore-thresholding helper on chemically uniform
+       matrices, and prefer :func:`remove_polar_rings_conservative` when
+       preserving radial chemical contrast.
     """
     arr = np.asarray(volume_or_slice, dtype=np.float32)
-    is_2d = arr.ndim == 2
-    vol = arr[None, ...] if is_2d else arr.copy()
-    if vol.ndim != 3:
+    if arr.ndim not in (2, 3):
         raise ValueError(f"Expected 2D or 3D array, got shape {arr.shape}.")
-
-    z_dim, height, width = vol.shape
-    yy = np.linspace(-1.0, 1.0, height, dtype=np.float32)
-    xx = np.linspace(-1.0, 1.0, width, dtype=np.float32)
-    yg, xg = np.meshgrid(yy, xx, indexing="ij")
-    r4 = (yg * yg + xg * xg) ** 2
-    basis_drift = np.stack(
-        [yg, xg, yg * yg, yg * xg, xg * xg, r4], axis=-1
-    )  # (H, W, 6)
-
-    step = max(1, min(height, width) // 128)
-    out = np.empty_like(vol)
-    for z_i in range(z_dim):
-        sl = vol[z_i]
-        if valid_mask is not None:
-            m_sl = (
-                np.asarray(valid_mask, dtype=bool)
-                if valid_mask.ndim == 2
-                else np.asarray(valid_mask[z_i], dtype=bool)
-            ) & np.isfinite(sl)
-        else:
-            m_sl = np.isfinite(sl)
-
-        sub_m = m_sl[::step, ::step]
-        if int(sub_m.sum()) < 16:
-            out[z_i] = sl
-            continue
-        b_mean = basis_drift[m_sl].mean(axis=0, dtype=np.float64)
-        sub_b = basis_drift[::step, ::step][sub_m].astype(np.float64) - b_mean
-        design = np.concatenate(
-            [np.ones((sub_b.shape[0], 1), dtype=np.float64), sub_b], axis=1
-        )
-        sub_y = sl[::step, ::step][sub_m].astype(np.float64)
-        coef, *_ = np.linalg.lstsq(design, sub_y, rcond=1e-3)
-        centered_b = basis_drift - b_mean.astype(np.float32)
-        drift = np.tensordot(centered_b, coef[1:].astype(np.float32), axes=([2], [0]))
-        out[z_i] = np.where(m_sl, sl - drift, sl)
-
-    return out[0] if is_2d else out
+    fin = np.isfinite(arr)
+    if not np.any(fin):
+        return arr.copy()
+    eff_mask = fin if valid_mask is None else (np.asarray(valid_mask, dtype=bool) & fin)
+    if int(np.count_nonzero(eff_mask)) < 16:
+        return arr.copy()
+    sanitized = np.where(fin, arr, float(np.median(arr[fin]))).astype(np.float32)
+    detrended = _bc_detrend_radial_cupping(sanitized, valid_mask_zyx=eff_mask)
+    return np.where(eff_mask, detrended, arr).astype(np.float32)
 
 
 def remove_polar_rings_conservative(
@@ -592,108 +562,45 @@ def remove_polar_rings_conservative(
     mad_clip: float = 3.0,
 ) -> np.ndarray:
     """Suppress concentric synchrotron XCT ring/arc artifacts in polar coordinates
-    with gradient-magnitude edge protection and MAD outlier clipping so sharp
-    pore walls, dense inclusions, and pellet rims do not induce false bullseyes.
+    via :func:`basecoat.remove_rings_polar_conservative`.
     """
+    _ = grad_protect_quantile
     arr = np.asarray(volume_or_slice, dtype=np.float32)
-    is_2d = arr.ndim == 2
-    vol = arr[None, ...] if is_2d else arr.copy()
-    if vol.ndim != 3:
+    if arr.ndim not in (2, 3):
         raise ValueError(f"Expected 2D or 3D array, got shape {arr.shape}.")
-
-    z_dim, height, width = vol.shape
+    height, width = (
+        (arr.shape[0], arr.shape[1]) if arr.ndim == 2 else (arr.shape[1], arr.shape[2])
+    )
     if min(height, width) < 4:
         return arr.copy()
-    cy = (height - 1) * 0.5 if center is None else float(center[0])
-    cx = (width - 1) * 0.5 if center is None else float(center[1])
-    max_r = (
-        int(
-            np.ceil(
-                max(
-                    np.hypot(cy, cx),
-                    np.hypot(cy, width - 1 - cx),
-                    np.hypot(height - 1 - cy, cx),
-                    np.hypot(height - 1 - cy, width - 1 - cx),
-                )
-            )
-        )
-        + 1
-    )
-    n_theta = max(180, int(np.ceil(2.0 * np.pi * max(16.0, 0.5 * max_r))))
-    thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False, dtype=np.float32)
-    radii = np.arange(max_r, dtype=np.float32)
-    rg, tg = np.meshgrid(radii, thetas, indexing="ij")  # (R, Theta)
-    pol_y = cy + rg * np.sin(tg)
-    pol_x = cx + rg * np.cos(tg)
-    in_fov = (
-        (pol_y >= 0.0)
-        & (pol_y <= float(height - 1))
-        & (pol_x >= 0.0)
-        & (pol_x <= float(width - 1))
-    ).astype(np.float32)
 
-    yy, xx = np.meshgrid(
-        np.arange(height, dtype=np.float32) - cy,
-        np.arange(width, dtype=np.float32) - cx,
-        indexing="ij",
-    )
-    cart_r = np.hypot(yy, xx)
-    cart_t = (np.arctan2(yy, xx) % (2.0 * np.pi)) * (n_theta / (2.0 * np.pi))
-    sigma_theta = max(1.0, (float(angular_window_deg) / 360.0) * n_theta * 0.5)
-    fov_denom = np.maximum(
-        gaussian_filter1d(in_fov, sigma=sigma_theta, axis=1, mode="wrap"), 0.15
-    )
-
-    out = np.empty_like(vol)
-    for z_i in range(z_dim):
-        sl_raw = vol[z_i]
-        fin = np.isfinite(sl_raw)
-        if not np.any(fin):
-            out[z_i] = sl_raw
-            continue
-        if not np.all(fin):
-            f_vals = sl_raw[fin]
-            sl = np.nan_to_num(
-                sl_raw,
-                nan=float(np.median(f_vals)),
-                posinf=float(np.max(f_vals)),
-                neginf=float(np.min(f_vals)),
-            )
-        else:
-            sl = sl_raw
-
-        gy, gx = np.gradient(sl)
-        gmag = np.hypot(gy, gx)
-        g_thr = float(
-            np.quantile(gmag, float(np.clip(grad_protect_quantile, 0.5, 0.99)))
-        )
-        edge_w = np.clip(gmag / max(g_thr * 1.5, 1e-6), 0.0, 1.0)
-
-        hp = sl - gaussian_filter(sl, sigma=float(radial_sigma), mode="nearest")
-        med = float(np.median(hp))
-        mad = float(np.median(np.abs(hp - med))) * 1.4826 + 1e-6
-        hp_clipped = np.clip(hp, med - mad_clip * mad, med + mad_clip * mad)
-        hp_protected = hp_clipped * (1.0 - 0.85 * edge_w)
-
-        polar_hp = (
-            map_coordinates(hp_protected, [pol_y, pol_x], order=1, mode="nearest")
-            * in_fov
-        )
-        ring_pol = (
-            gaussian_filter1d(polar_hp, sigma=sigma_theta, axis=1, mode="wrap")
-            / fov_denom
-        ) * in_fov
-        ring_pol = ring_pol - gaussian_filter1d(
-            ring_pol, sigma=max(2.0, float(radial_sigma) * 2.5), axis=0, mode="nearest"
-        )
-        ring_pol_pad = np.concatenate([ring_pol, ring_pol[:, :1]], axis=1)
-        ring_cart = map_coordinates(
-            ring_pol_pad, [cart_r, cart_t], order=1, mode="nearest"
+    fin = np.isfinite(arr)
+    if not np.any(fin):
+        return arr.copy()
+    if not np.all(fin):
+        f_vals = arr[fin]
+        work = np.nan_to_num(
+            arr,
+            nan=float(np.median(f_vals)),
+            posinf=float(np.max(f_vals)),
+            neginf=float(np.min(f_vals)),
         ).astype(np.float32)
-        cleaned = sl - ring_cart * (1.0 - 0.75 * edge_w)
-        out[z_i] = np.where(fin, cleaned, sl_raw)
+    else:
+        work = arr
 
-    return out[0] if is_2d else out
+    center_yx = (
+        ((height - 1) * 0.5, (width - 1) * 0.5)
+        if center is None
+        else (float(center[0]), float(center[1]))
+    )
+    cleaned, _ = _bc_remove_rings_polar(
+        work,
+        center_yx=center_yx,
+        radial_sigma_px=max(2.5, float(radial_sigma)),
+        angular_window_deg=float(angular_window_deg),
+        mad_clip_factor=float(mad_clip),
+    )
+    return np.where(fin, cleaned, arr).astype(np.float32)
 
 
 def load_i13_xct(xct_path: str, **kwargs: Any) -> np.ndarray:
