@@ -129,7 +129,6 @@
     options:
       members:
         - load_xct_subvolume
-        - load_diad_xct_zn13x
         - load_diad_xrdct
         - load_xrdct_peak_maps
         - aggregate_peak_maps

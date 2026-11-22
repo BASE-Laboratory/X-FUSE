@@ -22,12 +22,6 @@ from scipy.ndimage import rotate
 
 _ORIG_H5PY_FILE = h5py.File
 
-# Retained in v1.0.x for manuscript reproducibility; canonical home under ECOSYSTEM.md
-# is BASE-Laboratory/MultimodalBenchmark (Layer 4).
-DIAD_ZN13X_50UM_SCAN_IDS: tuple[int, ...] = tuple(
-    list(range(43336, 43348)) + list(range(43393, 43401))
-)
-DIAD_ZN13X_25UM_SCAN_IDS: tuple[int, ...] = (43322, 43323, 43324, 43325)
 PeakAggregationMode = Literal[
     "all_sum",
     "all_mean",
@@ -336,39 +330,27 @@ def load_xrdct_phase(
     return xrdct_data
 
 
-def load_diad_xct_zn13x(
-    xct_path: str | Path,
-    recon: str = "Astra",
-    zyx_slices: tuple[slice, slice, slice] | None = (
-        slice(150, 2000),
-        slice(350, 2200),
-        slice(350, 2200),
-    ),
-    stride: int | tuple[int, int, int] = 1,
-    flip_x: bool = False,
-    **kwargs: Any,
-) -> np.ndarray:
-    """Load and crop DIAD Zn13X Astra-reconstructed XCT volume out-of-core."""
-    return load_xct_subvolume(
-        xct_path,
-        recon=recon,
-        zyx_slices=zyx_slices,
-        stride=stride,
-        flip_x=flip_x,
-    )
-
-
 def _load_cleaned_xrdct_bundle(
     bundle_path: Path,
-    phase_list: list[str],
+    phase_list: list[str] | None,
     include_auxiliary: bool = False,
 ) -> dict[str, np.ndarray]:
     """Load an artifact-cleaned XRD-CT `.npz` or `.h5` bundle."""
+    aux_keys = {"na_sigma2", "zn_sigma2", "valid_mask", "scan_ids"}
     out: dict[str, np.ndarray] = {}
     if bundle_path.suffix.lower() == ".npz":
         with np.load(bundle_path, allow_pickle=False) as data:
             lower_map = {k.lower(): k for k in data.files}
-            for ph in phase_list:
+            resolved_phases = (
+                phase_list
+                if phase_list
+                else [
+                    k
+                    for k in data.files
+                    if k.lower() not in aux_keys and not k.lower().endswith("_sigma2")
+                ]
+            )
+            for ph in resolved_phases:
                 k_match = lower_map.get(ph.lower())
                 if k_match is None:
                     raise KeyError(
@@ -376,24 +358,34 @@ def _load_cleaned_xrdct_bundle(
                     )
                 out[ph] = np.asarray(data[k_match], dtype=np.float32)
             if include_auxiliary:
-                for aux in ("na_sigma2", "zn_sigma2", "valid_mask", "scan_ids"):
-                    if aux in lower_map:
-                        out[aux] = np.asarray(data[lower_map[aux]])
+                for k_orig in data.files:
+                    kl = k_orig.lower()
+                    if kl in aux_keys or kl.endswith("_sigma2"):
+                        out[k_orig] = np.asarray(data[k_orig])
         return out
 
     with h5py.File(bundle_path, "r") as hf:
-        lower_map = {str(k).lower(): str(k) for k in hf.keys()}
-        for ph in phase_list:
+        keys = [str(k) for k in hf.keys()]
+        lower_map = {k.lower(): k for k in keys}
+        resolved_phases = (
+            phase_list
+            if phase_list
+            else [
+                k
+                for k in keys
+                if k.lower() not in aux_keys and not k.lower().endswith("_sigma2")
+            ]
+        )
+        for ph in resolved_phases:
             k_match = lower_map.get(ph.lower())
             if k_match is None:
-                raise KeyError(
-                    f"Phase '{ph}' not found in {bundle_path} ({list(hf.keys())})."
-                )
+                raise KeyError(f"Phase '{ph}' not found in {bundle_path} ({keys}).")
             out[ph] = np.asarray(hf[k_match], dtype=np.float32)
         if include_auxiliary:
-            for aux in ("na_sigma2", "zn_sigma2", "valid_mask", "scan_ids"):
-                if aux in lower_map:
-                    out[aux] = np.asarray(hf[lower_map[aux]])
+            for k_orig in keys:
+                kl = k_orig.lower()
+                if kl in aux_keys or kl.endswith("_sigma2"):
+                    out[k_orig] = np.asarray(hf[k_orig])
     return out
 
 
@@ -401,31 +393,30 @@ def load_diad_xrdct(
     phase_folder: str | Path,
     phases: Sequence[str] | None = None,
     *,
-    resolution: Literal["50um", "25um"] | None = None,
     scan_ids: Sequence[int] | None = None,
     aggregation: PeakAggregationMode = "all_sum",
     target_q_by_phase: dict[str, float] | None = None,
     q_tol: float = 0.02,
     flip_x: bool = True,
-    correct_motor_offset_deg: float | None = None,
+    correct_motor_offset_deg: float = 0.0,
     include_auxiliary: bool = False,
     **kwargs: Any,
 ) -> dict[str, np.ndarray]:
-    """Load DIAD K11 XRD-CT NeXus phase stacks or pre-cleaned ``.npz``/``.h5``
-    bundles as ``{phase_name: (Z, Y, X)}``.
+    """Load XRD-CT NeXus phase stacks or pre-cleaned ``.npz``/``.h5`` bundles
+    as ``{phase_name: (Z, Y, X)}``.
 
-    Resolves explicit ``50um`` (``43336..43347, 43393..43400``, 20 slices) vs
-    ``25um`` ROI (``43322..43325``, 4 slices) scan IDs, aggregates all fitted
-    Bragg reflections by default (``aggregation="all_sum"``), and corrects the
-    ``+47.5°`` ``gts_cs_theta`` soft-motor zero offset on ``50 µm`` scans
-    (``-47.5°`` after horizontal ``flip_x``).
+    Dataset-specific scan subsets and stage motor-zero offsets belong in Layer 4
+    workflows (e.g. ``MultimodalBenchmark``) and are passed explicitly via
+    ``scan_ids`` and ``correct_motor_offset_deg``.
     """
-    phase_list = list(phases) if phases is not None else ["Na", "Zn"]
+    explicit_phases = list(phases) if phases is not None else None
     src_path = Path(phase_folder)
 
     if src_path.is_file() and src_path.suffix.lower() in (".npz", ".h5", ".hdf5"):
         return _load_cleaned_xrdct_bundle(
-            src_path, phase_list=phase_list, include_auxiliary=include_auxiliary
+            src_path,
+            phase_list=explicit_phases,
+            include_auxiliary=include_auxiliary,
         )
 
     if src_path.is_dir() and aggregation != "legacy":
@@ -438,26 +429,26 @@ def load_diad_xrdct(
 
         if scan_map:
             avail_scans = sorted({sid for (sid, _) in scan_map})
-            if scan_ids is not None:
-                chosen_ids = [int(s) for s in scan_ids]
-            elif resolution == "25um":
-                chosen_ids = [s for s in DIAD_ZN13X_25UM_SCAN_IDS if s in avail_scans]
-            elif resolution == "50um":
-                chosen_ids = [s for s in DIAD_ZN13X_50UM_SCAN_IDS if s in avail_scans]
-            else:
-                s50 = [s for s in DIAD_ZN13X_50UM_SCAN_IDS if s in avail_scans]
-                chosen_ids = s50 if s50 else avail_scans
-
+            chosen_ids = (
+                [int(s) for s in scan_ids] if scan_ids is not None else avail_scans
+            )
             if not chosen_ids:
                 raise FileNotFoundError(
                     f"No matching XRD-CT scan IDs found in {src_path} "
-                    f"(available={avail_scans}, resolution={resolution})."
+                    f"(available={avail_scans})."
                 )
 
-            q_defaults = {"na": 1.651, "zn": 1.656}
-            if target_q_by_phase:
-                for k_p, v_q in target_q_by_phase.items():
-                    q_defaults[k_p.lower()] = float(v_q)
+            phase_list = (
+                explicit_phases
+                if explicit_phases is not None
+                else sorted({ph_k for (_, ph_k) in scan_map})
+            )
+            q_targets = (
+                {k_p.lower(): float(v_q) for k_p, v_q in target_q_by_phase.items()}
+                if target_q_by_phase
+                else {}
+            )
+            eff_deg = float(correct_motor_offset_deg)
 
             result: dict[str, np.ndarray] = {}
             for ph in phase_list:
@@ -474,7 +465,7 @@ def load_diad_xrdct(
                         sl_2d = aggregate_peak_maps(
                             peaks,
                             mode=aggregation,
-                            target_q=q_defaults.get(ph_l),
+                            target_q=q_targets.get(ph_l),
                             q_tol=q_tol,
                         )
                     else:
@@ -485,11 +476,6 @@ def load_diad_xrdct(
                             ).squeeze()
                             if flip_x:
                                 sl_2d = np.fliplr(sl_2d).copy()
-
-                    if correct_motor_offset_deg is None:
-                        eff_deg = 47.5 if sid in DIAD_ZN13X_50UM_SCAN_IDS else 0.0
-                    else:
-                        eff_deg = float(correct_motor_offset_deg)
 
                     if abs(eff_deg) > 1e-6:
                         rot_angle = -eff_deg if flip_x else eff_deg
@@ -504,23 +490,26 @@ def load_diad_xrdct(
                 result[ph] = np.stack(slices_2d, axis=0)
             return result
 
-    # Legacy fallback (e.g. non-output_* .nxs stacks or mocked test_loaders paths)
+    if not explicit_phases:
+        raise ValueError(
+            "phases must be specified explicitly when loading legacy NeXus slice "
+            "folders without 'output_<scan>_<phase>.nxs' naming."
+        )
+    shape = kwargs.pop("shape", (21, 20, 20))
+    crop = kwargs.pop("crop", slice(None))
+    entry_names = kwargs.pop("entry_names", {"default": "data"})
     phase_arrays = load_xrdct_phase(
         str(phase_folder),
-        shape=(21, 20, 20),
-        phases=phase_list,
-        crop=slice(5, -1),
-        entry_names={
-            "Na": "entry/peak at q~1.651",
-            "Zn": "entry/peak at q~1.656",
-            "default": "data",
-        },
+        shape=shape,
+        phases=explicit_phases,
+        crop=crop,
+        entry_names=entry_names,
         **kwargs,
     )
 
     return {
         phase: (np.flip(arr, axis=2).copy() if flip_x else arr.copy())
-        for phase, arr in zip(phase_list, phase_arrays, strict=False)
+        for phase, arr in zip(explicit_phases, phase_arrays, strict=False)
     }
 
 
@@ -558,13 +547,11 @@ def remove_polar_rings_conservative(
     center: tuple[float, float] | None = None,
     radial_sigma: float = 2.5,
     angular_window_deg: float = 45.0,
-    grad_protect_quantile: float = 0.85,
     mad_clip: float = 3.0,
 ) -> np.ndarray:
     """Suppress concentric synchrotron XCT ring/arc artifacts in polar coordinates
     via :func:`basecoat.remove_rings_polar_conservative`.
     """
-    _ = grad_protect_quantile
     arr = np.asarray(volume_or_slice, dtype=np.float32)
     if arr.ndim not in (2, 3):
         raise ValueError(f"Expected 2D or 3D array, got shape {arr.shape}.")
