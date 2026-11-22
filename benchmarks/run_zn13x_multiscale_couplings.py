@@ -27,8 +27,6 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter, laplace, rotate, shift, zoom
 
 from x_fuse import (
-    DIAD_ZN13X_25UM_SCAN_IDS,
-    DIAD_ZN13X_50UM_SCAN_IDS,
     PeakAggregationMode,
     VolumetricUncertaintyReport,
     XFuse,
@@ -55,6 +53,12 @@ except ImportError:
         cnmf_pansharpen_baseline,
         guided_variational_sr_baseline,
     )
+
+_BENCH_50UM_SCAN_IDS: tuple[int, ...] = tuple(
+    list(range(43336, 43348)) + list(range(43393, 43401))
+)
+_BENCH_25UM_SCAN_IDS: tuple[int, ...] = (43322, 43323, 43324, 43325)
+_BENCH_Q_TARGETS = {"na": 1.651, "zn": 1.656}
 
 PAIRED_ZN13X_SCANS: tuple[tuple[int, int, int], ...] = (
     (43345, 43324, 9),
@@ -130,16 +134,26 @@ def run_study1_xrdct_hardware_audit(
     out: dict[str, Any] = {}
     for label, agg, deg in configs:
         d50 = load_diad_xrdct(
-            nxs_dir, resolution="50um", aggregation=agg, correct_motor_offset_deg=deg
+            nxs_dir,
+            phases=["Na", "Zn"],
+            scan_ids=_BENCH_50UM_SCAN_IDS,
+            aggregation=agg,
+            target_q_by_phase=_BENCH_Q_TARGETS,
+            correct_motor_offset_deg=deg,
         )
         d25 = load_diad_xrdct(
-            nxs_dir, resolution="25um", aggregation=agg, correct_motor_offset_deg=0.0
+            nxs_dir,
+            phases=["Na", "Zn"],
+            scan_ids=_BENCH_25UM_SCAN_IDS,
+            aggregation=agg,
+            target_q_by_phase=_BENCH_Q_TARGETS,
+            correct_motor_offset_deg=0.0,
         )
         per_pair: dict[str, dict[str, float]] = {}
         r_int_list, r_frac_list, mae_list = [], [], []
         for s50, s25, z_idx in PAIRED_ZN13X_SCANS:
-            i50 = DIAD_ZN13X_50UM_SCAN_IDS.index(s50)
-            i25 = DIAD_ZN13X_25UM_SCAN_IDS.index(s25)
+            i50 = _BENCH_50UM_SCAN_IDS.index(s50)
+            i25 = _BENCH_25UM_SCAN_IDS.index(s25)
             na50_up = zoom(d50["Na"][i50], 2.0, order=3)
             zn50_up = zoom(d50["Zn"][i50], 2.0, order=3)
             f50, _ = _zn_fraction(na50_up, zn50_up)
@@ -442,8 +456,8 @@ def run_study3_multilength_ladder_and_vodasure(
     vodasure_pairs: dict[str, Any] = {}
     syn_rs, real_rs = [], []
     for s50, s25, z_idx in PAIRED_ZN13X_SCANS:
-        i50 = DIAD_ZN13X_50UM_SCAN_IDS.index(s50)
-        i25 = DIAD_ZN13X_25UM_SCAN_IDS.index(s25)
+        i50 = _BENCH_50UM_SCAN_IDS.index(s50)
+        i25 = _BENCH_25UM_SCAN_IDS.index(s25)
         g25_gt = np.maximum(
             np.stack([d25["Na"][i25], d25["Zn"][i25]], axis=0), 0.0
         ).astype(np.float32)
@@ -766,8 +780,20 @@ def main() -> int:
     paths = fetch_open_dataset("diad_zn13x_xrdct", dest_root=args.zenodo_cache)
     nxs_dir = paths[0].parent
 
-    d50 = load_diad_xrdct(nxs_dir, resolution="50um", aggregation="positive_sum")
-    d25 = load_diad_xrdct(nxs_dir, resolution="25um", aggregation="positive_sum")
+    d50 = load_diad_xrdct(
+        nxs_dir,
+        phases=["Na", "Zn"],
+        scan_ids=_BENCH_50UM_SCAN_IDS,
+        aggregation="positive_sum",
+        correct_motor_offset_deg=47.5,
+    )
+    d25 = load_diad_xrdct(
+        nxs_dir,
+        phases=["Na", "Zn"],
+        scan_ids=_BENCH_25UM_SCAN_IDS,
+        aggregation="positive_sum",
+        correct_motor_offset_deg=0.0,
+    )
 
     if args.cleaned_xct_path is not None and args.cleaned_xct_path.exists():
         hr_raw, _ = load_microscopy_file(args.cleaned_xct_path)

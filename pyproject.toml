@@ -180,8 +180,12 @@ layer = 2
 source_dirs = ["x_fuse"]
 banned_imports = [
     "multimodal_benchmark",
+    "xct_research",
+    "porousdiff_workflows",
     "openimpala",
+    "sms",
     "openlsrx",
     "braggtrack",
+    "porousdiff",
     "numcodecs",
 ]

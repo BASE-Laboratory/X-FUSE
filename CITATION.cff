@@ -13,8 +13,8 @@ authors:
     affiliation: Imperial College London
   - family-names: Le Houx
     given-names: James
-    affiliation: BASE Laboratory
-  - name: "BASE Laboratory"
+    orcid: "https://orcid.org/0000-0002-1576-0673"
+    affiliation: "BASE Laboratory, School of Engineering, University of Greenwich"
 keywords:
   - correlative microscopy
   - multimodal fusion

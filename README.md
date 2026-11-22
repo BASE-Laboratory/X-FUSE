@@ -10,6 +10,8 @@
 
 Unlike purely geometric foundation models (such as SAM/SAM2) that segment contrast boundaries without knowing chemical identity—or naive interpolation of coarse chemical maps—**X-FUSE** extracts dense sub-patch Vision Transformer features from $I_{\text{HR}}$, fuses $M$ physical guide channels simultaneously via a differentiable forward point-spread-function (PSF) operator, and outputs **prior-matched high-resolution phase segmentations paired with pixel/voxel-level certainty maps and optional Split Conformal prediction sets**.
 
+**Maintainer:** James Le Houx ([BASE Laboratory](https://github.com/BASE-Laboratory))
+
 ---
 
 ## Supported Correlative Modality Pairs

@@ -832,10 +832,17 @@ def test_savu_xzy_out_of_core_and_multipeak_diad_xrdct_loader(tmp_path: Path) ->
     near = aggregate_peak_maps(peaks_zn, mode="nearest_q", target_q=1.656, q_tol=0.02)
     assert near.shape == (24, 24)
 
-    loaded_corr = load_diad_xrdct(nxs_dir, resolution="50um", aggregation="all_sum")
+    loaded_corr = load_diad_xrdct(
+        nxs_dir,
+        phases=["Zn", "Na"],
+        scan_ids=[43345],
+        aggregation="all_sum",
+        correct_motor_offset_deg=47.5,
+    )
     loaded_uncorr = load_diad_xrdct(
         nxs_dir,
-        resolution="50um",
+        phases=["Zn", "Na"],
+        scan_ids=[43345],
         aggregation="all_sum",
         correct_motor_offset_deg=0.0,
     )
@@ -846,8 +853,8 @@ def test_savu_xzy_out_of_core_and_multipeak_diad_xrdct_loader(tmp_path: Path) ->
     bundle_p = tmp_path / "cleaned_xrdct.npz"
     np.savez(
         bundle_p,
-        na=true_na[None, ...],
-        zn=true_zn[None, ...],
+        Na=true_na[None, ...],
+        Zn=true_zn[None, ...],
         zn_sigma2=np.full((1, 24, 24), 0.01, dtype=np.float32),
     )
     b_out = load_diad_xrdct(bundle_p, include_auxiliary=True)

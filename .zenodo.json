@@ -1,0 +1,27 @@
+{
+  "title": "X-FUSE: Physics-Guided Foundation-Model Feature Fusion & Conformal Uncertainty Quantification for Correlative Materials Imaging",
+  "upload_type": "software",
+  "license": "MIT",
+  "creators": [
+    {
+      "name": "Green, Calum",
+      "affiliation": "Imperial College London"
+    },
+    {
+      "name": "Le Houx, James",
+      "affiliation": "BASE Laboratory, School of Engineering, University of Greenwich",
+      "orcid": "0000-0002-1576-0673"
+    }
+  ],
+  "keywords": [
+    "correlative microscopy",
+    "multimodal fusion",
+    "uncertainty quantification",
+    "conformal prediction",
+    "vision transformers",
+    "X-ray tomography",
+    "XRD-CT",
+    "electron microscopy",
+    "neutron Bragg-edge imaging"
+  ]
+}
