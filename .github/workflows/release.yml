@@ -37,7 +37,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG_VER="${GITHUB_REF_NAME#v}"
-          uv run python -c '
+          uv run python - "${TAG_VER}" <<'PY'
           import importlib.metadata, pathlib, re, sys, x_fuse
           tag = sys.argv[1]
           meta_v = importlib.metadata.version("x-fuse")
@@ -45,7 +45,7 @@ jobs:
           cff_v = cff_m.group(1).strip("\"'") if cff_m else ""
           print(f"Tag={tag}, __version__={x_fuse.__version__}, metadata={meta_v}, CITATION.cff={cff_v}")
           assert tag == x_fuse.__version__ == meta_v == cff_v
-          ' "${TAG_VER}"
+          PY
 
       - name: Run Ruff, Mypy, Docs & Coverage Test Gates
         run: |
