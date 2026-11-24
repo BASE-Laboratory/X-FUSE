@@ -65,7 +65,7 @@ from .upsamplers import (
     ForwardPSFDownsampler,
     PSFProfile,
 )
-from .utils import guide_to_tensor
+from .utils import extract_guide_physical_scales, guide_to_tensor
 from .vit_patch import AttentionOptions
 
 PoreMaskSpec = (
@@ -563,6 +563,7 @@ class CorrelativeFuser(nn.Module):
         self.xrd_fusion_module: XRDFusionMethod | None = None
         self._unmixed_guide_lr: torch.Tensor | None = None
         self._fit_guide_ptr: int | None = None
+        self._guide_physical_scales: list[dict[str, float]] | None = None
         self._fit_hr_sig: tuple[tuple[int, ...], int] | None = None
         self._tta_cache: OrderedDict[
             tuple[Any, ...], tuple[str, list[torch.Tensor]]
@@ -1568,6 +1569,10 @@ class CorrelativeFuser(nn.Module):
         if self._last_loss_history:
             diag["initial_loss"] = round(self._last_loss_history[0], 5)
             diag["final_loss"] = round(self._last_loss_history[-1], 5)
+        if self._guide_physical_scales is not None:
+            diag["guide_physical_scales"] = [
+                dict(s) for s in self._guide_physical_scales
+            ]
         return diag
 
     def _logits_from_hr_view(
@@ -2208,6 +2213,11 @@ class CorrelativeFuser(nn.Module):
             )
         )
         guide_t = guide_to_tensor(coarse_guide, device=dev, normalization=norm_mode)
+        self._guide_physical_scales = (
+            None
+            if spectral_unmix
+            else extract_guide_physical_scales(coarse_guide, normalization=norm_mode)
+        )
         lr_hw = (int(guide_t.shape[-2]), int(guide_t.shape[-1]))
 
         if reset_weights:
@@ -2429,6 +2439,10 @@ class CorrelativeFuser(nn.Module):
                 )
             )
             guide_t = guide_to_tensor(coarse_guide, device=dev, normalization=norm_mode)
+            if self.spectral_channels is None:
+                self._guide_physical_scales = extract_guide_physical_scales(
+                    coarse_guide, normalization=norm_mode
+                )
             if self.xrd_fusion_module is None:
                 fwd, inv = build_default_tta(shift_dists=[1], include_flips=True)
                 self.set_guide_transforms(guide_t, fwd, inv)

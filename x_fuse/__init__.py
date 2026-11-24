@@ -50,6 +50,7 @@ from .heads import (
 )
 from .io import (
     export_for_openimpala,
+    export_report_ome_zarr,
     export_volume_ome_zarr,
     load_microscopy_file,
     load_uncertainty_report,
@@ -135,7 +136,13 @@ from .upsamplers import (
     extract_structure_tensor_field,
     joint_bilateral_upsample,
 )
-from .utils import downsample_xrdct, get_multiphase, guide_to_tensor, xrd_to_tensor
+from .utils import (
+    downsample_xrdct,
+    extract_guide_physical_scales,
+    get_multiphase,
+    guide_to_tensor,
+    xrd_to_tensor,
+)
 from .volumetric import (
     VolumeSliceAccessor,
     VolumetricFuser,
@@ -144,7 +151,7 @@ from .volumetric import (
     z_slice_consistency_score,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "__version__",
@@ -212,6 +219,7 @@ __all__ = [
     "suggest_next_slices",
     "suggest_2d_rois",
     "export_for_openimpala",
+    "export_report_ome_zarr",
     "export_volume_ome_zarr",
     "save_uncertainty_report",
     "load_uncertainty_report",
@@ -254,6 +262,7 @@ __all__ = [
     "load_image_array",
     "load_correlative_tiff_pair",
     "load_eds_text_hypermap",
+    "extract_guide_physical_scales",
     "guide_to_tensor",
     "xrd_to_tensor",
     "get_multiphase",

@@ -116,15 +116,7 @@ OPEN_DATASETS: dict[str, OpenCorrelativeDataset] = {
             "at 25 µm for real hardware validation) of partially Zn-exchanged Na-13X "
             "zeolite pellets."
         ),
-        default_filenames=tuple(
-            f"output_{sid}_{ph}.nxs"
-            for sid in (
-                *range(43322, 43326),
-                *range(43336, 43348),
-                *range(43393, 43401),
-            )
-            for ph in ("na", "zn")
-        ),
+        default_filenames=None,
     ),
     "diad_zn13x_powder_xrd": OpenCorrelativeDataset(
         key="diad_zn13x_powder_xrd",
@@ -222,8 +214,20 @@ def get_sample_dataset_path(name: str = "Zn13X") -> Path:
     )
 
 
-def list_open_datasets() -> dict[str, OpenCorrelativeDataset]:
+def list_open_datasets(
+    *, _warn_deprecated: bool = True
+) -> dict[str, OpenCorrelativeDataset]:
     """Return the dictionary of registered open correlative benchmark datasets."""
+    if _warn_deprecated:
+        import warnings
+
+        warnings.warn(
+            "OPEN_DATASETS and list_open_datasets() are deprecated under ECOSYSTEM.md "
+            "and scheduled to migrate to Layer 4 (MultimodalBenchmark) in a future "
+            "release; prefer basecoat.fetch_file for Layer 2 workflows.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     return dict(OPEN_DATASETS)
 
 
@@ -233,6 +237,8 @@ def fetch_open_dataset(
     filenames: Iterable[str] | None = None,
     timeout: float = 60.0,
     use_default_subset: bool = True,
+    *,
+    _warn_deprecated: bool = True,
 ) -> list[Path]:
     """Download files for a registered Zenodo dataset with HTTPS, path-traversal,
     timeout, and streaming checksum verification.
@@ -241,6 +247,16 @@ def fetch_open_dataset(
     restricts downloads to ``meta.default_filenames`` if those files are present
     in the Zenodo record (avoiding multi-gigabyte unrelated archives).
     """
+    if _warn_deprecated:
+        import warnings
+
+        warnings.warn(
+            "fetch_open_dataset() is deprecated under ECOSYSTEM.md and scheduled to "
+            "migrate to Layer 4 (MultimodalBenchmark) in a future release; prefer "
+            "basecoat.fetch_file for Layer 2 workflows.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if dataset_key not in OPEN_DATASETS:
         raise KeyError(
             f"Unknown dataset '{dataset_key}'. Choose from {list(OPEN_DATASETS)}"

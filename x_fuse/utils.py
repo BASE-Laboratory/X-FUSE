@@ -232,6 +232,71 @@ def guide_to_tensor(
     return t.to(device=device, dtype=torch.float32)
 
 
+def extract_guide_physical_scales(
+    guide_img: np.ndarray | torch.Tensor | Sequence[np.ndarray | torch.Tensor],
+    *,
+    normalize: bool = True,
+    normalization: GuideNormalization | None = None,
+) -> list[dict[str, float]]:
+    """Record per-channel non-negative physical guide statistics ``(offset, scale,
+    raw_mean, raw_max)`` prior to normalization so high-resolution predicted
+    probabilities can reconstruct calibrated physical intensity units.
+    """
+    if isinstance(guide_img, (list, tuple)):
+        stacked = [
+            g.detach().cpu().float().numpy()
+            if isinstance(g, torch.Tensor)
+            else np.asarray(g, dtype=np.float32)
+            for g in guide_img
+        ]
+        arr = np.stack(stacked, axis=0)
+    elif isinstance(guide_img, torch.Tensor):
+        arr = guide_img.detach().cpu().float().numpy()
+    else:
+        arr = np.asarray(guide_img, dtype=np.float32)
+
+    if arr.ndim == 2:
+        arr = arr[np.newaxis, :, :]
+    elif arr.ndim == 4:
+        arr = arr[0]
+    elif arr.ndim != 3:
+        raise ValueError(f"Expected 2D, 3D, or 4D guide map, got shape {arr.shape}.")
+
+    clean = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    pos = np.maximum(clean, 0.0)
+    mode: GuideNormalization = (
+        normalization
+        if normalization is not None
+        else ("minmax" if normalize else "preserve_counts")
+    )
+    g_max = float(np.max(pos)) if pos.size > 0 else 0.0
+
+    scales: list[dict[str, float]] = []
+    for m in range(pos.shape[0]):
+        ch = pos[m]
+        mn = float(np.min(ch)) if ch.size > 0 else 0.0
+        mx = float(np.max(ch)) if ch.size > 0 else 0.0
+        rm = float(np.mean(ch)) if ch.size > 0 else 0.0
+        if mode == "minmax":
+            offset = mn
+            scale = mx - mn
+        elif mode == "global_max":
+            offset = 0.0
+            scale = g_max
+        else:
+            offset = 0.0
+            scale = 1.0
+        scales.append(
+            {
+                "offset": offset,
+                "scale": scale,
+                "raw_mean": rm,
+                "raw_max": mx,
+            }
+        )
+    return scales
+
+
 def xrd_to_tensor(
     xrd_img: np.ndarray | torch.Tensor, device: str | torch.device = "cpu"
 ) -> torch.Tensor:

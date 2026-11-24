@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x-fuse"
-version = "1.0.0"
+version = "1.1.0"
 description = "Physics-guided foundation-model feature fusion and conformal uncertainty quantification for correlative materials imaging"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -123,6 +123,7 @@ include = [
     "/notebooks",
     "/docs",
     "/mkdocs.yml",
+    "/.zenodo.json",
     "/AGENTS.md",
     "/README.md",
     "/INSTALL.md",

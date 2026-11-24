@@ -119,6 +119,7 @@
 ::: x_fuse.io
     options:
       members:
+        - export_report_ome_zarr
         - export_volume_ome_zarr
         - export_for_openimpala
         - save_uncertainty_report

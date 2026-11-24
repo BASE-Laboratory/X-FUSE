@@ -25,13 +25,13 @@ Unlike purely geometric foundation models (such as SAM/SAM2) that segment contra
 
 ---
 
-## Key Capabilities (v1.0.0)
+## Key Capabilities (v1.1)
 
 1. **Quantitative Physics Forward Model, Porous-Media Void Clamping & 3D Spectral Cube Unmixing**: Train directly against low-dose counting statistics via Poisson shot-noise deviance NLL (`loss_fn="forward_psf_poisson"`), enforce exact simplex conservation $\sum_k P_k = 1$ (`loss_fn="compositional_kl"`), deconvolve partial-volume pore dilution with Fresnel-fringe-guarded structural void clamping (`pore_mask="auto_otsu_fringe_guarded"`), model heavy-tailed synchrotron/SEM interaction volumes (`psf_profile="gaussian" | "moffat" | "core_halo"`), or pass raw 3D `(E, H_lr, W_lr)` EDS / EELS / XRD spectral cubes directly (`spectral_unmix=True`).
 2. **Spin-2 Orientation-Aware Upsampling, Small-FOV ViT Scaling & Apositional Debiasing**: Separate iso-intensity textured phases (e.g., oriented lamellar colonies) via `CrossAttentionFeatureUpsampler` (`interpolation_mode="cross_attn"`, $D_4$-exact sub-token cross-attention + spin-2 structure-tensor descriptors) and `SpatialConvMLPHead` (`fusion_method="spatial_mlp"`), prevent ViT token starvation on nanoscale ROIs (`min_input_size="auto"`), and project out ViT positional ramps via `ApositionalFeatureDebiaser` (`debias_positional=True`).
 3. **Spatial-Block Temperature-Scaled RAPS Conformal Sets & 1D Voronoi Active Steering**: Pair **aleatoric entropy**, **online $O(1)$-memory Welford TTA / tri-plane epistemic variance**, and **forward physical PSF residual** with distribution-free $(1 - \alpha)$ RAPS/APS/LAC Split Conformal phase prediction sets (`conformal_alpha=0.10`, `conformal_method="raps"`, `ConformalCalibrator`) and 1D Voronoi-integrated active beamtime steering (`suggest_next_slices`, `suggest_2d_rois`).
 4. **3D Axial Interaction-Volume Deconvolution & Differentiable Registration**: Deconvolve axial interaction-volume blur across sparse 2D chemical slices (`VolumetricFuser.fit_sparse_slices(..., depth_psf_sigma=..., learn_depth_psf=True)`) with orthogonal `XY + XZ + YZ` tri-plane consistency, and jointly compensate rigid stage drift or nonlinear SEM/STEM scan distortion (`align_guide="translation" | "rigid" | "affine" | "bspline"`).
-5. **Megapixel Tiling, Out-of-Core Synchrotron Streaming & `OpenImpala` Export**: Pure-PyTorch package (`bfloat16`/`float16`/`float32` ready), content-hashed frozen TTA caching, Hann-windowed 2D tiling (`tile_size=...`), out-of-core Savu HDF5 / DAWN NeXus / Zarr streaming (`load_xct_subvolume`, `load_diad_xrdct`, `VolumeSliceAccessor`), `xfuse fuse` / `xfuse fuse-3d` CLI, OME-TIFF / HDF5 / Zarr / NPZ report I/O, `export_for_openimpala` AMReX multi-phase geometry + conformal transport bounds, and RosettaSciIO vendor readers.
+5. **Megapixel Tiling, Out-of-Core Synchrotron Streaming & OME-Zarr v0.4 Export**: Pure-PyTorch Layer-2 package built on [`basecoat`](https://github.com/BASE-Laboratory/basecoat) (`bfloat16`/`float16`/`float32` ready), content-hashed frozen TTA caching, Hann-windowed 2D tiling (`tile_size=...`), out-of-core Savu HDF5 / DAWN NeXus / OME-Zarr streaming (`load_xct_subvolume`, `load_diad_xrdct`, `VolumeSliceAccessor`), `xfuse fuse` / `xfuse fuse-3d` CLI, calibrated `.ome.zarr` / OME-TIFF / HDF5 / Zarr / NPZ report I/O (`export_report_ome_zarr`, `export_volume_ome_zarr`), and RosettaSciIO vendor readers.
 
 ---
 
@@ -81,7 +81,7 @@ phase_mask = report.hard_mask[0]                             # (H, W) int64 phas
 phase_sets_90 = report.prediction_sets[0]                    # (K, H, W) 90% conformal phase sets
 certainty = 1.0 - report.combined_uncertainty[0]             # (H, W) pixel certainty in [0, 1]
 rois = suggest_2d_rois(report, roi_size=(32, 32), k=2)       # Targeted re-acquisition windows
-save_uncertainty_report(report, "fused_report.h5", pixel_size_um=0.05)
+save_uncertainty_report(report, "fused_report.ome.zarr", pixel_size_um=0.05)
 ```
 
 *(Low-level hooks `fuser.set_guide_transforms(...)`, `fuser.train_fusion_step(...)`, and `fuser.predict_with_uncertainty(...)` remain 100% supported for custom research loops.)*
@@ -137,14 +137,14 @@ Once installed, the `xfuse` CLI provides environment diagnostics, Zenodo dataset
 ```bash
 xfuse info
 xfuse datasets
-xfuse datasets --fetch diad_zn13x_xrdct --dest ./zenodo_cache
 xfuse demo --epochs 15
 xfuse fuse --hr data/samples/Zn13X/high_4.tiff --guide data/samples/Zn13X/low_4.tiff \
   --upsampler cross_attn --fusion-method spatial_mlp --psf-profile moffat --learn-psf \
-  --pore-mask auto_otsu_fringe_guarded --conformal-alpha 0.10 --conformal-method raps --output zn13x.h5
+  --pore-mask auto_otsu_fringe_guarded --conformal-alpha 0.10 --conformal-method raps \
+  --pixel-size-um 0.54 --output zn13x.ome.zarr
 xfuse fuse-3d --hr-volume xct_tomogram.h5 --guide-slice 4:xrd_z04.tif 28:xrd_z28.tif \
   --pore-mask auto_otsu_fringe_guarded --axial-psf-sigma 1.8 --learn-axial-psf \
-  --triplane --suggest-next 3 --export-openimpala-dir ./openimpala_geom --output fused_3d.h5
+  --triplane --suggest-next 3 --voxel-size-um 0.54 --output fused_3d.ome.zarr
 ```
 
 Interactive step-by-step notebooks (stored with outputs stripped) are available in [`notebooks/`](notebooks/):
@@ -156,10 +156,10 @@ Interactive step-by-step notebooks (stored with outputs stripped) are available 
 
 ## BASE Laboratory Ecosystem Interoperability
 
-`X-FUSE` is a standalone, modality-agnostic correlative fusion solver designed to interoperate cleanly across the [BASE Laboratory](https://github.com/BASE-Laboratory) imaging & transport stack:
-- **[`OpenLSR-X`](https://github.com/BASE-Laboratory/OpenLSR-X)** $\rightarrow$ **`X-FUSE`**: Super-resolved single-modality XCT `.tif` volumes from `OpenLSR-X` drop directly into `XFuse` / `VolumetricFuser` as structural $I_{\text{HR}}$ inputs alongside coarse diffraction/chemical guides.
-- **`X-FUSE`** $\rightarrow$ **[`OpenImpala`](https://github.com/BASE-Laboratory/OpenImpala)**: `export_for_openimpala` writes uncompressed `uint8` 3D multi-phase TIFFs (`0 = Pore`, `1..M = Solid phases`), conformal lower/upper phase-envelope TIFFs (`[D_eff^-, D_eff^+]`), and AMReX `ParmParse` `.inputs` decks directly runnable by `OpenImpala`.
-- **[`MultimodalBenchmark`](https://github.com/BASE-Laboratory/MultimodalBenchmark)**: Independent multi-length XCT + XRD-CT benchmark harness (`Zn-13X` `2.6–0.325 µm` XCT + `50 µm / 25 µm` XRD-CT); see `benchmarks/run_zn13x_multiscale_couplings.py` for multi-length coupling and chemical `VoDaSuRe` validation.
+`X-FUSE` is a Layer-2 correlative fusion solver built on [`basecoat`](https://github.com/BASE-Laboratory/basecoat) and designed to interoperate cleanly across the [BASE Laboratory](https://github.com/BASE-Laboratory) imaging & simulation stack:
+- **[`OpenLSR-X`](https://github.com/BASE-Laboratory/OpenLSR-X)** $\rightarrow$ **`X-FUSE`**: Super-resolved single-modality XCT `.ome.zarr` / `.tif` volumes from `OpenLSR-X` drop directly into `XFuse` / `VolumetricFuser` as structural $I_{\text{HR}}$ inputs alongside coarse diffraction/chemical guides.
+- **`X-FUSE`** $\rightarrow$ **[`OpenImpala`](https://github.com/BASE-Laboratory/OpenImpala)** & **`SMS`**: `export_volume_ome_zarr` and `export_report_ome_zarr` write calibrated OME-Zarr v0.4 `VolumeSet` stores containing mode-downsampled multi-phase labels (`phase`), conformal phase-envelope bounds (`phase_lower`, `phase_upper`), and `uncertainties/*` sidecars consumed directly by Layer-3 solvers (`export_for_openimpala` remains available with a deprecation notice until `OpenImpala v5.1`).
+- **[`MultimodalBenchmark`](https://github.com/BASE-Laboratory/MultimodalBenchmark)**: Independent Layer-4 multi-length XCT + XRD-CT benchmark harness (`Zn-13X-Bench` Tasks T1–T4); `xfuse fuse` and `xfuse fuse-3d` emit calibrated `.ome.zarr` stores scored directly by `evaluate.py --task t2`.
 
 ---
 

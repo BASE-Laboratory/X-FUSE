@@ -34,7 +34,7 @@ from .uncertainty import (
     compute_posterior_uncertainty,
     match_coarse_priors,
 )
-from .utils import guide_to_tensor
+from .utils import extract_guide_physical_scales, guide_to_tensor
 
 
 @dataclass
@@ -55,6 +55,79 @@ class VolumetricUncertaintyReport:
     conformal_interval_halfwidth: torch.Tensor | None = (
         None  # Optional (M, Z, Y, X) calibrated coarse physical error halfwidth
     )
+
+    def reconstruct_physical_maps(
+        self,
+        scales: list[dict[str, float]] | None = None,
+        *,
+        conserve_guide_mean: bool = True,
+    ) -> np.ndarray:
+        """Reconstruct ``(M, Z, Y, X)`` calibrated physical-amplitude guide volumes
+        from 3D ``probabilities`` and training-slice ``guide_physical_scales`` while
+        preserving axial chemical gradients on unvisited slices.
+        """
+        probs_np = self.probabilities.detach().cpu().float().numpy()
+        eff_scales = (
+            scales
+            if scales is not None
+            else self.diagnostics.get("guide_physical_scales")
+        )
+        if not isinstance(eff_scales, list) or len(eff_scales) == 0:
+            return probs_np.astype(np.float32, copy=True)
+
+        m_ch = len(eff_scales)
+        k_ch, z_dim = int(probs_np.shape[0]), int(probs_np.shape[1])
+        if k_ch == m_ch + 1:
+            solid_probs = probs_np[1:]
+            bg_prob = probs_np[0]
+        elif k_ch >= m_ch:
+            solid_probs = probs_np[:m_ch]
+            bg_prob = None
+        else:
+            return probs_np.astype(np.float32, copy=True)
+
+        if bool(self.diagnostics.get("pore_mask_active", False)):
+            void_mask = (
+                (bg_prob >= 1.0 - 1e-5)
+                if bg_prob is not None
+                else np.all(solid_probs <= 1e-5, axis=0)
+            )
+        else:
+            void_mask = None
+        raw_acq = self.diagnostics.get("acquired_slices")
+        acq_idx = (
+            [int(s) for s in raw_acq if 0 <= int(s) < z_dim]
+            if isinstance(raw_acq, list)
+            else []
+        )
+
+        out = np.zeros_like(solid_probs, dtype=np.float32)
+        for idx in range(m_ch):
+            sc_meta = eff_scales[idx]
+            off = float(sc_meta.get("offset", 0.0))
+            sc = float(sc_meta.get("scale", 1.0))
+            rm = float(sc_meta.get("raw_mean", 0.0))
+            base = (
+                np.where(void_mask, 0.0, off + sc * solid_probs[idx])
+                if void_mask is not None
+                else (off + sc * solid_probs[idx])
+            )
+            if conserve_guide_mean:
+                if rm <= 1e-12:
+                    phys = np.zeros_like(base, dtype=np.float32)
+                else:
+                    ref_sub = base[acq_idx] if acq_idx else base
+                    mean_b = float(np.mean(ref_sub))
+                    if mean_b > 1e-12:
+                        phys = (base * (rm / mean_b)).astype(np.float32)
+                    else:
+                        phys = np.full_like(base, rm, dtype=np.float32)
+                        if void_mask is not None:
+                            phys[void_mask] = 0.0
+            else:
+                phys = base.astype(np.float32)
+            out[idx] = phys
+        return out
 
 
 class VolumeSliceAccessor:
@@ -950,6 +1023,7 @@ class VolumetricFuser:
             else None
         )
         prior_accum = []
+        raw_scales_per_slice: list[list[dict[str, float]]] = []
         for idx, g_raw in sparse_guides.items():
             s_i = int(idx)
             g_t = guide_to_tensor(g_raw, device=dev, normalization=norm_mode)
@@ -983,6 +1057,9 @@ class VolumetricFuser:
                 g_unit = guide_to_tensor(g_raw, device=dev, normalize=True)
                 sparse_norm_cpu[s_i] = g_unit.detach().cpu()
                 prior_accum.append(g_unit.mean(dim=(-2, -1)))
+                raw_scales_per_slice.append(
+                    extract_guide_physical_scales(g_raw, normalization=norm_mode)
+                )
 
         slice_keys = sorted(prepared_guides.keys())
         use_depth_psf = (depth_psf_sigma > 0.0 or learn_depth_psf) and depth_ax >= 2
@@ -1236,11 +1313,37 @@ class VolumetricFuser:
             if raw_depth_sigma is not None
             else float(depth_psf_sigma)
         )
+        agg_scales: list[dict[str, float]] | None = None
+        if raw_scales_per_slice and raw_scales_per_slice[0]:
+            n_m = len(raw_scales_per_slice[0])
+            agg_scales = []
+            for m_i in range(n_m):
+                offs = [sl[m_i]["offset"] for sl in raw_scales_per_slice]
+                scs = [sl[m_i]["scale"] for sl in raw_scales_per_slice]
+                rms = [sl[m_i]["raw_mean"] for sl in raw_scales_per_slice]
+                rmxs = [sl[m_i]["raw_max"] for sl in raw_scales_per_slice]
+                agg_scales.append(
+                    {
+                        "offset": float(np.mean(offs)),
+                        "scale": (
+                            float(np.max(scs))
+                            if norm_mode == "global_max"
+                            else float(np.mean(scs))
+                        ),
+                        "raw_mean": float(np.mean(rms)),
+                        "raw_max": float(np.max(rmxs)),
+                    }
+                )
+
         self._last_fit_diagnostics = {
             "depth_psf_enabled": bool(use_depth_psf),
             "depth_psf_sigma_learned": learned_sig_z,
             "triplane_consistency_weight": float(triplane_consistency_weight),
+            "acquired_slices": [int(s) for s in slice_keys],
+            "pore_mask_active": bool(eff_pm_spec is not None),
         }
+        if agg_scales is not None:
+            self._last_fit_diagnostics["guide_physical_scales"] = agg_scales
 
         if self.fuser.calibrator is not None and slice_keys:
             cal_mode: Literal["multiclass", "multilabel"] = (

@@ -137,6 +137,14 @@ def save_uncertainty_report(
     lower_name = out_path.name.lower()
     suffix = out_path.suffix.lower()
 
+    if lower_name.endswith(".ome.zarr"):
+        return export_report_ome_zarr(
+            report,
+            out_path,
+            channel_names=channel_names,
+            pixel_size_um=pixel_size_um,
+        )
+
     if suffix in (".h5", ".hdf5", ".nxs"):
         with h5py.File(out_path, "w") as hf:
             grp = hf.create_group("xfuse_report")
@@ -318,6 +326,22 @@ def load_uncertainty_report(path: str | Path) -> dict[str, Any]:
                 else str(raw_meta)
             )
         return _normalize_loaded_arrays(out)
+
+    if lower_name.endswith(".ome.zarr"):
+        vset = read_ome_zarr(in_path, level=0, as_set=True)
+        out_ome: dict[str, Any] = {
+            "physical_maps": np.asarray(vset.image.data),
+            "metadata": dict(vset.image.provenance),
+        }
+        for uk, uv in vset.uncertainties.items():
+            out_ome[uk] = np.asarray(uv.data)
+        if "phase" in vset.labels:
+            ph_arr = np.asarray(vset.labels["phase"].data, dtype=np.int32)
+            out_ome["hard_mask"] = np.where(ph_arr == 255, -1, ph_arr).astype(np.int32)
+        for lk in ("phase_lower", "phase_upper"):
+            if lk in vset.labels:
+                out_ome[lk] = np.asarray(vset.labels[lk].data, dtype=np.uint8)
+        return _normalize_loaded_arrays(out_ome)
 
     if suffix == ".zarr":
         import zarr  # type: ignore[import-not-found]
@@ -641,6 +665,355 @@ def _compute_conformal_phase_envelopes(
     return lower_u8, upper_u8
 
 
+def _pool_spatial_float(
+    arr: np.ndarray,
+    target_hw: tuple[int, int],
+    *,
+    is_3d: bool,
+) -> np.ndarray:
+    import torch
+    import torch.nn.functional as F
+
+    h_t, w_t = int(target_hw[0]), int(target_hw[1])
+    t = torch.from_numpy(np.asarray(arr, dtype=np.float32))
+    if is_3d:
+        if t.ndim == 3:
+            # (Z, Y, X) -> (1, Z, h_t, w_t)
+            pooled = F.adaptive_avg_pool2d(t.unsqueeze(0), output_size=(h_t, w_t))
+            return pooled.squeeze(0).numpy().astype(np.float32)
+        # (C, Z, Y, X)
+        c_dim, z_dim = int(t.shape[0]), int(t.shape[1])
+        flat = t.reshape(c_dim * z_dim, int(t.shape[2]), int(t.shape[3]))
+        pooled = F.adaptive_avg_pool2d(flat.unsqueeze(0), output_size=(h_t, w_t))
+        return (
+            pooled.squeeze(0).reshape(c_dim, z_dim, h_t, w_t).numpy().astype(np.float32)
+        )
+    if t.ndim == 2:
+        pooled = F.adaptive_avg_pool2d(
+            t.unsqueeze(0).unsqueeze(0), output_size=(h_t, w_t)
+        )
+        return pooled.squeeze(0).squeeze(0).numpy().astype(np.float32)
+    # (C, Y, X)
+    pooled = F.adaptive_avg_pool2d(t.unsqueeze(0), output_size=(h_t, w_t))
+    return pooled.squeeze(0).numpy().astype(np.float32)
+
+
+def _pool_spatial_nearest(
+    arr: np.ndarray,
+    target_hw: tuple[int, int],
+    *,
+    is_3d: bool,
+) -> np.ndarray:
+    import torch
+    import torch.nn.functional as F
+
+    h_t, w_t = int(target_hw[0]), int(target_hw[1])
+    orig_dtype = arr.dtype
+    t = torch.from_numpy(np.asarray(arr, dtype=np.float32))
+    if is_3d:
+        if t.ndim == 3:
+            interp = F.interpolate(t.unsqueeze(0), size=(h_t, w_t), mode="nearest")
+            return np.rint(interp.squeeze(0).numpy()).astype(orig_dtype)
+        c_dim, z_dim = int(t.shape[0]), int(t.shape[1])
+        flat = t.reshape(c_dim * z_dim, int(t.shape[2]), int(t.shape[3]))
+        interp = F.interpolate(flat.unsqueeze(0), size=(h_t, w_t), mode="nearest")
+        return np.rint(
+            interp.squeeze(0).reshape(c_dim, z_dim, h_t, w_t).numpy()
+        ).astype(orig_dtype)
+    if t.ndim == 2:
+        interp = F.interpolate(
+            t.unsqueeze(0).unsqueeze(0), size=(h_t, w_t), mode="nearest"
+        )
+        return np.rint(interp.squeeze(0).squeeze(0).numpy()).astype(orig_dtype)
+    interp = F.interpolate(t.unsqueeze(0), size=(h_t, w_t), mode="nearest")
+    return np.rint(interp.squeeze(0).numpy()).astype(orig_dtype)
+
+
+def export_report_ome_zarr(
+    report: UncertaintyReport | VolumetricUncertaintyReport,
+    store_path: str | Path,
+    *,
+    channel_names: Sequence[str] | None = None,
+    pixel_size_um: float | Sequence[float] | None = None,
+    origin_um: Sequence[float] | None = None,
+    space: str | None = None,
+    target_grid_shape: tuple[int, int] | None = None,
+    eval_slice_z: int | None = None,
+    active_phase: int = 0,
+    export_conformal_bounds: bool = True,
+    multiscale_levels: int = 1,
+    overwrite: bool = True,
+) -> Path:
+    """Export a 2D ``UncertaintyReport`` or 3D ``VolumetricUncertaintyReport`` as a
+    calibrated OME-Zarr v0.4 ``VolumeSet`` store via ``basecoat``.
+
+    Writes calibrated physical-amplitude guide predictions (``(M, [Z,] Y, X)``) as
+    the primary ``VolumeSet.image`` with named ``channel_names`` provenance, paired
+    with co-registered ``labels/phase`` (+ optional ``phase_lower`` / ``phase_upper``
+    conformal bounds) and ``uncertainties/*`` sidecars. When ``target_grid_shape``
+    (and optional ``eval_slice_z`` for 3D) is specified, area-pools floating-point
+    maps onto the requested coarse evaluation grid while preserving pre-pooling HR
+    pore-leakage and stoichiometry diagnostics in provenance.
+    """
+    act = int(active_phase)
+    if not (0 <= act <= 255):
+        raise ValueError(f"active_phase must lie in [0, 255], got {active_phase}.")
+
+    arrays, meta, is_3d = _report_to_arrays(report, channel_names=channel_names)
+    phys_maps = np.asarray(report.reconstruct_physical_maps(), dtype=np.float32)
+    probs = np.asarray(arrays["probabilities"], dtype=np.float32)
+    raw_mask = np.asarray(arrays["hard_mask"], dtype=np.int32)
+    labeled = np.where(raw_mask < 0, 255, np.clip(raw_mask, 0, 255)).astype(np.uint8)
+    entropy = np.asarray(arrays["aleatoric_entropy"], dtype=np.float32)
+    epi_var = np.asarray(arrays["epistemic_variance"], dtype=np.float32)
+    phys_res = np.asarray(arrays["physical_residual"], dtype=np.float32)
+    comb_unc = np.asarray(arrays["combined_uncertainty"], dtype=np.float32)
+    conf_margin = (
+        np.asarray(arrays["confidence_margin"], dtype=np.float32)
+        if "confidence_margin" in arrays
+        else None
+    )
+    pred_sets = (
+        (np.asarray(arrays["prediction_sets"]) > 0)
+        if "prediction_sets" in arrays
+        else None
+    )
+    conf_hw = (
+        np.asarray(arrays["conformal_interval_halfwidth"], dtype=np.float32)
+        if "conformal_interval_halfwidth" in arrays
+        else None
+    )
+
+    n_k = int(probs.shape[0])
+    m_phys = int(phys_maps.shape[0])
+    hr_diag: dict[str, float] = {}
+    if n_k == m_phys + 1 and bool(report.diagnostics.get("pore_mask_active", False)):
+        pm_hr = probs[0] >= 1.0 - 1e-5
+        tot_abs = np.sum(np.abs(phys_maps), axis=0)
+        solid_scale = (
+            float(np.percentile(tot_abs, 90.0)) + 1e-8 if tot_abs.size > 0 else 1.0
+        )
+        hr_diag["hr_pore_leakage_rel"] = (
+            float(np.mean(tot_abs[pm_hr]) / solid_scale) if np.any(pm_hr) else 0.0
+        )
+        sm_hr = ~pm_hr
+        if np.any(sm_hr):
+            tot_solid = tot_abs[sm_hr]
+            hr_diag["hr_solid_stoichiometry_cv"] = float(
+                np.std(tot_solid) / (abs(float(np.mean(tot_solid))) + 1e-8)
+            )
+
+    if channel_names is not None:
+        raw_names = [str(c) for c in channel_names]
+        if len(raw_names) == m_phys:
+            solid_names = raw_names
+            prob_names = (
+                (["background"] + raw_names)
+                if n_k == m_phys + 1
+                else [f"phase_{i}" for i in range(n_k)]
+            )
+        elif len(raw_names) == n_k:
+            prob_names = raw_names
+            solid_names = raw_names[1:] if n_k == m_phys + 1 else raw_names[:m_phys]
+        else:
+            solid_names = [
+                raw_names[i] if i < len(raw_names) else f"phase_{i}"
+                for i in range(m_phys)
+            ]
+            prob_names = [f"phase_{i}" for i in range(n_k)]
+    else:
+        solid_names = [f"phase_{i}" for i in range(m_phys)]
+        prob_names = (
+            (["background"] + solid_names)
+            if n_k == m_phys + 1
+            else [f"phase_{i}" for i in range(n_k)]
+        )
+
+    eff_is_3d = is_3d
+    orig_spatial = tuple(int(d) for d in probs.shape[1:])
+    if eval_slice_z is not None:
+        if not is_3d:
+            raise ValueError("eval_slice_z is only valid for 3D volumetric reports.")
+        z_i = int(eval_slice_z)
+        z_total = int(probs.shape[1])
+        if not (0 <= z_i < z_total):
+            raise ValueError(
+                f"eval_slice_z={z_i} out of bounds for volume depth Z={z_total}."
+            )
+        phys_maps = phys_maps[:, z_i]
+        probs = probs[:, z_i]
+        labeled = labeled[z_i]
+        entropy = entropy[z_i]
+        epi_var = epi_var[z_i]
+        phys_res = phys_res[z_i]
+        comb_unc = comb_unc[z_i]
+        if pred_sets is not None:
+            pred_sets = pred_sets[:, z_i]
+        if conf_hw is not None:
+            conf_hw = conf_hw[:, z_i]
+        eff_is_3d = False
+
+    cur_h, cur_w = int(probs.shape[-2]), int(probs.shape[-1])
+    scale_y_factor = 1.0
+    scale_x_factor = 1.0
+    if target_grid_shape is not None:
+        h_eval, w_eval = int(target_grid_shape[0]), int(target_grid_shape[1])
+        if h_eval < 1 or w_eval < 1:
+            raise ValueError(
+                "target_grid_shape must have positive dimensions, "
+                f"got {target_grid_shape}."
+            )
+        if (h_eval, w_eval) != (cur_h, cur_w):
+            scale_y_factor = float(cur_h) / float(h_eval)
+            scale_x_factor = float(cur_w) / float(w_eval)
+            phys_maps = _pool_spatial_float(
+                phys_maps, (h_eval, w_eval), is_3d=eff_is_3d
+            )
+            probs = _pool_spatial_float(probs, (h_eval, w_eval), is_3d=eff_is_3d)
+            entropy = _pool_spatial_float(entropy, (h_eval, w_eval), is_3d=eff_is_3d)
+            epi_var = _pool_spatial_float(epi_var, (h_eval, w_eval), is_3d=eff_is_3d)
+            phys_res = _pool_spatial_float(phys_res, (h_eval, w_eval), is_3d=eff_is_3d)
+            comb_unc = _pool_spatial_float(comb_unc, (h_eval, w_eval), is_3d=eff_is_3d)
+            if conf_margin is not None:
+                conf_margin = _pool_spatial_float(
+                    conf_margin, (h_eval, w_eval), is_3d=eff_is_3d
+                )
+            if conf_hw is not None:
+                conf_hw = _pool_spatial_float(
+                    conf_hw, (h_eval, w_eval), is_3d=eff_is_3d
+                )
+            labeled = _pool_spatial_nearest(labeled, (h_eval, w_eval), is_3d=eff_is_3d)
+            if pred_sets is not None:
+                pred_sets = (
+                    _pool_spatial_nearest(
+                        pred_sets.astype(np.uint8), (h_eval, w_eval), is_3d=eff_is_3d
+                    )
+                    > 0
+                )
+
+    spatial_names = ("z", "y", "x") if eff_is_3d else ("y", "x")
+    n_sp = len(spatial_names)
+    if pixel_size_um is not None:
+        if isinstance(pixel_size_um, Sequence) and not isinstance(
+            pixel_size_um, (str, bytes)
+        ):
+            px_seq = [float(v) for v in pixel_size_um]
+            if len(px_seq) > n_sp:
+                px_seq = px_seq[-n_sp:]
+            elif len(px_seq) < n_sp:
+                px_seq = [px_seq[0]] * (n_sp - len(px_seq)) + px_seq
+        else:
+            px_seq = [float(pixel_size_um)] * n_sp
+        px_seq[-2] *= scale_y_factor
+        px_seq[-1] *= scale_x_factor
+        sp_unit = "um"
+    else:
+        px_seq = [1.0] * n_sp
+        sp_unit = "px"
+
+    if origin_um is not None:
+        orig_seq = [float(v) for v in origin_um]
+        if len(orig_seq) > n_sp:
+            orig_seq = orig_seq[-n_sp:]
+        elif len(orig_seq) < n_sp:
+            orig_seq = [0.0] * (n_sp - len(orig_seq)) + orig_seq
+    else:
+        orig_seq = [0.0] * n_sp
+
+    spatial_axes = tuple(
+        AxisSpec(
+            name=ax_n,
+            kind="space",
+            unit=sp_unit,
+            scale=px_seq[i],
+            offset=orig_seq[i],
+        )
+        for i, ax_n in enumerate(spatial_names)
+    )
+    chan_axes = (AxisSpec(name="c", kind="channel", unit="none"), *spatial_axes)
+
+    prov_meta: dict[str, Any] = {
+        **meta,
+        "channel_names": solid_names,
+        "probability_channel_names": prob_names,
+        "hr_spatial_shape": list(orig_spatial),
+    }
+    if eval_slice_z is not None:
+        prov_meta["eval_slice_z"] = int(eval_slice_z)
+    if target_grid_shape is not None:
+        prov_meta["target_grid_shape"] = [
+            int(target_grid_shape[0]),
+            int(target_grid_shape[1]),
+        ]
+    if hr_diag:
+        prov_meta["hr_diagnostics"] = hr_diag
+
+    img_vol = Volume(
+        phys_maps.astype(np.float32),
+        axes=chan_axes,
+        space=space,
+        provenance=prov_meta,
+    )
+
+    uniq = [int(v) for v in np.unique(labeled)]
+    resolved_lbl_names = {v: ("abstained" if v == 255 else f"phase_{v}") for v in uniq}
+    labels_map: dict[str, Volume] = {
+        "phase": Volume(
+            labeled,
+            axes=spatial_axes,
+            space=space,
+            label_names=resolved_lbl_names,
+            provenance={"active_phase": act},
+        )
+    }
+    if export_conformal_bounds:
+        envelopes = _compute_conformal_phase_envelopes(
+            labeled, probs, pred_sets, conf_hw, active_phase=act
+        )
+        if envelopes is not None:
+            lower_u8, upper_u8 = envelopes
+            comp = 1 if act == 0 else 0
+            env_names = {act: f"phase_{act}", comp: "complement"}
+            labels_map["phase_lower"] = Volume(
+                lower_u8,
+                axes=spatial_axes,
+                space=space,
+                label_names=env_names,
+                provenance={"envelope": "conformal_lower", "active_phase": act},
+            )
+            labels_map["phase_upper"] = Volume(
+                upper_u8,
+                axes=spatial_axes,
+                space=space,
+                label_names=env_names,
+                provenance={"envelope": "conformal_upper", "active_phase": act},
+            )
+
+    unc_map: dict[str, Volume] = {
+        "probabilities": Volume(probs, axes=chan_axes, space=space),
+        "combined_uncertainty": Volume(comb_unc, axes=spatial_axes, space=space),
+        "aleatoric_entropy": Volume(entropy, axes=spatial_axes, space=space),
+        "epistemic_variance": Volume(epi_var, axes=spatial_axes, space=space),
+        "physical_residual": Volume(phys_res, axes=spatial_axes, space=space),
+    }
+    if conf_margin is not None:
+        unc_map["confidence_margin"] = Volume(
+            conf_margin, axes=spatial_axes, space=space
+        )
+    if conf_hw is not None:
+        unc_map["conformal_interval_halfwidth"] = Volume(
+            conf_hw, axes=chan_axes, space=space
+        )
+
+    vset = VolumeSet(img_vol, labels=labels_map, uncertainties=unc_map)
+    return write_ome_zarr(
+        vset,
+        store_path,
+        multiscale_levels=multiscale_levels,
+        overwrite=overwrite,
+    )
+
+
 def export_volume_ome_zarr(
     vol_report_or_mask: Any,
     store_path: str | Path,
@@ -650,6 +1023,7 @@ def export_volume_ome_zarr(
     origin_um: Sequence[float] | None = None,
     space: str | None = None,
     label_names: Mapping[int, str] | None = None,
+    channel_names: Sequence[str] | None = None,
     active_phase: int = 0,
     export_conformal_bounds: bool = True,
     extra_uncertainties: Mapping[str, np.ndarray] | None = None,
@@ -673,6 +1047,8 @@ def export_volume_ome_zarr(
     labeled, probs_np, pred_sets, conf_hw_np, comb_unc_np, prov = (
         _extract_phase_and_conformal_arrays(vol_report_or_mask)
     )
+    if channel_names is not None:
+        prov["guide_channel_names"] = [str(c) for c in channel_names]
     if labeled.ndim != 3:
         raise ValueError(
             f"Expected 3D (D, H, W) volume for OME-Zarr export, got {labeled.shape}."
@@ -767,6 +1143,12 @@ def export_volume_ome_zarr(
                 axes=chan_axes,
                 space=img_vol.space,
             )
+        phys_3d = vol_report_or_mask.reconstruct_physical_maps()
+        unc_map["physical_maps"] = Volume(
+            np.asarray(phys_3d, dtype=np.float32),
+            axes=chan_axes,
+            space=img_vol.space,
+        )
         if conf_hw_np is not None:
             unc_map["conformal_interval_halfwidth"] = Volume(
                 np.asarray(conf_hw_np, dtype=np.float32),

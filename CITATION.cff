@@ -2,8 +2,8 @@ cff-version: 1.2.0
 title: "X-FUSE: Physics-Guided Foundation-Model Feature Fusion & Conformal Uncertainty Quantification for Correlative Materials Imaging"
 message: "If you use X-FUSE in your research, please cite this software."
 type: software
-version: 1.0.0
-date-released: "2026-11-20"
+version: 1.1.0
+date-released: "2026-11-24"
 license: MIT
 repository-code: "https://github.com/BASE-Laboratory/X-FUSE"
 url: "https://github.com/BASE-Laboratory/X-FUSE"

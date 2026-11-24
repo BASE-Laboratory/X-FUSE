@@ -73,7 +73,9 @@ jobs:
           python-version: "3.12"
 
       - name: Build sdist and wheel
-        run: uv build
+        run: |
+          uv build
+          uvx twine check dist/*
 
       - name: Smoke-test built wheel outside repo
         run: |
@@ -122,6 +124,22 @@ jobs:
     permissions:
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard against direct git URL dependencies before PyPI upload
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          if "git+https://" in text or "allow-direct-references = true" in text:
+              sys.stderr.write(
+                  "ERROR: pyproject.toml still contains a direct git URL dependency "
+                  "or allow-direct-references=true. Publish basecoat to PyPI and "
+                  "swap to 'basecoat>=0.3.1,<0.4.0' before enabling PyPI upload.\n"
+              )
+              sys.exit(1)
+          PY
+
       - uses: actions/download-artifact@v4
         with:
           name: python-package-distributions

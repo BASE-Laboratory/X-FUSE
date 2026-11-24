@@ -109,6 +109,70 @@ class UncertaintyReport:
             ),
         )
 
+    def reconstruct_physical_maps(
+        self,
+        scales: list[dict[str, float]] | None = None,
+        *,
+        conserve_guide_mean: bool = True,
+    ) -> np.ndarray:
+        """Reconstruct ``(M, H, W)`` calibrated physical-amplitude guide maps from
+        posterior ``probabilities`` and ``diagnostics["guide_physical_scales"]``.
+        """
+        probs_np = self.probabilities[0].detach().cpu().float().numpy()
+        eff_scales = (
+            scales
+            if scales is not None
+            else self.diagnostics.get("guide_physical_scales")
+        )
+        if not isinstance(eff_scales, list) or len(eff_scales) == 0:
+            return probs_np.astype(np.float32, copy=True)
+
+        m_ch = len(eff_scales)
+        k_ch = int(probs_np.shape[0])
+        if k_ch == m_ch + 1:
+            solid_probs = probs_np[1:]
+            bg_prob = probs_np[0]
+        elif k_ch >= m_ch:
+            solid_probs = probs_np[:m_ch]
+            bg_prob = None
+        else:
+            return probs_np.astype(np.float32, copy=True)
+
+        if bool(self.diagnostics.get("pore_mask_active", False)):
+            void_mask = (
+                (bg_prob >= 1.0 - 1e-5)
+                if bg_prob is not None
+                else np.all(solid_probs <= 1e-5, axis=0)
+            )
+        else:
+            void_mask = None
+        out = np.zeros_like(solid_probs, dtype=np.float32)
+        for idx in range(m_ch):
+            sc_meta = eff_scales[idx]
+            off = float(sc_meta.get("offset", 0.0))
+            sc = float(sc_meta.get("scale", 1.0))
+            rm = float(sc_meta.get("raw_mean", 0.0))
+            base = (
+                np.where(void_mask, 0.0, off + sc * solid_probs[idx])
+                if void_mask is not None
+                else (off + sc * solid_probs[idx])
+            )
+            if conserve_guide_mean:
+                if rm <= 1e-12:
+                    phys = np.zeros_like(base, dtype=np.float32)
+                else:
+                    mean_b = float(np.mean(base))
+                    if mean_b > 1e-12:
+                        phys = (base * (rm / mean_b)).astype(np.float32)
+                    else:
+                        phys = np.full_like(base, rm, dtype=np.float32)
+                        if void_mask is not None:
+                            phys[void_mask] = 0.0
+            else:
+                phys = base.astype(np.float32)
+            out[idx] = phys
+        return out
+
 
 def _safe_quantile(tensor: torch.Tensor, q: float) -> torch.Tensor:
     """Compute quantile safely on arbitrarily large tensors, striding when
