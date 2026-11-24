@@ -23,6 +23,7 @@ from .fusion import PoreMaskSpec, XFuse
 from .heads import FusionOptions
 from .io import (
     export_for_openimpala,
+    export_report_ome_zarr,
     export_volume_ome_zarr,
     load_microscopy_file,
     save_uncertainty_report,
@@ -55,6 +56,23 @@ def _parse_pore_mask_arg(raw_spec: str | None) -> PoreMaskSpec:
         )
     arr, _ = load_microscopy_file(pm_path)
     return arr > 0.5
+
+
+def _parse_eval_grid_arg(raw_grid: str | None) -> tuple[int, int] | None:
+    if raw_grid is None:
+        return None
+    cleaned = raw_grid.strip().lower().replace(",", "x")
+    parts = cleaned.split("x")
+    if len(parts) != 2 or not all(p.strip().isdigit() for p in parts):
+        raise ValueError(
+            f"Invalid --eval-grid '{raw_grid}'. Expected '<H>x<W>' (e.g. '40x40')."
+        )
+    h_val, w_val = int(parts[0]), int(parts[1])
+    if h_val < 1 or w_val < 1:
+        raise ValueError(
+            f"--eval-grid dimensions must be >= 1, got ({h_val}, {w_val})."
+        )
+    return h_val, w_val
 
 
 def _cmd_info() -> int:
@@ -196,6 +214,8 @@ def _cmd_fuse(
     device: str = "cpu",
     pixel_size_um: float | None = None,
     pore_mask_raw: str | None = None,
+    channel_names: Sequence[str] | None = None,
+    eval_grid_raw: str | None = None,
 ) -> int:
     if stride < 1:
         raise ValueError(f"--stride must be >= 1, got {stride}.")
@@ -217,6 +237,7 @@ def _cmd_fuse(
         raise ValueError(f"--n-components must be >= 1, got {n_components}.")
     if pixel_size_um is not None and pixel_size_um <= 0.0:
         raise ValueError(f"--pixel-size-um must be > 0, got {pixel_size_um}.")
+    eval_grid_hw = _parse_eval_grid_arg(eval_grid_raw)
     if not hr_path.exists():
         raise FileNotFoundError(f"High-resolution input file not found: {hr_path}")
     for gp in guide_paths:
@@ -244,7 +265,9 @@ def _cmd_fuse(
     g_ch = (
         int(n_components or 2) if spectral_unmix else max(1, int(guide_stack.shape[0]))
     )
-    if spectral_unmix:
+    if channel_names is not None:
+        names = [str(c) for c in channel_names]
+    elif spectral_unmix:
         names = [f"component_{i}" for i in range(g_ch)]
 
     layer_sel: LayerSelection = layers
@@ -289,9 +312,18 @@ def _cmd_fuse(
         if rep.probabilities.shape[1] == len(names) + 1
         else names
     )
-    saved = save_uncertainty_report(
-        rep, output_path, channel_names=ch_names, pixel_size_um=pixel_size_um
-    )
+    if output_path.name.lower().endswith(".ome.zarr"):
+        saved = export_report_ome_zarr(
+            rep,
+            output_path,
+            channel_names=ch_names,
+            pixel_size_um=pixel_size_um,
+            target_grid_shape=eval_grid_hw,
+        )
+    else:
+        saved = save_uncertainty_report(
+            rep, output_path, channel_names=ch_names, pixel_size_um=pixel_size_um
+        )
     out_summary = {
         "saved_report": str(saved),
         "hr_shape": list(hr_arr.shape),
@@ -308,15 +340,34 @@ def _save_volumetric_report(
     output_path: Path,
     voxel_size_um: float | None = None,
     active_phase: int = 0,
+    channel_names: Sequence[str] | None = None,
+    target_grid_shape: tuple[int, int] | None = None,
+    eval_slice_z: int | None = None,
 ) -> Path:
     if output_path.name.lower().endswith(".ome.zarr"):
+        if (
+            target_grid_shape is not None
+            or eval_slice_z is not None
+            or channel_names is not None
+        ):
+            return export_report_ome_zarr(
+                rep,
+                output_path,
+                channel_names=channel_names,
+                pixel_size_um=voxel_size_um,
+                target_grid_shape=target_grid_shape,
+                eval_slice_z=eval_slice_z,
+                active_phase=active_phase,
+            )
         return export_volume_ome_zarr(
             rep,
             output_path,
             voxel_size_um=voxel_size_um,
             active_phase=active_phase,
         )
-    return save_uncertainty_report(rep, output_path, pixel_size_um=voxel_size_um)
+    return save_uncertainty_report(
+        rep, output_path, channel_names=channel_names, pixel_size_um=voxel_size_um
+    )
 
 
 def _parse_guide_slice_spec(spec: str) -> tuple[int, Path]:
@@ -368,6 +419,9 @@ def _cmd_fuse_3d(
     conformal_method: ConformalMethod = "raps",
     openimpala_phase: int = 0,
     openimpala_direction: str = "x",
+    channel_names: Sequence[str] | None = None,
+    eval_grid_raw: str | None = None,
+    eval_slice_z: int | None = None,
 ) -> int:
     if stride < 1:
         raise ValueError(f"--stride must be >= 1, got {stride}.")
@@ -383,6 +437,7 @@ def _cmd_fuse_3d(
         raise ValueError(
             f"--conformal-alpha must lie strictly in (0, 1), got {conformal_alpha}."
         )
+    eval_grid_hw = _parse_eval_grid_arg(eval_grid_raw)
     if not hr_volume_path.exists():
         raise FileNotFoundError(f"3D HR volume not found: {hr_volume_path}")
 
@@ -392,6 +447,10 @@ def _cmd_fuse_3d(
     pore_spec = _parse_pore_mask_arg(pore_mask_raw)
     accessor = VolumeSliceAccessor(hr_volume_path)
     z_dim = accessor.shape[0]
+    if eval_slice_z is not None and not (0 <= int(eval_slice_z) < z_dim):
+        raise ValueError(
+            f"--eval-slice-z={eval_slice_z} out of bounds for volume depth Z={z_dim}."
+        )
     sparse_guides: dict[int, np.ndarray | torch.Tensor] = {}
     n_ch: int | None = None
     for spec in guide_slice_specs:
@@ -458,6 +517,9 @@ def _cmd_fuse_3d(
         output_path,
         voxel_size_um=voxel_size_um,
         active_phase=openimpala_phase,
+        channel_names=channel_names,
+        target_grid_shape=eval_grid_hw,
+        eval_slice_z=eval_slice_z,
     )
     recommended: list[int] = []
     if suggest_next > 0:
@@ -670,6 +732,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional void mask file, 'auto_otsu', or 'auto_otsu_fringe_guarded'.",
     )
+    p_fuse.add_argument(
+        "--channel-names",
+        nargs="+",
+        default=None,
+        help="Optional solid guide channel names (e.g. 'zn na') for .ome.zarr export.",
+    )
+    p_fuse.add_argument(
+        "--eval-grid",
+        default=None,
+        metavar="HxW",
+        help="Optional coarse evaluation grid '<H>x<W>' (e.g. '40x40') for .ome.zarr.",
+    )
 
     p_f3d = sub.add_parser(
         "fuse-3d",
@@ -692,7 +766,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         required=True,
-        help="Output 3D report path (.h5, .zarr, .npz, or .tif).",
+        help="Output 3D report path (.ome.zarr, .h5, .zarr, .npz, or .tif).",
     )
     p_f3d.add_argument("--backbone", default="dinov2_vits14")
     p_f3d.add_argument(
@@ -757,6 +831,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional isotropic physical voxel spacing in micrometres for 3D output."
         ),
+    )
+    p_f3d.add_argument(
+        "--channel-names",
+        nargs="+",
+        default=None,
+        help="Optional solid guide channel names (e.g. 'zn na') for .ome.zarr export.",
+    )
+    p_f3d.add_argument(
+        "--eval-grid",
+        default=None,
+        metavar="HxW",
+        help="Optional coarse evaluation grid '<H>x<W>' (e.g. '40x40') for .ome.zarr.",
+    )
+    p_f3d.add_argument(
+        "--eval-slice-z",
+        type=int,
+        default=None,
+        help="Optional held-out Z-slice index to project for 2D benchmark evaluation.",
     )
     p_f3d.add_argument(
         "--export-openimpala-dir",
@@ -834,6 +926,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             device=args.device,
             pixel_size_um=args.pixel_size_um,
             pore_mask_raw=args.pore_mask,
+            channel_names=args.channel_names,
+            eval_grid_raw=args.eval_grid,
         )
     if args.command == "fuse-3d":
         return _cmd_fuse_3d(
@@ -858,6 +952,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             conformal_method=args.conformal_method,
             openimpala_phase=args.openimpala_phase,
             openimpala_direction=args.openimpala_direction,
+            channel_names=args.channel_names,
+            eval_grid_raw=args.eval_grid,
+            eval_slice_z=args.eval_slice_z,
         )
     return _cmd_info()
 

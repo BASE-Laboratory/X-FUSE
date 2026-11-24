@@ -13,7 +13,7 @@ X-FUSE uses a single modality-neutral interface across X-ray, electron, and neut
 
 ```python
 import h5py
-from x_fuse import XFuse, VolumetricFuser, export_for_openimpala, suggest_next_slices
+from x_fuse import XFuse, VolumetricFuser, export_volume_ome_zarr, suggest_next_slices
 
 base = XFuse(
     backbone="dinov2_vits14",
@@ -44,8 +44,8 @@ with h5py.File("xct_tomogram.h5", "r") as hf:
         pore_mask="auto_otsu_fringe_guarded",
     )
 
-# Export multi-phase uint8 geometry + conformal envelopes for OpenImpala AMReX PDE transport:
-export_for_openimpala(vol_report, "./openimpala_geom", name="zeolite_pellet", active_phase=0)
+# Export calibrated OME-Zarr v0.4 phase labels + conformal envelopes + uncertainties:
+export_volume_ome_zarr(vol_report, "./zeolite_pellet.ome.zarr", voxel_size_um=0.54, active_phase=0)
 
 # Recommend the next 3 XRD-CT z-slices to scan during live beamtime (1D Voronoi steering):
 plan = suggest_next_slices(vol_report, acquired_indices=[10, 50], k=3, min_spacing=8)

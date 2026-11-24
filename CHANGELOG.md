@@ -4,6 +4,18 @@ All notable changes to **X-FUSE** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Native 2D & 3D OME-Zarr v0.4 Report Export & Physical Amplitude Calibration (`x_fuse.io`, `x_fuse.fusion`, `x_fuse.volumetric`, `x_fuse.cli`)**: Added `export_report_ome_zarr` and automatic `.ome.zarr` routing in `save_uncertainty_report` writing calibrated OME-NGFF v0.4 `VolumeSet` stores (`basecoat v0.3.0+`) with named chemical channel metadata (`--channel-names`), per-guide physical intensity scale conservation (`guide_physical_scales` & `reconstruct_physical_maps`), conformal phase envelopes (`phase_lower`, `phase_upper`), `uncertainties/*` sidecars, and optional coarse benchmark grid evaluation sidecars (`--eval-grid`, `--eval-slice-z`).
+- **`basecoat` Layer-2 Volumetric & Filter Integration (`x_fuse.io`, `x_fuse.loaders`, `x_fuse.volumetric`)**: Added `export_volume_ome_zarr`, out-of-core Savu `(X, Z, Y)` slicing via `basecoat.open_savu_h5`, conservative ring/cupping filters via `basecoat`, `.zenodo.json` archive metadata, `AGENTS.md`, and `[tool.basecoat.layers]` AST layer-import enforcement.
+
+### Changed
+- **Deprecated Legacy Layer-4 Coupling Helpers (`x_fuse.io`, `x_fuse.datasets`)**: Deprecated `export_for_openimpala` in favour of `export_volume_ome_zarr` / `export_report_ome_zarr`, stripped hardcoded DIAD Zn-13X scan IDs from `OPEN_DATASETS["diad_zn13x_xrdct"]`, and marked `list_open_datasets()` / `fetch_open_dataset()` deprecated pending migration to Layer 4 (`MultimodalBenchmark`).
+
+### Removed
+- **Specimen-Specific DIAD Loader Constants (`x_fuse.loaders`)**: Removed `DIAD_ZN13X_50UM_SCAN_IDS`, `DIAD_ZN13X_25UM_SCAN_IDS`, `load_diad_xct_zn13x`, and hardcoded `+47.5°` stage motor-zero defaults from Layer 2 (`scan_ids` and `correct_motor_offset_deg` are now passed explicitly by Layer 4 workflows).
+
 ## [1.0.0] - 2026-11-20
 
 ### Added
